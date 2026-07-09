@@ -6,7 +6,7 @@
 
 - `strategies/` — реализации стратегий (сигналы, правила входа/выхода).
 - `backtest/` — движок и раннеры бэктестов, конфиги прогонов.
-- `data/raw/` — сырые исторические данные (не в git).
+- `data/raw/` — raw historical data grouped by instrument folders, for example `data/raw/EURUSD/EURUSDd1.csv` (not in git).
 - `data/processed/` — подготовленные датасеты (не в git).
 - `reports/` — сгенерированные отчёты и графики (не в git).
 - `notebooks/` — исследовательские ноутбуки.

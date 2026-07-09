@@ -1,0 +1,8 @@
+# Cursor rules
+
+See AGENTS.md in the repository root for the full project conventions.
+
+Language policy: write everything that goes into the code in English —
+commit messages, code comments, docstrings, identifiers, in-repo docs
+(README, docs/, config comments, logs) and PR titles/descriptions.
+Chat replies to the maintainer may stay in Russian.
