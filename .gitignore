@@ -16,6 +16,8 @@ env/
 # Data & outputs (не коммитим тяжёлые данные и сгенерированные отчёты)
 data/raw/*
 data/processed/*
+data/histdata/*
+data/fresh/*
 !data/**/.gitkeep
 reports/*
 !reports/.gitkeep
