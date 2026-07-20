@@ -1,0 +1,12 @@
+{% extends "base.html" %}{% block title %}Login{% endblock %}
+{% block body %}
+<div class="card" style="max-width:380px;margin:60px auto;">
+  <h1>Sign in</h1>
+  {% for f in flash %}<div class="flash {{ f.kind }}">{{ f.msg }}</div>{% endfor %}
+  <form method="post" action="/login">
+    <label>Username</label><input name="username" autofocus style="width:100%">
+    <label>Password</label><input name="password" type="password" style="width:100%">
+    <div style="margin-top:16px"><button style="width:100%">Sign in</button></div>
+  </form>
+</div>
+{% endblock %}

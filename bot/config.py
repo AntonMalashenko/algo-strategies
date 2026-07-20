@@ -1,12 +1,28 @@
 """Paper-bot configuration — frozen per strategy passport S004 v1.0.
 
 Do NOT tune these values outside the experiments log. Broker credentials
-come from environment variables (never commit them):
+live in <repo>/.env (gitignored) or environment variables:
 
-    CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN,
-    CTRADER_ACCOUNT_ID  (the demo account id)
+    CTRADER_CLIENT_ID=...
+    CTRADER_CLIENT_SECRET=...
+    CTRADER_ACCESS_TOKEN=...
+    CTRADER_ACCOUNT_ID=...             # numeric ctidTraderAccountId of the DEMO
+    CTRADER_HOST=demo.ctraderapi.com   # optional, defaults to demo
 """
 from __future__ import annotations
+
+import os
+from pathlib import Path
+
+try:                                   # load <repo>/.env if python-dotenv present
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
+
+def cred(name: str, default: str | None = None) -> str | None:
+    return os.environ.get(name, default)
 
 PAIRS = ["GBPJPY", "EURUSD", "USDCHF", "GBPUSD", "EURJPY", "USDJPY", "AUDUSD"]
 

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Algo bot{% endblock %}</title>
+  <style>
+    :root { --bg:#0f172a; --card:#1e293b; --ink:#e2e8f0; --mut:#94a3b8;
+            --ok:#059669; --err:#dc2626; --blue:#2563eb; --line:#334155; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
+           background:var(--bg); color:var(--ink); }
+    header { background:var(--card); border-bottom:1px solid var(--line);
+             padding:12px 20px; display:flex; gap:18px; align-items:center; }
+    header a { color:var(--ink); text-decoration:none; }
+    header .sp { flex:1; }
+    header .mut { color:var(--mut); }
+    main { max-width:1000px; margin:24px auto; padding:0 16px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+            padding:18px 20px; margin-bottom:18px; }
+    h1,h2 { margin:0 0 12px; }
+    table { width:100%; border-collapse:collapse; }
+    th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+    th { color:var(--mut); font-weight:600; font-size:12px; text-transform:uppercase; }
+    input,select { background:#0b1220; color:var(--ink); border:1px solid var(--line);
+                   border-radius:7px; padding:8px 10px; font-size:14px; }
+    label { display:block; margin:10px 0 4px; color:var(--mut); }
+    button, .btn { background:var(--blue); color:#fff; border:0; border-radius:7px;
+                   padding:8px 14px; font-size:14px; cursor:pointer; text-decoration:none; }
+    button.ghost { background:#334155; }
+    button.danger { background:var(--err); }
+    button.stop { background:#b45309; }
+    .pill { padding:2px 9px; border-radius:999px; font-size:12px; }
+    .pill.on { background:rgba(5,150,105,.2); color:#34d399; }
+    .pill.off { background:#334155; color:var(--mut); }
+    .flash { padding:10px 14px; border-radius:8px; margin-bottom:14px; }
+    .flash.ok { background:rgba(5,150,105,.15); color:#34d399; }
+    .flash.err { background:rgba(220,38,38,.15); color:#f87171; }
+    .mut { color:var(--mut); } .row { display:flex; gap:10px; align-items:center; }
+    small.mono { font-family:ui-monospace,Menlo,monospace; color:var(--mut); }
+  </style>
+</head>
+<body>
+  {% if user %}
+  <header>
+    <strong>⚙ Algo bot</strong>
+    <a href="/">Dashboard</a>
+    <a href="/creds">Credentials</a>
+    <a href="/accounts/add">Add account</a>
+    {% if user.is_admin %}<a href="/users">Users</a>{% endif %}
+    <span class="sp"></span>
+    <span class="mut">{{ user.username }}</span>
+    <a href="/logout" class="mut">Logout</a>
+  </header>
+  {% endif %}
+  <main>
+    {% for f in flash %}<div class="flash {{ f.kind }}">{{ f.msg }}</div>{% endfor %}
+    {% block body %}{% endblock %}
+  </main>
+</body>
+</html>

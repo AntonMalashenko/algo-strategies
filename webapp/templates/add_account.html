@@ -1,0 +1,20 @@
+{% extends "base.html" %}{% block title %}Add account{% endblock %}
+{% block body %}
+<div class="card" style="max-width:520px">
+  <h2>Add cTrader account</h2>
+  <form method="post" action="/accounts/add">
+    <label>ctidTraderAccountId (numeric)</label><input name="ctid" required style="width:100%">
+    <label>Label</label><input name="label" placeholder="demo-1" style="width:100%">
+    <label>Strategy preset</label>
+    <select name="preset" style="width:100%">{% for p in presets %}<option>{{ p }}</option>{% endfor %}</select>
+    <div class="row" style="gap:16px">
+      <div><label>Risk % per position</label><input name="risk" value="0.25" style="width:120px"></div>
+      <div><label>Fixed lot</label><input name="lot" value="0.01" style="width:120px"></div>
+    </div>
+    <label><input type="checkbox" name="is_live" value="true"> Live account (default demo)</label>
+    <div style="margin-top:16px"><button>Add account</button>
+      <a class="btn ghost" href="/">Cancel</a></div>
+  </form>
+  <p class="mut">Get the id from cTrader, or run <small class="mono">python -m bot.s007_paper --accounts</small>.</p>
+</div>
+{% endblock %}

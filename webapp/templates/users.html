@@ -1,0 +1,20 @@
+{% extends "base.html" %}{% block title %}Users{% endblock %}
+{% block body %}
+<div class="card">
+  <h2>Users</h2>
+  <table><tr><th>ID</th><th>Username</th><th>Admin</th><th>Token</th><th>Accounts</th></tr>
+  {% for u in users %}<tr><td>{{ u.id }}</td><td>{{ u.username }}</td>
+    <td>{{ '✓' if u.is_admin else '' }}</td>
+    <td>{{ 'set' if u._access_token_enc else '—' }}</td><td>{{ u.accounts|length }}</td></tr>{% endfor %}
+  </table>
+</div>
+<div class="card" style="max-width:480px">
+  <h2>Create user</h2>
+  <form method="post" action="/users/create">
+    <label>Username</label><input name="username" style="width:100%">
+    <label>Password</label><input name="password" type="password" style="width:100%">
+    <label><input type="checkbox" name="is_admin" value="true"> Admin</label>
+    <div style="margin-top:14px"><button>Create</button></div>
+  </form>
+</div>
+{% endblock %}
