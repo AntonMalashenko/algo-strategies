@@ -30,6 +30,12 @@ logic layered on top. Do not fork or copy a base engine per strategy; extend or 
     orders / reconcile). **All strategies reuse this.** S007's `ctrader_s007.py` does
     `class CTraderS007(CTraderAdapter)` and only adds S007-specific symbol/signal glue — the
     connection, auth, and order plumbing are inherited, not re-written.
+  - `risk.py` — `lots_for_risk(...)`, equal-dollar-risk position sizing for lot/point-based
+    (cTrader CFD/FX) instruments. Pure math, no broker I/O: the caller (a strategy's `decide`)
+    fetches `balance` and `money_per_point_per_lot` once per cycle via the adapter (see
+    `CTraderAdapter._get_balance_step`, `CTraderS007.run_live_cycle`) and passes them in. Added
+    for S007 (2026-07-21); any future cTrader strategy sizing by dollar risk reuses this, not a
+    private copy.
   - `config.py` — shared bot config / `.env` credential loading (never read or log secret
     *values*; refer to them by variable name).
   - `signals.py` / `paper.py` — base signal + paper-trading scaffolding; a strategy adds its

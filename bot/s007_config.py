@@ -42,12 +42,22 @@ SYMBOL_CANDIDATES = ["GER40", "DE40", "GERMANY40", "GER40.cash", "DE40.cash", "G
 PRESET = "WORKING_S007"
 
 # --- sizing ---
-RISK_PCT = 0.25            # % of balance risked per 1R (position). 0.25 -> ~-10% maxDD
-# With flat R sizing the max daily loss = max_positions x RISK_PCT (=1.0% at 4x0.25).
-# For the FIRST demo run use a fixed small lot (risk-% sizing needs the broker's
-# contract/tick value — calibrate once, then switch USE_FIXED_LOT=False).
-USE_FIXED_LOT = True
-FIXED_LOT = 0.01
+RISK_PCT = 0.25            # % of CURRENT balance risked per position, refetched every
+# order (see bot/risk.py:lots_for_risk). With flat R sizing the max daily loss =
+# max_positions x RISK_PCT (=1.0% at 4x0.25). Live 2026-07-21: switched on after the
+# first successful live-demo day confirmed real broker connectivity (decisions-log.md).
+#
+# money_per_point_per_lot is NOT hardcoded — it's read from the broker's own
+# ProtoOASymbol.lotSize at the start of every cycle (CTraderS007.run_live_cycle),
+# so a leverage/contract-spec change on the broker side can't silently desync it
+# from an empirical constant (decision 2026-07-21, decisions-log.md).
+#
+# USE_FIXED_LOT=True is the manual override / emergency fallback (e.g. if the
+# broker-fetched money_per_point_per_lot ever looks wrong on a live cycle) —
+# flip it back on to trade FIXED_LOT flat, no risk math, no extra broker calls.
+USE_FIXED_LOT = False
+FIXED_LOT = 0.01          # used directly when USE_FIXED_LOT=True; always the
+# broker-minimum-lot floor for risk-based sizing ("0.25%, or 0.01 if it doesn't fit").
 
 # --- session (EET / Kyiv clock, anchored to the DAX cash open at 10:00) ---
 FR_START, FR_END = "09:00", "09:59"   # pre-open hour range (see spec §0)

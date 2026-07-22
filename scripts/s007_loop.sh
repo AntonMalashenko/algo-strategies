@@ -2,30 +2,35 @@
 cd ~/Trading/algo
 source .venv/bin/activate
 
-# Seconds until the next session window (10:00 EET on the next weekday,
-# skipping Sat/Sun). Used both to skip idle time outside 10:00-16:59 and to
-# skip the rest of today once the strategy reports day_done with nothing
-# left to close.
-next_window_sleep_seconds() {
+# Single atomic time snapshot: decides TRADE vs SLEEP <secs> in one Python
+# call. Two separate `date`/python invocations (bash reads the hour, then a
+# later python call reads its own now()) can straddle the 10:00:00 boundary
+# and disagree -- observed in practice: bash said "still before 10:00" while
+# python, invoked a fraction of a second later, saw "past 10:00" and rolled
+# the target to tomorrow, sleeping through the whole session.
+window_decision() {
   python3 -c "
 import datetime
 now = datetime.datetime.now()
-target = now.replace(hour=10, minute=0, second=0, microsecond=0)
-if now >= target:
-    target += datetime.timedelta(days=1)
-while target.weekday() >= 5:  # Sat=5, Sun=6
-    target += datetime.timedelta(days=1)
-print(int((target - now).total_seconds()))
+in_window = now.weekday() < 5 and 10 <= now.hour < 17
+if in_window:
+    print('TRADE')
+else:
+    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += datetime.timedelta(days=1)
+    while target.weekday() >= 5:  # Sat=5, Sun=6
+        target += datetime.timedelta(days=1)
+    print(f'SLEEP {int((target - now).total_seconds())}')
 "
 }
 
 while true; do
   now_hm=$(date +%H:%M)
-  now_h=$(date +%H)
-  now_dow=$(date +%u)   # 1=Mon..7=Sun
+  decision=$(window_decision)
 
-  if [ "$now_dow" -ge 6 ] || [ "$now_h" -lt 10 ] || [ "$now_h" -ge 17 ]; then
-    secs=$(next_window_sleep_seconds)
+  if [ "${decision%% *}" = "SLEEP" ]; then
+    secs=${decision#SLEEP }
     echo "[$now_hm] outside session window, sleeping ${secs}s until next window"
     sleep "$secs"
     continue
@@ -36,7 +41,22 @@ while true; do
   echo "$out"
 
   if echo "$out" | grep -q "STATUS day_done=True .* actions=0"; then
-    secs=$(next_window_sleep_seconds)
+    secs_decision=$(window_decision)
+    # day is done -- if we're still nominally "in window" by the clock,
+    # force a wait until tomorrow rather than re-polling every minute for
+    # the rest of today.
+    if [ "${secs_decision%% *}" = "SLEEP" ]; then
+      secs=${secs_decision#SLEEP }
+    else
+      secs=$(python3 -c "
+import datetime
+now = datetime.datetime.now()
+target = (now + datetime.timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+while target.weekday() >= 5:
+    target += datetime.timedelta(days=1)
+print(int((target - now).total_seconds()))
+")
+    fi
     echo "[$now_hm] day done, nothing left to close -- sleeping ${secs}s until next window"
     sleep "$secs"
   else

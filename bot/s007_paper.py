@@ -27,6 +27,7 @@ from pathlib import Path
 import pandas as pd
 
 from bot import s007_config as C
+from bot.risk import lots_for_risk
 from bot.s007_signals import plan_now
 from utils.trade_logger import StrategyLogger
 
@@ -90,24 +91,29 @@ def check():
 def live():
     from bot.ctrader_s007 import CTraderS007
     cid = LOG.cycle_start(mode="live", preset=C.PRESET)
-    lot = C.FIXED_LOT
     actions_taken = []
     status = {}
 
-    def decide(symbol, m1, broker_positions):
+    def decide(symbol, m1, broker_positions, balance, money_per_point_per_lot):
         """Pure decision step (no I/O): plan_now() + diff against what the
-        broker already has open. Runs inside the single cTrader session
-        (see CTraderS007.run_live_cycle) between fetching state and placing
-        orders, so this cannot make its own broker calls."""
+        broker already has open, sized to equal dollar risk per position.
+        Runs inside the single cTrader session (see CTraderS007.run_live_cycle)
+        between fetching state (incl. balance + the instrument's contract
+        metadata) and placing orders, so this cannot make its own broker
+        calls -- balance and money_per_point_per_lot are handed in already
+        fetched, fresh, for this cycle."""
         res = plan_now(m1)
         status.update(day_done=res["day_done"], in_window=res["in_window"])
         have = {p["label"]: p for p in broker_positions if p["label"].startswith(C.MAGIC)}
+        risk_amount = balance * C.RISK_PCT / 100.0
         LOG.event("state", cycle=cid, symbol=symbol,
                   last_bar=str(m1.index[-1]) if len(m1) else None,
                   in_window=res["in_window"], day_done=res["day_done"], flat=res["flat"],
                   direction=res["direction"], context=res.get("context"),
                   broker_positions=len(broker_positions), ours_open=len(have),
-                  n_desired=len(res["positions"]))
+                  n_desired=len(res["positions"]), balance=balance,
+                  money_per_point_per_lot=money_per_point_per_lot,
+                  risk_amount=risk_amount, use_fixed_lot=C.USE_FIXED_LOT)
 
         out = []
         if res["day_done"] or res["flat"] or not res["in_window"]:
@@ -120,6 +126,23 @@ def live():
             for lab, o in want.items():       # open new entries/adds (server-side SL/TP)
                 if lab in have:
                     continue
+                if LOG.label_was_closed(lab):
+                    # Broker doesn't show it open, but OUR log already saw it
+                    # close today -- a real stop-out the current M1 bar just
+                    # hasn't caught up to yet, not "never opened". Re-placing
+                    # here is exactly the 2026-07-21 duplicate-reopen bug.
+                    LOG.event("skip_reopen", cycle=cid, label=lab,
+                              reason="already_closed_today_per_position_log")
+                    continue
+                stop_distance = abs(o["entry"] - o["sl"])
+                if C.USE_FIXED_LOT:
+                    lot = C.FIXED_LOT
+                else:
+                    lot = lots_for_risk(risk_amount, stop_distance,
+                                        money_per_point_per_lot, min_lot=C.FIXED_LOT)
+                LOG.event("size", cycle=cid, label=lab, stop_distance=stop_distance,
+                          risk_amount=risk_amount, money_per_point_per_lot=money_per_point_per_lot,
+                          lot=lot)
                 out.append(dict(kind="place", label=lab, side=o["side"], sl=o["sl"], tp=o["tp"],
                                 volume_lots=lot, entry=o["entry"], is_add=o["is_add"]))
         return out
@@ -140,14 +163,15 @@ def live():
                 LOG.position(lab, "close", cycle=cid, reason=a["reason"])
                 actions_taken.append(f"close {lab} ({a['reason']})")
             else:
-                req = dict(symbol=symbol, side=a["side"], sl=a["sl"], tp=a["tp"], lot=lot)
+                req = dict(symbol=symbol, side=a["side"], sl=a["sl"], tp=a["tp"], lot=a["volume_lots"])
                 if err is not None:
                     LOG.order(lab, "place_market", cycle=cid, request=req, error=err)
                     continue
                 LOG.order(lab, "place_market", cycle=cid, request=req, result=res_)
                 LOG.position(lab, "open", cycle=cid, side=a["side"], entry=a["entry"],
-                             sl=a["sl"], tp=a["tp"], is_add=a["is_add"])
-                actions_taken.append(f"open {lab} {a['side']} SL{a['sl']:.1f} TP{a['tp']:.1f}")
+                             sl=a["sl"], tp=a["tp"], is_add=a["is_add"], volume_lots=a["volume_lots"])
+                actions_taken.append(
+                    f"open {lab} {a['side']} lot={a['volume_lots']:.3f} SL{a['sl']:.1f} TP{a['tp']:.1f}")
     except Exception as e:
         LOG.error("live cycle failed", exc=e, cycle=cid)
     LOG.cycle_end(cid, actions=len(actions_taken))

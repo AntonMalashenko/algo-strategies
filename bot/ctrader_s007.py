@@ -22,6 +22,7 @@ if HAVE_SDK:
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOAGetTrendbarsReq, ProtoOANewOrderReq, ProtoOAClosePositionReq,
         ProtoOAReconcileReq, ProtoOASymbolByIdReq,
+        ProtoOAOrderErrorEvent, ProtoOAErrorRes,
     )
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
         ProtoOAOrderType, ProtoOATradeSide, ProtoOATrendbarPeriod,
@@ -202,12 +203,41 @@ class CTraderS007(CTraderAdapter):
     def _check_response(resp):
         """client.send() only errbacks on transport failures -- an
         application-level rejection (wrong volume, bad price, market closed,
-        ...) comes back as a normal response carrying ProtoOAErrorRes /
-        ProtoOAOrderErrorEvent. Parse it and turn those into real errors
-        instead of silently reporting success."""
+        ...) comes back as a normal response. Two known-bad shapes:
+
+        (1) Protobuf.extract() resolves it to a named error message
+            (ProtoOAErrorRes / ProtoOAOrderErrorEvent) -- straightforward,
+            raise from its errorCode/description.
+        (2) Protobuf.extract() does NOT resolve it and hands back the raw
+            envelope (payloadType + payload bytes) instead of the specific
+            message class. CONFIRMED live 2026-07-20: a TRADING_BAD_VOLUME
+            rejection came back exactly this way, and the old version of
+            this method (which only checked case 1) treated it as success --
+            the bot logged "ok=True" for 6 orders that the broker had fully
+            rejected (0 volume ever placed). See decisions-log.md 2026-07-21.
+
+        For (2): the raw envelope has payloadType/payload fields but not the
+        errorCode field a decoded message would have -- that's the tell.
+        Try to decode the payload bytes as either known error message; if
+        that also comes up empty, refuse to guess "success" and raise loud
+        instead, with the raw payloadType so the failure is diagnosable.
+        """
         msg = Protobuf.extract(resp)
-        if type(msg).__name__ in ("ProtoOAErrorRes", "ProtoOAOrderErrorEvent"):
+        name = type(msg).__name__
+        if name in ("ProtoOAErrorRes", "ProtoOAOrderErrorEvent"):
             raise RuntimeError(f"{msg.errorCode}: {getattr(msg, 'description', '')}")
+        if hasattr(msg, "payloadType") and hasattr(msg, "payload") and not hasattr(msg, "errorCode"):
+            for cls in (ProtoOAOrderErrorEvent, ProtoOAErrorRes):
+                candidate = cls()
+                try:
+                    candidate.ParseFromString(msg.payload)
+                except Exception:
+                    continue
+                if candidate.errorCode:
+                    raise RuntimeError(f"{candidate.errorCode}: {getattr(candidate, 'description', '')}")
+            raise RuntimeError(
+                f"unrecognized broker response (payloadType={msg.payloadType}) -- "
+                f"treating as a failure, not assuming success")
         return msg
 
     def _get_full_symbol_step(self, symbol: str):
@@ -235,10 +265,16 @@ class CTraderS007(CTraderAdapter):
         return int(round(raw / step) * step)
 
     def _place_market_step(self, symbol: str, side: str, sl_price: float, tp_price: float,
-                           volume_lots: float, label: str):
+                           volume_lots: float, label: str, full_symbol=None):
+        """full_symbol: pass the already-fetched ProtoOASymbol (e.g. from
+        run_live_cycle, which fetches it once per cycle for risk sizing) to
+        skip a redundant ProtoOASymbolByIdReq per order; omit to fetch it
+        fresh (standalone/one-off use)."""
         @defer.inlineCallbacks
         def flow():
-            full = yield self._get_full_symbol_step(symbol)
+            full = full_symbol
+            if full is None:
+                full = yield self._get_full_symbol_step(symbol)
             sym = self._symbols[symbol.upper()]
             req = ProtoOANewOrderReq()
             req.ctidTraderAccountId = self.account
@@ -268,13 +304,19 @@ class CTraderS007(CTraderAdapter):
     def run_live_cycle(self, symbol_candidates, history_days: int, decide):
         """One connect/auth/work/disconnect session for a full bot cycle.
 
-        Resolves the symbol, fetches M1 bars, lists open positions, then
-        calls `decide(symbol, m1, positions) -> list[action]` (pure Python,
-        no I/O) where each action is
+        Resolves the symbol, fetches the instrument's contract metadata (for
+        risk sizing) and the account balance, gets M1 bars, lists open
+        positions, then calls
+          decide(symbol, m1, positions, balance, money_per_point_per_lot)
+            -> list[action]
+        (pure Python, no I/O -- balance and money_per_point_per_lot are
+        fetched here, once per cycle, precisely so `decide` doesn't have to
+        make its own broker calls) where each action is
           {"kind": "place", side, sl, tp, volume_lots, label, ...}  or
           {"kind": "close", position_id, volume, label, ...}
         and executes the actions in order. Returns
-          {"symbol", "m1", "positions", "actions", "results"}
+          {"symbol", "m1", "positions", "actions", "results", "balance",
+           "money_per_point_per_lot"}
         where results[i] = {"action", "result", "error"} lines up with actions.
         """
         def work(done):
@@ -292,16 +334,23 @@ class CTraderS007(CTraderAdapter):
                         f"none of {symbol_candidates} found; broker symbols "
                         f"e.g. {sorted(self._symbols.keys())[:15]}")
 
+                # Fetched once per cycle (not per order) -- see _place_market_step's
+                # full_symbol param and bot/risk.py for how these two feed sizing.
+                full_symbol = yield self._get_full_symbol_step(symbol)
+                balance = yield self._get_balance_step()
+                money_per_point_per_lot = full_symbol.lotSize
+
                 m1 = yield self._get_m1_step(symbol, history_days)
                 positions = yield self._reconcile_step()
-                actions = decide(symbol, m1, positions)
+                actions = decide(symbol, m1, positions, balance, money_per_point_per_lot)
 
                 results = []
                 for a in actions:
                     try:
                         if a["kind"] == "place":
                             r = yield self._place_market_step(
-                                symbol, a["side"], a["sl"], a["tp"], a["volume_lots"], a["label"])
+                                symbol, a["side"], a["sl"], a["tp"], a["volume_lots"], a["label"],
+                                full_symbol=full_symbol)
                         else:
                             r = yield self._close_position_step(a["position_id"], a["volume"])
                         results.append(dict(action=a, result=r, error=None))
@@ -309,7 +358,8 @@ class CTraderS007(CTraderAdapter):
                         results.append(dict(action=a, result=None, error=e))
 
                 return dict(symbol=symbol, m1=m1, positions=positions,
-                            actions=actions, results=results)
+                            actions=actions, results=results, balance=balance,
+                            money_per_point_per_lot=money_per_point_per_lot)
 
             d = flow()
             d.addCallbacks(lambda r: done(r), lambda f: done(error=f))

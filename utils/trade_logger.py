@@ -134,6 +134,37 @@ class StrategyLogger:
                        f"{k}={v}" for k, v in fields.items()),
                    label=label, action=action, **fields)
 
+    def label_was_closed(self, label: str) -> bool:
+        """True if this label's position log already recorded a 'close' action.
+
+        Idempotency guard for stateless-per-cycle bots (see S007's
+        bot/s007_paper.py::live): each label is emitted once per day by the
+        strategy engine and should open, then close, exactly once. The only
+        broker-side source of truth for "is this open" is a fresh reconcile
+        each cycle -- but a real stop-out can beat the M1 bar the engine is
+        reasoning from to the punch, so "not in the broker's open positions"
+        does NOT always mean "never opened". Checking our own append-only
+        log (which the broker call that closed it already wrote to) catches
+        that case: if we already saw this label close, never re-place it,
+        even if a lagging bar still "wants" it open (bug found 2026-07-21,
+        see decisions-log.md).
+        """
+        path = self.pos_dir / f"{_safe(label)}.jsonl"
+        if not path.exists():
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("action") == "close":
+                    return True
+        return False
+
     def order(self, label: str, op: str, cycle: str | None = None,
               request: dict | None = None, result=None, error=None) -> None:
         """Log a broker order attempt with its request and result/error, per-position."""

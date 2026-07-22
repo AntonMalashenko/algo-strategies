@@ -5,13 +5,9 @@ Install on the trading machine:
     pip install ctrader-open-api
 
 Credentials come from <repo>/.env via bot.config. The adapter runs one
-"session" per call inside the twisted reactor: connect -> app auth ->
-account auth -> perform queued work -> disconnect. A bot cycle (e.g. S007's
---live) typically does several of these calls back to back (resolve symbol,
-get M1 bars, list positions, place/close orders); crochet keeps a single
-reactor alive in a background thread for the whole process so each call can
-block synchronously without hitting Twisted's "reactor can only run once"
-restriction.
+"session" per call cycle inside the twisted reactor: connect -> app auth ->
+account auth -> perform queued work -> stop reactor. This fits the bot's
+run-every-15-minutes model (no long-lived process needed).
 
 Verify credentials with:  python -m bot.paper --check
 
@@ -21,6 +17,7 @@ interactively on first run.
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -28,8 +25,6 @@ import pandas as pd
 from bot import config as C
 
 try:
-    import crochet
-    crochet.setup()   # idempotent; starts the reactor in a background thread once
     from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOAApplicationAuthReq, ProtoOAAccountAuthReq,
@@ -41,10 +36,8 @@ try:
         ProtoOAOrderType, ProtoOATradeSide, ProtoOATrendbarPeriod,
     )
     HAVE_SDK = True
-except ImportError:            # dev machines without the SDK (or crochet)
+except ImportError:            # dev machines without the SDK
     HAVE_SDK = False
-
-CALL_TIMEOUT = 30   # seconds; one connect+auth+work+disconnect cycle
 
 
 class CTraderAdapter:
@@ -75,51 +68,41 @@ class CTraderAdapter:
         """Connect, authenticate, run `work(done)`; block until finished.
 
         auth_account=False stops after application auth — used to fetch the
-        account list before the account id is known.
-
-        Runs on crochet's persistent background reactor thread (see module
-        docstring), so this may be called many times per process — each call
-        opens its own connection, does its work, and disconnects."""
-        from twisted.internet.defer import Deferred
-
-        @crochet.wait_for(timeout=CALL_TIMEOUT)
-        def _do():
-            result_d = Deferred()
-
-            def done(result=None, error=None):
-                if result_d.called:
-                    return
-                try:
-                    self.client.stopService()
-                except Exception:
-                    pass
-                if error is not None:
-                    result_d.errback(error)
-                else:
-                    result_d.callback(result)
-
-            def on_connected(_client):
-                req = ProtoOAApplicationAuthReq()
-                req.clientId = self.client_id
-                req.clientSecret = self.secret
-                d = self.client.send(req)
-                if auth_account:
-                    d.addCallback(lambda _r: self._auth_account())
-                d.addCallback(lambda _r: work(done))
-                d.addErrback(lambda f: done(error=f))
-
-            self.client.setConnectedCallback(on_connected)
-            self.client.setDisconnectedCallback(
-                lambda _c, reason: done(error=reason) if not result_d.called else None)
-            self.client.startService()
-            return result_d
+        account list before the account id is known."""
+        from twisted.internet import reactor
 
         self._result, self._error = None, None
-        try:
-            self._result = _do()
-        except Exception as e:
-            self._error = e
-            raise RuntimeError(f"cTrader error: {e}") from e
+        finished = threading.Event()
+
+        def done(result=None, error=None):
+            if finished.is_set():
+                return
+            self._result, self._error = result, error
+            finished.set()
+            try:
+                self.client.stopService()
+            except Exception:
+                pass
+            if reactor.running:
+                reactor.callFromThread(reactor.stop)
+
+        def on_connected(_client):
+            req = ProtoOAApplicationAuthReq()
+            req.clientId = self.client_id
+            req.clientSecret = self.secret
+            d = self.client.send(req)
+            if auth_account:
+                d.addCallback(lambda _r: self._auth_account())
+            d.addCallback(lambda _r: work(done))
+            d.addErrback(lambda f: done(error=f))
+
+        self.client.setConnectedCallback(on_connected)
+        self.client.setDisconnectedCallback(
+            lambda _c, reason: done(error=reason) if not finished.is_set() else None)
+        self.client.startService()
+        reactor.run(installSignalHandlers=False)
+        if self._error is not None:
+            raise RuntimeError(f"cTrader error: {self._error}")
         return self._result
 
     def _auth_account(self):
@@ -160,23 +143,29 @@ class CTraderAdapter:
             d.addCallbacks(fin, lambda f: done(error=f))
         return self._run(work, auth_account=False)
 
+    def _get_balance_step(self):
+        """Account balance in deposit currency (session-chainable -- assumes
+        an already-connected+authed session, like `_get_m1_step` in
+        ctrader_s007.py; see `run_live_cycle`). Used to compute equal-
+        dollar-risk position sizing fresh every cycle, since balance moves
+        with every fill."""
+        req = ProtoOATraderReq()
+        req.ctidTraderAccountId = self.account
+        d = self.client.send(req)
+        d.addCallback(lambda resp: Protobuf.extract(resp).trader.balance / 100.0)
+        return d
+
     def check(self) -> dict:
         """Connectivity check: auth + balance + our pairs present."""
         def work(done):
             d = self._load_symbols()
+            d.addCallback(lambda _m: self._get_balance_step())
 
-            def ask_trader(_msg):
-                req = ProtoOATraderReq()
-                req.ctidTraderAccountId = self.account
-                return self.client.send(req)
-
-            def fin(resp):
-                t = Protobuf.extract(resp).trader
+            def fin(balance):
                 done(dict(
-                    balance=t.balance / 100.0,
+                    balance=balance,
                     symbols_found=[p for p in C.PAIRS if p.upper() in self._symbols],
                 ))
-            d.addCallback(ask_trader)
             d.addCallbacks(fin, lambda f: done(error=f))
         return self._run(work)
 
