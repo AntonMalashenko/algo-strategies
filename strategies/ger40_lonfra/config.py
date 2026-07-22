@@ -31,6 +31,14 @@ class StrategyConfig:
     # alternative risk model: unlimited adds, but the day is stopped when the
     # aggregate (realized + open, marked-to-market) loss reaches daily_loss_cap_R.
     # daily_loss_cap_R is in R; at 1R=0.5% a 2% cap = 4R, at 0.25% = 8R.
+    # TESTED 2026-07-22 and REJECTED as-is: this only bounds the LOSING side of
+    # the day -- on a winning trend day eff_max becomes 10**9 with nothing else
+    # capping add count, so net R/day grows ~monotonically and unrealistically
+    # with the cap (Dukascopy net: +0.437R at cap=4 (=baseline, unreached) up to
+    # +2.80R at cap=16, with drawdown NOT scaling proportionally) -- a leverage/
+    # concentration artifact (real broker margin/liquidity would stop this long
+    # before 10**9 positions), not a discovered edge. Needs a companion cap on
+    # add COUNT (not just loss) before this is usable. See experiments-log.md S007 E2.
     unlimited_adds: bool = False
     daily_loss_cap_R: float | None = None
 
@@ -58,6 +66,14 @@ class StrategyConfig:
 
     # --- pre-entry day filters (raise net profitability / cut drawdown) ---
     max_height: float | None = None  # skip day if Frankfurt height > this (points)
+    # TESTED 2026-07-22 and REJECTED as a day-quality filter: sweeping
+    # min_height in {5..40} on BASELINE_S007/WORKING_S007 (net, real spread,
+    # Dukascopy 2023-2026) nudges the aggregate net R/day up slightly at low
+    # thresholds (10-15pt: +0.437->+0.446..0.453R) but at higher thresholds
+    # (25-40pt) individual years collapse toward flat/negative (e.g. 2023/2024
+    # go near-zero or negative) while the aggregate average keeps climbing --
+    # the same overfitting signature as the already-rejected DOW/entry-time
+    # filters (backtest-log.md), not a robust edge. See experiments-log.md S007 E1.
     min_height: float | None = None
     max_gap_points: float | None = None  # skip if |10:00 open - prior RTH close| > this
     # scenario A only: skip if the entry (confirmation) candle already reaches the

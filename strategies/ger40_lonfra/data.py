@@ -33,7 +33,7 @@ def _data_dir() -> str:
     )
 
 
-DUKA_NAME = "GER40_Dukascopy_M1_2023-06-26_2026-07-13.csv.gz"
+DUKA_NAME = "GER40_Dukascopy_M1_2023-06-30_2026-07-22.csv.gz"  # refreshed 2026-07-22 via dukascopy-node (deuidxeur); see decisions-log.md
 MT5_NAME = "GER40.cash_M1_202603231944_202607082311.csv"
 
 

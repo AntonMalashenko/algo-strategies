@@ -18,6 +18,7 @@ data/raw/*
 data/processed/*
 data/histdata/*
 data/fresh/*
+data/GER40/*
 !data/**/.gitkeep
 reports/*
 !reports/.gitkeep
@@ -31,3 +32,6 @@ secrets.*
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code local machine settings (per-machine permission grants, not shared)
+.claude/settings.local.json
