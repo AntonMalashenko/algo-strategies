@@ -1,4 +1,12 @@
 #!/bin/bash
+# DEPRECATED 2026-07-23 -- superseded by scripts/s007_loop.py, supervised via
+# launchd (scripts/s007_loop_install.sh install). Root cause: this script's
+# long single `sleep <seconds-until-tomorrow>` call silently failed to wake
+# for ~17 hours overnight 2026-07-22/23 (process stayed alive in `ps`, zero
+# new log lines) -- most likely macOS App Nap/power-management throttling an
+# unsupervised long-lived timer in a bare backgrounded bash process. See
+# decisions-log.md 2026-07-23. Do not run this script -- kept only for
+# reference/rollback; DO NOT `nohup` it again.
 cd ~/Trading/algo
 source .venv/bin/activate
 

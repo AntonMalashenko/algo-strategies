@@ -18,6 +18,45 @@ broker to the desired position set:
 - Stateless: no long-lived process needed — schedule `--live` every 1 minute during
   the session (10:00–17:00 EET).
 
+## Risk controls
+
+Two signals guard the live bot beyond per-position sizing:
+
+**Daily aggregate risk cap** (`DAILY_RISK_CAP_PCT` in `bot/s007_config.py`,
+default 2% of current balance). `RISK_PCT` sizes each new entry/add
+independently and does not look at what is already open — min-lot flooring
+can push the REAL summed risk well past `max_positions x RISK_PCT`. Every
+cycle, `decide()` (`bot/s007_paper.py`) sums the broker's own potential loss
+across all open S007 positions — `|price - stopLoss| x volume`, read straight
+from `ProtoOAReconcileReq`'s response (`CTraderS007._reconcile_step`), not our
+nominal risk_amount — into `open_risk`. A new entry/add is skipped, logged as
+a `skip_risk_cap` event (`open_risk`/`new_risk`/`risk_cap` fields), once
+`open_risk + its own potential loss` would exceed `risk_cap`. `open_risk` and
+`risk_cap` are also logged on every `state` event for visibility. This does
+not force-close anything already open — it only blocks new entries.
+
+**Manual stop-for-today** (kill switch, e.g. news event or discretionary
+override):
+```
+python -m bot.s007_paper --stop-today     # close everything now, no new entries until tomorrow
+python -m bot.s007_paper --resume-today   # cancel the stop early, same day
+```
+Backed by a control file, `reports/control/S007_STOP_TODAY`, holding today's
+date — checked fresh every cycle (the bot is stateless). A stale file (an old
+date left behind) is ignored automatically, no manual cleanup needed. While
+active, `decide()` treats the rest of the day like `flat`: closes every open
+S007 position (`reason=manual_stop`) and opens nothing new. The `STATUS` line
+`--live` prints carries `manual_stop=True/False` for the scheduler.
+
+The scheduler (`scripts/s007_tick.py`) treats `manual_stop` the same as
+`day_done`/`filtered`: once seen, it logs `loop_settled` and stops running
+full `--live` cycles for the rest of the session (heartbeat-only) — no point
+polling every minute for an answer that cannot change until tomorrow.
+`--resume-today` logs a `loop_resumed` event so the scheduler un-settles
+(resumes running full cycles) if that happens later than the last
+`loop_settled` — otherwise a resume mid-session would clear the stop file but
+the scheduler would keep silently skipping cycles anyway.
+
 ## Setup
 
 Credentials are the same `.env` as S004:
@@ -77,6 +116,11 @@ log.position(label, "open", ...); log.order(label, "place_market", request=..., 
 - `bot/s007_config.py` — config + credentials.
 - `bot/s007_signals.py` — `plan_now()` desired-position set (reuses the engine).
 - `bot/ctrader_s007.py` — cTrader adapter extension (M1 bars, market orders, close).
-- `bot/s007_paper.py` — CLI runner (`--dry-run/--accounts/--check/--live`).
+- `bot/s007_paper.py` — CLI runner (`--dry-run/--accounts/--check/--live/--stop-today/--resume-today`).
+- `bot/risk.py` — `lots_for_risk()`, equal-dollar-risk position sizing.
 - `strategies/ger40_lonfra/` — the validated strategy engine + presets.
+- `scripts/s007_tick.py` — stateless scheduler tick, invoked every minute by
+  launchd (`scripts/com.anton.algo.s007bot.plist`,
+  `scripts/s007_loop_install.sh install|uninstall|status`) — see "Risk
+  controls" above for how it consumes `day_done`/`filtered`/`manual_stop`.
 - Spec: `strategy-spec-S007.md` (project) / `GER40-london-frankfurt/algo/docs/`.

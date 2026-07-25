@@ -1,0 +1,16 @@
+CTRADER:
+  - username: username@gmail.com
+    CLIENT_ID: ******
+    CLIENT_SECRET: ******
+    ACCOUNT_ID: ******
+    ACCESS_TOKEN: ******
+    active: true
+    initial_balance: 10000
+
+BYBIT:
+  - username: username@gmail.com
+    API_KEY: ******
+    API_SECRET: ******
+    TESTNET: false
+    active: true
+    initial_balance: 100

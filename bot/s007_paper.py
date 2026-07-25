@@ -12,6 +12,11 @@ Broker cycle (reuses the S004 cTrader connection / .env):
     python -m bot.s007_paper --check         # auth + balance + GER40 present
     python -m bot.s007_paper --live          # one reconcile cycle; schedule every 1 min
 
+Manual kill-switch for the rest of today (e.g. news event, discretionary override):
+
+    python -m bot.s007_paper --stop-today    # close everything, no new entries, until tomorrow
+    python -m bot.s007_paper --resume-today  # cancel the stop early, same day
+
 The bot is stateless: each cycle rebuilds the day's state from recent M1 bars via
 the validated engine and reconciles the broker to it. The common 0.5 stop and the
 day target are attached to each order (server-side); the bot only opens new
@@ -33,6 +38,41 @@ from utils.trade_logger import StrategyLogger
 
 ROOT = Path(__file__).resolve().parent.parent
 LOG = StrategyLogger("S007", log_root=str(ROOT / "reports" / "logs"))
+
+# Manual stop flag: a file holding today's date, checked fresh every cycle
+# (the bot is stateless -- see module docstring). If present AND its content
+# is today's date, decide() treats the rest of today like `flat` (close
+# everything, no new entries). A stale flag (yesterday's date left behind) is
+# ignored automatically -- no manual cleanup needed, unlike a plain touch-file.
+STOP_FLAG = ROOT / "reports" / "control" / "S007_STOP_TODAY"
+
+
+def _stop_flag_active() -> bool:
+    if not STOP_FLAG.exists():
+        return False
+    return STOP_FLAG.read_text().strip() == datetime.now().strftime("%Y-%m-%d")
+
+
+def stop_today():
+    STOP_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    STOP_FLAG.write_text(datetime.now().strftime("%Y-%m-%d"))
+    print(f"S007 stopped for today ({STOP_FLAG.read_text()}) -- "
+          f"next --live cycle will close all open positions and open no new ones.")
+
+
+def resume_today():
+    # Always log loop_resumed, even if the flag file was already gone -- the
+    # scheduler (scripts/s007_tick.py) may have logged loop_settled earlier
+    # today (day_done/filtered/manual_stop) and needs a resume marker AFTER
+    # that settle timestamp to start running full cycles again; without this
+    # event a bare STOP_FLAG.unlink() would silently do nothing, since the
+    # scheduler's "settled today" check doesn't look at the flag file at all.
+    LOG.event("loop_resumed", today=datetime.now().strftime("%Y-%m-%d"))
+    if STOP_FLAG.exists():
+        STOP_FLAG.unlink()
+        print("S007 manual stop cleared -- resuming normal trading.")
+    else:
+        print("S007 was not stopped -- nothing to clear (scheduler un-settled anyway).")
 
 
 def _load_local(path: Path) -> pd.DataFrame:
@@ -102,10 +142,33 @@ def live():
         metadata) and placing orders, so this cannot make its own broker
         calls -- balance and money_per_point_per_lot are handed in already
         fetched, fresh, for this cycle."""
+        # money_per_point_per_lot as fetched by CTraderS007.run_live_cycle is
+        # correct in DE40/GER40's own quote currency (EUR), not yet in this
+        # account's deposit currency (USD) -- see C.EUR_TO_USD_FX_RATE_APPROX
+        # for the full story (decisions-log.md 2026-07-23) and how/when to
+        # refresh this snapshot rate. Applied here, before any logging or
+        # sizing, so every downstream $ figure (risk_amount comparisons, the
+        # "state"/"size" log events, lots_for_risk) is already in real USD.
+        money_per_point_per_lot = money_per_point_per_lot * C.EUR_TO_USD_FX_RATE_APPROX
         res = plan_now(m1)
-        status.update(day_done=res["day_done"], in_window=res["in_window"])
+        manual_stop = _stop_flag_active()
+        status.update(day_done=res["day_done"], in_window=res["in_window"],
+                      filtered=res.get("filtered", False), manual_stop=manual_stop)
         have = {p["label"]: p for p in broker_positions if p["label"].startswith(C.MAGIC)}
         risk_amount = balance * C.RISK_PCT / 100.0
+
+        # Real potential loss already on the books, from the broker's own fill
+        # price/stopLoss (not our nominal risk_amount) -- volume is in Open API
+        # raw units (see CTraderS007._volume_from_lots: raw = lots*100*lotSize),
+        # and money_per_point_per_lot here already equals lotSize*FX, so
+        # (volume/100)*|price-sl|*FX == lots*lotSize*FX*|price-sl|, the lotSize
+        # cancels and no separate contract-size lookup is needed.
+        open_risk = sum(
+            (p["volume"] / 100.0) * abs(p["price"] - p["stop_loss"]) * C.EUR_TO_USD_FX_RATE_APPROX
+            for p in have.values() if p.get("price") and p.get("stop_loss")
+        )
+        risk_cap = balance * C.DAILY_RISK_CAP_PCT / 100.0
+
         LOG.event("state", cycle=cid, symbol=symbol,
                   last_bar=str(m1.index[-1]) if len(m1) else None,
                   in_window=res["in_window"], day_done=res["day_done"], flat=res["flat"],
@@ -113,12 +176,15 @@ def live():
                   broker_positions=len(broker_positions), ours_open=len(have),
                   n_desired=len(res["positions"]), balance=balance,
                   money_per_point_per_lot=money_per_point_per_lot,
-                  risk_amount=risk_amount, use_fixed_lot=C.USE_FIXED_LOT)
+                  risk_amount=risk_amount, use_fixed_lot=C.USE_FIXED_LOT,
+                  open_risk=open_risk, risk_cap=risk_cap)
 
         out = []
-        if res["day_done"] or res["flat"] or not res["in_window"]:
-            reason = "target" if res["day_done"] else ("flat_time" if res["flat"] else "out_of_window")
-            for lab, p in have.items():       # target hit / end of session -> flatten
+        if manual_stop or res["day_done"] or res["flat"] or not res["in_window"]:
+            reason = ("manual_stop" if manual_stop else
+                      "target" if res["day_done"] else
+                      ("flat_time" if res["flat"] else "out_of_window"))
+            for lab, p in have.items():       # target hit / end of session / manual stop -> flatten
                 out.append(dict(kind="close", label=lab, reason=reason,
                                 position_id=p["position_id"], volume=p["volume"]))
         else:
@@ -140,6 +206,14 @@ def live():
                 else:
                     lot = lots_for_risk(risk_amount, stop_distance,
                                         money_per_point_per_lot, min_lot=C.FIXED_LOT)
+                new_risk = lot * stop_distance * money_per_point_per_lot
+                if open_risk + new_risk > risk_cap:
+                    # Would push today's summed potential loss (already-open +
+                    # this one) past DAILY_RISK_CAP_PCT -- skip, don't open.
+                    LOG.event("skip_risk_cap", cycle=cid, label=lab,
+                              open_risk=open_risk, new_risk=new_risk, risk_cap=risk_cap)
+                    continue
+                open_risk += new_risk
                 LOG.event("size", cycle=cid, label=lab, stop_distance=stop_distance,
                           risk_amount=risk_amount, money_per_point_per_lot=money_per_point_per_lot,
                           lot=lot)
@@ -179,10 +253,13 @@ def live():
     for a_ in actions_taken:
         print(" ", a_)
     if status:
-        # machine-readable marker for the scheduling loop: once day_done and
-        # nothing left to close (0 actions this cycle), it can stop polling
-        # every minute and sleep until the next session window instead.
+        # machine-readable marker for the scheduling loop (scripts/s007_loop.py):
+        # once day_done (target reached) OR filtered (today's Frankfurt range
+        # already failed the height filter -- a verdict that can't change for
+        # the rest of the day, see s007_signals.py::plan_now) it can stop
+        # polling every minute and sleep until the next session window instead.
         print(f"STATUS day_done={status.get('day_done')} in_window={status.get('in_window')} "
+              f"filtered={status.get('filtered')} manual_stop={status.get('manual_stop')} "
               f"actions={len(actions_taken)}")
 
 
@@ -193,8 +270,14 @@ if __name__ == "__main__":
     ap.add_argument("--accounts", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--live", action="store_true")
+    ap.add_argument("--stop-today", action="store_true")
+    ap.add_argument("--resume-today", action="store_true")
     a = ap.parse_args()
-    if a.accounts:
+    if a.stop_today:
+        stop_today()
+    elif a.resume_today:
+        resume_today()
+    elif a.accounts:
         accounts()
     elif a.check:
         check()

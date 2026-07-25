@@ -41,6 +41,12 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
       positions   -- list of positions that SHOULD be open right now, each:
                      {label, side, entry, sl, tp, is_add}
       direction   -- 'up'/'down'/None for the day
+      filtered    -- True only when today's Frankfurt range failed the
+                     day-quality height filter -- a verdict that is FINAL for
+                     the rest of today (see the height-check branch below).
+                     Absent/falsy in every other case, including "not enough
+                     bars yet" and "no A/B scenario yet", which can still
+                     resolve later today and must keep being polled.
     """
     cfg = _preset(preset).with_(trade_start=C.TRADE_START, exit_end=C.EXIT_END,
                                 fr_start=C.FR_START, fr_end=C.FR_END)
@@ -60,8 +66,18 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
     mid = (rh + rl) / 2
     height = rh - rl
     if height <= 0 or (cfg.max_height is not None and height > cfg.max_height):
+        # This verdict is FINAL for the day, not "no signal yet": the Frankfurt
+        # range (09:00-09:59) is already fixed and closed by the time we can
+        # compute rh/rl at all, so height cannot change on a later call this
+        # same day. filtered=True lets a scheduler (scripts/s007_loop.py) stop
+        # polling once it sees this, instead of re-checking every minute until
+        # 16:59 for an answer that was already decided at ~10:00 (see
+        # decisions-log.md 2026-07-23). Contrast with the two branches above/
+        # below this one, which return the same in-window "nothing to do yet"
+        # shape but for reasons that CAN still resolve later today (bars still
+        # arriving, or no A/B scenario yet) -- those must NOT set filtered.
         return dict(in_window=in_window, day_done=False, flat=flat, positions=[],
-                    direction=None, context=None)
+                    direction=None, context=None, filtered=True)
 
     ld = df[(df.date_only == today) & (df.time_only >= C.TRADE_START) & (df.time_only <= now_hm)]
     if len(ld) < 2:

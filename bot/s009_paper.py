@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -39,6 +40,7 @@ sys.path.insert(0, str(REPO))
 from strategies.funding_carry import (  # noqa: E402
     FundingCarryConfig, load_panels, run_backtest, MS_PER_DAY, DEFAULT_UNIVERSE,
 )
+from utils.trade_logger import StrategyLogger  # noqa: E402  (shared project logger)
 
 DATA_DIR = REPO / "data" / "raw" / "crypto_funding"
 STATE_DIR = REPO / "reports" / "paper_s009"
@@ -161,7 +163,62 @@ def forward_target_book(close: pd.DataFrame, funding: pd.DataFrame, cfg: Funding
     return {s: float(round(v * k, 4)) for s, v in book.items()}
 
 
-def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_forming: bool = True) -> None:
+def _floor_step(x: float, step: float) -> float:
+    return math.floor(abs(x) / step) * step
+
+
+def reconcile_to_target(client, target_book: dict, equity: float, log, cid, execute: bool) -> list[dict]:
+    """Turn the target book (weights) into delta market orders vs current broker
+    positions. dry (execute=False) logs the plan; execute places demo orders and
+    records the fill price + slippage vs the reference price."""
+    positions = client.positions()
+    plan: list[dict] = []
+    for sym in sorted(set(target_book) | set(positions)):
+        w = float(target_book.get(sym, 0.0))
+        try:
+            price = client.ticker_price(sym)
+            inst = client.instrument(sym)
+        except Exception as exc:
+            log.error(f"price/instrument fetch failed {sym}", exc=exc, cycle=cid)
+            continue
+        if price <= 0:
+            continue
+        tgt_qty = math.copysign(_floor_step(w * equity / price, inst.qty_step), w) if w else 0.0
+        cur = float(positions.get(sym, 0.0))
+        delta = tgt_qty - cur
+        if abs(delta) < inst.min_qty:
+            continue
+        side = "Buy" if delta > 0 else "Sell"
+        qty = round(_floor_step(delta, inst.qty_step), 8)
+        if qty < inst.min_qty:
+            continue
+        rec = {"symbol": sym, "side": side, "qty": qty, "ref_price": price,
+               "target_qty": tgt_qty, "cur_qty": cur}
+        plan.append(rec)
+        if not execute:
+            log.order(f"S009:{sym}", "plan_market", cycle=cid,
+                      request={"side": side, "qty": qty, "ref_price": price}, result="dry-run")
+            continue
+        try:
+            res = client.place_market(sym, side, qty)
+            oid = res.get("orderId")
+            fill = client.recent_fill_price(sym, oid) if oid else None
+            slip = ((fill - price) / price) if (fill and price) else None
+            log.order(f"S009:{sym}", "place_market", cycle=cid,
+                      request={"side": side, "qty": qty, "ref_price": price},
+                      result={"orderId": oid, "fill": fill, "slippage": slip})
+            log.event("fill", cycle=cid, symbol=sym, side=side, qty=qty,
+                      ref_price=price, fill=fill, slippage=slip)
+            rec["fill"] = fill
+            rec["slippage"] = slip
+        except Exception as exc:
+            log.order(f"S009:{sym}", "place_market", cycle=cid,
+                      request={"side": side, "qty": qty, "ref_price": price}, error=exc)
+    return plan
+
+
+def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_forming: bool = True,
+             broker: str = "off", allow_mainnet: bool = False) -> None:
     if do_fetch:
         print("Refreshing data from Bybit (public)...")
         refresh_data(cfg.universe, data_dir)
@@ -177,29 +234,60 @@ def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_formi
     latest = days[-1]
 
     st = load_state()
+    date = pd.to_datetime(latest * MS_PER_DAY, unit="ms", utc=True).strftime("%Y-%m-%d")
+
+    # Route through the shared project logger (uniform with S004/S007). We only
+    # USE its public API — the logger itself is unchanged. One cycle per daily run.
+    log = StrategyLogger("S009", log_root=REPO / "reports" / "logs", console=False)
+    cid = log.cycle_start(mode="paper-shadow", latest_day=date,
+                          equity=round(st["equity"], 6), universe=len(cfg.universe),
+                          fetched=do_fetch)
+
     # First run: seed the book to hold now, book NO already-closed day.
     # Subsequent runs: realise every day that closed since we last set a book.
     start = (st["last_day"] + 1) if st["last_day"] is not None else latest + 1
     equity = st["equity"]
+    booked = 0
     for d in [x for x in days if start <= x <= latest]:
         net = float(out.loc[d, "net_ret"])
         equity *= (1 + net)
-        append_ledger({
-            "day": int(d),
-            "date": pd.to_datetime(d * MS_PER_DAY, unit="ms", utc=True).strftime("%Y-%m-%d"),
-            "net_ret": round(net, 6),
+        d_date = pd.to_datetime(d * MS_PER_DAY, unit="ms", utc=True).strftime("%Y-%m-%d")
+        row = {
+            "day": int(d), "date": d_date, "net_ret": round(net, 6),
             "price_comp": round(float(price_comp.loc[d]), 6),
             "funding_comp": round(float(fund_comp.loc[d]), 6),
             "turnover": round(float(out.loc[d, "turnover"]), 4),
-            "n_pos": int(out.loc[d, "n_pos"]),
-            "equity": round(equity, 6),
-        })
+            "n_pos": int(out.loc[d, "n_pos"]), "equity": round(equity, 6),
+        }
+        append_ledger(row)
+        log.event("day_pnl", cycle=cid, **row)
+        booked += 1
 
     target = forward_target_book(close, funding, cfg)
+    # Log the target book per symbol (one file per coin under positions/).
+    for sym, wt in target.items():
+        log.position(f"S009:{sym}", "desired", cycle=cid,
+                     side="long" if wt > 0 else "short", weight=wt, for_date=date)
     st.update({"last_day": int(latest), "equity": round(equity, 6), "book": target})
     save_state(st)
 
-    date = pd.to_datetime(latest * MS_PER_DAY, unit="ms", utc=True).strftime("%Y-%m-%d")
+    # Broker execution (optional): reconcile the target book to real positions.
+    plan = []
+    if broker != "off" and target:
+        from bot.bybit_exec import BybitExec
+        client = BybitExec(allow_mainnet=allow_mainnet)
+        broker_eq = client.wallet_equity()
+        log.event("broker", cycle=cid, env=client.env, equity=round(broker_eq, 2), mode=broker)
+        plan = reconcile_to_target(client, target, broker_eq, log, cid, execute=(broker == "execute"))
+        print(f"\nbroker[{client.env}] equity={broker_eq:.2f}  mode={broker}  orders={len(plan)}")
+        for r in plan:
+            extra = f" fill={r.get('fill')} slip={r.get('slippage')}" if "fill" in r else ""
+            print(f"  {r['side']:>4} {r['qty']} {r['symbol']} @~{r['ref_price']}  (cur {r['cur_qty']} → tgt {r['target_qty']}){extra}")
+
+    log.cycle_end(cid, status=f"paper-shadow: {len(target)} positions, {booked} day(s) booked, "
+                             f"broker={broker} orders={len(plan)}",
+                  equity=round(equity, 6))
+
     longs = {s: v for s, v in target.items() if v > 0}
     shorts = {s: v for s, v in target.items() if v < 0}
     print(f"\n=== S009 paper cycle {date} ===")
@@ -261,6 +349,9 @@ def main() -> None:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--reconcile", action="store_true")
     ap.add_argument("--simulate", type=int, metavar="N", help="replay last N days from local data")
+    ap.add_argument("--broker", choices=["off", "dry", "execute"], default="off",
+                    help="off=shadow only; dry=compute+log intended demo orders; execute=place demo orders")
+    ap.add_argument("--allow-mainnet", action="store_true", help="DANGER: permit real mainnet orders")
     ap.add_argument("--data", type=Path, default=DATA_DIR)
     args = ap.parse_args()
 
@@ -271,7 +362,8 @@ def main() -> None:
     elif args.reconcile:
         reconcile(args.data, DEPLOY)
     elif args.once:
-        run_once(args.data, DEPLOY, do_fetch=not args.no_fetch)
+        run_once(args.data, DEPLOY, do_fetch=not args.no_fetch,
+                 broker=args.broker, allow_mainnet=args.allow_mainnet)
     else:
         ap.print_help()
 

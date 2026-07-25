@@ -194,6 +194,11 @@ class CTraderS007(CTraderAdapter):
                     label=getattr(td, "label", "") or "",
                     side="buy" if td.tradeSide == ProtoOATradeSide.BUY else "sell",
                     volume=td.volume,
+                    # broker's own fill price / current SL, not our requested
+                    # values -- needed to sum real potential loss across open
+                    # positions (bot/s007_paper.py's daily risk cap).
+                    price=p.price,
+                    stop_loss=p.stopLoss,
                 ))
             return out
         d.addCallback(fin)
@@ -338,6 +343,11 @@ class CTraderS007(CTraderAdapter):
                 # full_symbol param and bot/risk.py for how these two feed sizing.
                 full_symbol = yield self._get_full_symbol_step(symbol)
                 balance = yield self._get_balance_step()
+                # Correct in THIS SYMBOL's own quote currency (EUR for
+                # GER40/DE40) -- NOT yet converted to the account's deposit
+                # currency. bot/s007_paper.py::decide() applies that
+                # conversion (C.EUR_TO_USD_FX_RATE_APPROX) before using this
+                # for any risk math; see decisions-log.md 2026-07-23.
                 money_per_point_per_lot = full_symbol.lotSize
 
                 m1 = yield self._get_m1_step(symbol, history_days)

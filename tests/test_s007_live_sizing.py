@@ -69,11 +69,15 @@ def test_live_sizes_new_positions_by_risk_not_fixed_lot(fake_broker, monkeypatch
     monkeypatch.setattr(C, "RISK_PCT", 0.25)
     monkeypatch.setattr(C, "FIXED_LOT", 0.01)
 
+    # decide() multiplies the raw 114.3 by C.EUR_TO_USD_FX_RATE_APPROX (see
+    # bot/s007_config.py) before sizing, so the lots below are computed against
+    # 114.3 * C.EUR_TO_USD_FX_RATE_APPROX (~130.66 at the current 1.1427 rate),
+    # not the raw 114.3 the fake broker hands in.
     fake_positions = [
         dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=17950.0,
-             tp=18100.0, is_add=False),  # 50-pt stop -> 25/(50*114.3) < min -> 0.01
+             tp=18100.0, is_add=False),  # 50-pt stop -> still < min -> 0.01
         dict(label="S007:2024-05-10:1", side="buy", entry=18000.0, sl=17995.0,
-             tp=18100.0, is_add=True),   # 5-pt stop -> 25/(5*114.3) ≈ 0.0437 -> sizes UP
+             tp=18100.0, is_add=True),   # 5-pt stop -> still sizes UP above 0.01
     ]
     monkeypatch.setattr(s007_paper, "plan_now", lambda m1: dict(
         in_window=True, day_done=False, flat=False, positions=fake_positions,
@@ -85,7 +89,8 @@ def test_live_sizes_new_positions_by_risk_not_fixed_lot(fake_broker, monkeypatch
     assert balance == 10_000.0 and ppp == 114.3
     by_label = {a["label"]: a for a in actions}
     assert by_label["S007:2024-05-10:0"]["volume_lots"] == pytest.approx(0.01)
-    assert by_label["S007:2024-05-10:1"]["volume_lots"] == pytest.approx(25.0 / (5.0 * 114.3))
+    assert by_label["S007:2024-05-10:1"]["volume_lots"] == pytest.approx(
+        25.0 / (5.0 * 114.3 * C.EUR_TO_USD_FX_RATE_APPROX))
     assert by_label["S007:2024-05-10:1"]["volume_lots"] > 0.01
 
 
