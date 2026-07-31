@@ -47,16 +47,18 @@ class CTraderAdapter:
     def __init__(self, require_account: bool = True):
         if not HAVE_SDK:
             raise RuntimeError("pip install ctrader-open-api first")
-        self.client_id = C.cred("CTRADER_CLIENT_ID")
-        self.secret = C.cred("CTRADER_CLIENT_SECRET")
-        self.token = C.cred("CTRADER_ACCESS_TOKEN")
-        self.account = int(C.cred("CTRADER_ACCOUNT_ID", "0"))
-        host = C.cred("CTRADER_HOST") or EndPoints.PROTOBUF_DEMO_HOST
+        creds = C.ctrader_credentials()
+        self.client_id = creds["client_id"]
+        self.secret = creds["client_secret"]
+        self.token = creds["access_token"]
+        self.account = int(creds["account_id"] or 0)
+        host = creds["host"] or EndPoints.PROTOBUF_DEMO_HOST
         need = [self.client_id, self.secret, self.token]
         if require_account:
             need.append(self.account)
         if not all(need):
-            raise RuntimeError("missing CTRADER_* credentials (see bot/config.py)")
+            raise RuntimeError(
+                "missing CTRADER_* credentials (see configs/accounts.yml / bot/config.py)")
         self.client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
         self._result = None
         self._error = None

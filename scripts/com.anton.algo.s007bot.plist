@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- S007 live scheduler tick (scripts/s007_tick.py). launchd invokes it
+         once a minute, around the clock. It is NOT a long running process:
+         each invocation reads the clock, does at most one trading cycle,
+         and exits. See scripts/s007_loop_install.sh for install and
+         uninstall commands, and decisions-log.md 2026-07-23 for why this
+         design was chosen (a long-lived bash sleep silently failed to wake
+         for about 17 hours under a plain background process; delegating
+         "when to run next" to launchd removes that whole failure class
+         instead of just shortening the sleep). -->
+    <key>Label</key>
+    <string>com.anton.algo.s007bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Anton_Malashenko/Trading/algo/.venv/bin/python3</string>
+        <string>/Users/Anton_Malashenko/Trading/algo/scripts/s007_tick.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/Anton_Malashenko/Trading/algo</string>
+
+    <!-- StartCalendarInterval with an empty dict means "every minute of
+         every hour of every day", anchored to real wall clock minute
+         boundaries, NOT StartInterval. This distinction matters: launchd
+         computes each StartInterval firing as (time the job last actually
+         started) plus N seconds, so any per-cycle overhead (process spawn,
+         a slow disk, a moment of scheduling contention) is carried forward
+         into the next firing and never corrected. Over many thousands of
+         firings a day that compounds into a monotonic drift with no daily
+         reset: weeks in, the tick that "should" land at 10:00:00 could be
+         landing several minutes later and drifting further every day
+         (see decisions-log.md 2026-07-23, follow-up on interval drift).
+         StartCalendarInterval has no such compounding: each future firing
+         is computed from the absolute calendar clock, not from the
+         previous run's start time, so there is nothing to accumulate.
+         Running every minute instead of every 60 seconds is not more
+         expensive in practice: outside the trading session, or once today
+         is already settled, a tick is a near instant no-op (a one-off
+         Python start plus a date check, no broker call). Do NOT set
+         KeepAlive here: this job is supposed to exit after every tick.
+         KeepAlive is for a process meant to run continuously, and would
+         fight this schedule (launchd would treat each normal exit as a
+         crash to restart immediately). -->
+    <key>StartCalendarInterval</key>
+    <dict/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Anton_Malashenko/Trading/algo/reports/logs/S007/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Anton_Malashenko/Trading/algo/reports/logs/S007/launchd.err.log</string>
+</dict>
+</plist>

@@ -134,6 +134,23 @@ class StrategyLogger:
                        f"{k}={v}" for k, v in fields.items()),
                    label=label, action=action, **fields)
 
+    def _label_has_action(self, label: str, action: str) -> bool:
+        path = self.pos_dir / f"{_safe(label)}.jsonl"
+        if not path.exists():
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("action") == action:
+                    return True
+        return False
+
     def label_was_closed(self, label: str) -> bool:
         """True if this label's position log already recorded a 'close' action.
 
@@ -149,21 +166,21 @@ class StrategyLogger:
         even if a lagging bar still "wants" it open (bug found 2026-07-21,
         see decisions-log.md).
         """
-        path = self.pos_dir / f"{_safe(label)}.jsonl"
-        if not path.exists():
-            return False
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("action") == "close":
-                    return True
-        return False
+        return self._label_has_action(label, "close")
+
+    def label_was_opened(self, label: str) -> bool:
+        """True if this label's position log already recorded an 'open' action.
+
+        Companion to label_was_closed(), for a narrower race than the one it
+        guards: the broker-side reconcile can show a label gone (stopped/TP'd)
+        in the SAME cycle where our own log hasn't recorded the close yet
+        (nothing had a reason to, until that reconcile came back empty). A
+        label we ourselves opened that the broker no longer reports open has,
+        by construction, already closed on the broker's side even though our
+        log doesn't say so yet -- see the caller in bot/s007_paper.py::decide
+        (bug found live 2026-07-30, see decisions-log.md).
+        """
+        return self._label_has_action(label, "open")
 
     def order(self, label: str, op: str, cycle: str | None = None,
               request: dict | None = None, result=None, error=None) -> None:

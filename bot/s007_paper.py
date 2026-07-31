@@ -192,6 +192,21 @@ def live():
             for lab, o in want.items():       # open new entries/adds (server-side SL/TP)
                 if lab in have:
                     continue
+                if LOG.label_was_opened(lab) and not LOG.label_was_closed(lab):
+                    # We ourselves already placed this label successfully and
+                    # the broker no longer reports it open -- it has, by
+                    # construction, already closed broker-side (stop/TP/manual),
+                    # even though nothing logged the close yet (nothing had a
+                    # reason to, until this reconcile came back empty). Backfill
+                    # the close now, in THIS cycle, before label_was_closed()
+                    # is checked below -- otherwise a lagging M1 bar can still
+                    # "want" this label and we'd re-place it with a stop the
+                    # live price has already moved past (bug found live
+                    # 2026-07-30, see decisions-log.md).
+                    LOG.position(lab, "close", cycle=cid, reason="broker_side_close_detected")
+                    LOG.event("skip_reopen", cycle=cid, label=lab,
+                              reason="broker_side_close_detected")
+                    continue
                 if LOG.label_was_closed(lab):
                     # Broker doesn't show it open, but OUR log already saw it
                     # close today -- a real stop-out the current M1 bar just
@@ -221,8 +236,20 @@ def live():
                                 volume_lots=lot, entry=o["entry"], is_add=o["is_add"]))
         return out
 
+    # CTraderS007() is constructed OUTSIDE the try below, deliberately: its
+    # __init__ loads credentials (configs/accounts.yml via bot.accounts_config,
+    # falling back to .env) before any broker call. A malformed accounts.yml
+    # or missing credential must crash this subprocess loudly (non-zero exit)
+    # so scripts/s007_tick.py::run_cycle() logs "live cycle subprocess exited
+    # non-zero" once -- not get swallowed into the per-cycle except below and
+    # silently re-logged every minute forever. Real incident 2026-07-29: a
+    # stray leading space in accounts.yml broke YAML parsing; because
+    # construction used to happen inside this try, the bot did nothing for
+    # ~4 min while looking, from the scheduler's point of view, like a normal
+    # zero-action cycle. See tests/configs/test_accounts_yaml.py for the file-
+    # shape regression test and decisions-log.md for the incident writeup.
+    api = CTraderS007()
     try:
-        api = CTraderS007()
         cyc = api.run_live_cycle(C.SYMBOL_CANDIDATES, C.HISTORY_DAYS, decide)
         symbol = cyc["symbol"]
         for r in cyc["results"]:

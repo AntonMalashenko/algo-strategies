@@ -4,6 +4,7 @@ numpy>=1.26
 matplotlib>=3.8
 pyarrow>=15          # быстрый parquet для хранения свечей
 python-dotenv>=1.0
+pyyaml>=6.0          # configs/accounts.yml (broker creds), bot/accounts_config.py
 
 # --- Данные ---
 ccxt>=4.3            # крипта (если понадобится)

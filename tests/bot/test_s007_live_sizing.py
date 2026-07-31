@@ -131,6 +131,41 @@ def test_live_skips_reopening_a_label_the_log_already_closed(fake_broker, monkey
     assert fresh_label in labels
 
 
+def test_live_backfills_close_and_skips_reopen_on_broker_side_stop_before_log_catches_up(
+        fake_broker, monkeypatch):
+    # 2026-07-30 live incident: broker_positions comes back empty (real stop
+    # already filled), but the M1 bar plan_now() used to build `positions`
+    # hadn't caught up yet, so it still "wanted" the same label open -- and
+    # our own log had an "open" record but no "close" yet (nothing had
+    # detected the broker-side close to log it). decide() must recognize
+    # this from label_was_opened()+not label_was_closed() alone, backfill the
+    # close, and NOT attempt to re-place the position (it did, live, and the
+    # broker rejected it with TRADING_BAD_STOPS purely by luck of price
+    # having already moved past the stale stop level).
+    from bot import s007_paper, s007_config as C
+
+    monkeypatch.setattr(C, "USE_FIXED_LOT", True)
+    monkeypatch.setattr(C, "FIXED_LOT", 0.01)
+
+    label = "S007:2026-07-30:3"
+    s007_paper.LOG.position(label, "open", side="buy", entry=25388.2,
+                            sl=25318.2, tp=25543.4, is_add=False)
+    assert s007_paper.LOG.label_was_closed(label) is False  # not backfilled yet
+
+    fake_positions = [
+        dict(label=label, side="buy", entry=25388.2, sl=25318.2, tp=25543.4, is_add=False),
+    ]
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1: dict(
+        in_window=True, day_done=False, flat=False, positions=fake_positions,
+        direction="up", context={}))
+
+    s007_paper.live()
+
+    _, _, actions = fake_broker.last_decide_args
+    assert actions == []
+    assert s007_paper.LOG.label_was_closed(label) is True  # backfilled by decide()
+
+
 def test_live_uses_fixed_lot_when_flag_set(fake_broker, monkeypatch):
     from bot import s007_paper, s007_config as C
 

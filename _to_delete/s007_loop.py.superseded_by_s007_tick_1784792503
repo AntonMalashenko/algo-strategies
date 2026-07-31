@@ -1,0 +1,145 @@
+"""S007 live scheduling loop -- Python replacement for scripts/s007_loop.sh.
+
+Runs the bot's reconcile cycle (`python -m bot.s007_paper --live`) as a fresh
+subprocess every cycle -- deliberately, NOT by importing bot.s007_paper.live()
+and calling it in-process. bot/ctrader.py's session model (CTraderAdapter._run)
+calls Twisted's `reactor.run()` once per cycle; a Twisted reactor cannot be
+restarted within the same process (raises ReactorNotRestartable on the second
+call). A fresh subprocess gives every cycle its own never-yet-run reactor,
+exactly like the old bash loop did by re-invoking the interpreter each time --
+see decisions-log.md 2026-07-23. It also means one wedged cycle can be killed
+on CYCLE_TIMEOUT_SECONDS without taking down the scheduler supervising it.
+
+Root incident this replaces (2026-07-22/23, see decisions-log.md): the old
+bash loop's `sleep 61172` (a single ~17-hour sleep computed once at 17:00, to
+carry it overnight to the next session) never returned -- the process stayed
+alive in `ps` (STAT=SN) but produced zero log lines for ~17 hours. Most likely
+cause: macOS App Nap/power-management throttling a long-lived timer in an
+unsupervised background bash process. The fix here has two independent parts,
+and both matter -- moving the scheduling to Python alone would NOT have fixed
+this, since a bare `time.sleep(61172)` in Python is exactly as exposed to the
+same OS-level throttling as bash's `sleep`:
+
+  1. NEVER sleep longer than IDLE_POLL_SECONDS in one call. There is no long-
+     duration timer anywhere in this script to distrust -- every sleep is
+     short and the wall clock is re-read after each one, so a delayed or
+     coalesced wake self-corrects on the very next iteration instead of
+     silently losing hours. The old "compute exact seconds until 10:00
+     tomorrow and sleep exactly that long" pattern is gone entirely.
+  2. Run this script under a supervisor built for exactly this failure mode
+     -- launchd, not a bare `nohup ... &` bash process. See
+     scripts/com.anton.algo.s007bot.plist and the install instructions in
+     its companion scripts/s007_loop_install.sh. launchd's KeepAlive restarts
+     this process if it ever dies; ProcessType=Interactive asks macOS not to
+     App-Nap it the way a bare background shell gets napped.
+
+Usage (manual, foreground, for testing):
+    python3 scripts/s007_loop.py
+
+Usage (supervised, survives sleep/reboot) -- see scripts/s007_loop_install.sh.
+"""
+from __future__ import annotations
+
+import datetime
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from bot import s007_config as C  # noqa: E402
+from utils.trade_logger import StrategyLogger  # noqa: E402
+
+LOG = StrategyLogger("S007", log_root=str(ROOT / "reports" / "logs"))
+
+POLL_SECONDS = 60            # cadence while today might still do something
+IDLE_POLL_SECONDS = 300      # cadence outside the session / once today is settled --
+                             # short ON PURPOSE, see module docstring point 1
+HEARTBEAT_SECONDS = 1800     # log "scheduler alive" at least this often while idle
+CYCLE_TIMEOUT_SECONDS = 120  # kill a wedged --live subprocess rather than block forever
+
+
+def in_session(now: datetime.datetime) -> bool:
+    """Mon-Fri, TRADE_START..EXIT_END by wall-clock hour (reuses the same
+    named session-window constants bot/s007_config.py already defines --
+    no separate literal "10"/"17" here)."""
+    start_h = int(C.TRADE_START.split(":")[0])
+    end_h = int(C.EXIT_END.split(":")[0]) + 1   # EXIT_END="16:59" -> hour 16 still counts
+    return now.weekday() < 5 and start_h <= now.hour < end_h
+
+
+def decide_action(now: datetime.datetime, settled_today: datetime.date | None) -> dict:
+    """Pure decision step, no I/O and no sleeping -- easy to unit test against
+    fixed timestamps. Returns {"run": bool, "sleep": int, "settled_today": ...}."""
+    today = now.date()
+    if settled_today == today:
+        return dict(run=False, sleep=IDLE_POLL_SECONDS, settled_today=settled_today)
+    if not in_session(now):
+        return dict(run=False, sleep=IDLE_POLL_SECONDS, settled_today=None)
+    return dict(run=True, sleep=POLL_SECONDS, settled_today=None)
+
+
+def _parse_status_line(stdout: str) -> dict:
+    """Parse the `STATUS key=val key=val ...` line bot/s007_paper.py::live()
+    prints (see its docstring for the contract). Returns {} if no such line
+    is present -- e.g. the cycle raised before reaching a broker session at
+    all, which decide_action must treat as "not settled", never as done."""
+    for line in stdout.splitlines():
+        if line.startswith("STATUS "):
+            fields = dict(kv.split("=", 1) for kv in line[len("STATUS "):].split())
+            return {k: (v == "True" if v in ("True", "False") else v) for k, v in fields.items()}
+    return {}
+
+
+def run_cycle() -> dict:
+    """Run one `--live` reconcile cycle as a fresh subprocess (see module
+    docstring for why not an in-process call) and return its parsed STATUS
+    fields, or {} on crash/timeout -- never treated as day_done/filtered, so
+    a crashed cycle just means "try again next poll", not "stop for today"."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "bot.s007_paper", "--live"],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=CYCLE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        LOG.error("live cycle subprocess timed out",
+                  exc=RuntimeError(f"no STATUS line within {CYCLE_TIMEOUT_SECONDS}s"))
+        return {}
+    if proc.returncode != 0:
+        LOG.error("live cycle subprocess exited non-zero",
+                  exc=RuntimeError((proc.stderr or "")[-2000:] or f"exit code {proc.returncode}"))
+    return _parse_status_line(proc.stdout)
+
+
+def main(max_iterations: int | None = None) -> None:
+    """max_iterations is for tests only (bounds the loop instead of running
+    forever); production always calls main() with no argument."""
+    import time
+
+    settled_today = None
+    last_heartbeat = None
+    LOG.event("loop_started", note="python scheduler (replaces s007_loop.sh)")
+    i = 0
+    while max_iterations is None or i < max_iterations:
+        now = datetime.datetime.now()
+        plan = decide_action(now, settled_today)
+        settled_today = plan["settled_today"]
+
+        if plan["run"]:
+            result = run_cycle()
+            if result.get("day_done") or result.get("filtered"):
+                settled_today = now.date()
+                reason = "day_done" if result.get("day_done") else "filtered"
+                LOG.event("loop_settled", reason=reason, today=str(settled_today))
+        elif last_heartbeat is None or (now - last_heartbeat).total_seconds() >= HEARTBEAT_SECONDS:
+            LOG.event("loop_heartbeat", now=now.isoformat(timespec="seconds"),
+                      in_session=in_session(now), settled_today=str(settled_today))
+            last_heartbeat = now
+
+        time.sleep(plan["sleep"])
+        i += 1
+
+
+if __name__ == "__main__":
+    main()

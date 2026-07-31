@@ -55,7 +55,8 @@ separately-installed dependencies — see their sections below:
 - the live/paper bot needs `ctrader-open-api` (+ `python-dotenv`, already
   pulled in transitively by the bot config loaders);
 - the web control panel needs `fastapi uvicorn jinja2 python-multipart
-  itsdangerous sqlalchemy cryptography`.
+  itsdangerous sqlalchemy cryptography pydantic` (pydantic also validates
+  `webapp/schemas/` writes directly, not just via FastAPI).
 
 Broker credentials and app secrets live in `<repo>/.env` (gitignored), read by
 both `bot/` and `webapp/`:
@@ -122,18 +123,21 @@ credentials. The UI only edits DB state; a separate runner process trades.
 Full guide: `webapp/README.md`.
 
 ```bash
-pip install sqlalchemy cryptography fastapi uvicorn jinja2 python-multipart itsdangerous
+pip install sqlalchemy alembic cryptography fastapi uvicorn jinja2 python-multipart itsdangerous pydantic
 
-python -m webapp.cli init-db
-python -m webapp.cli create-user --username <name> --password *** --admin \
-    --access-token <ctrader_oauth_token>
-python -m webapp.cli add-account --username <name> --ctid <ctidTraderAccountId> \
-    --label demo1 --preset WORKING_S007 --risk 0.25 --enable
+cd webapp && alembic upgrade head && cd ..     # create/update the schema (see webapp/migrations/)
+python -m scripts.migrate_accounts_yml --password '***'  # one-off: import configs/accounts.yml
 
 APP_SECRET_KEY=... uvicorn webapp.app:app --host 0.0.0.0 --port 8000   # the UI
 python -m webapp.runner --dry --at "2024-05-10 10:45"                  # offline pipeline test
 python -m webapp.runner                                                # one live cycle, all enabled accounts
 ```
+
+Schema changes go through Alembic, not `webapp.db.init_db()`'s create_all (that's
+for tests/scratch DBs only): `cd webapp && alembic revision --autogenerate --rev-id 00N -m "..."`,
+review the generated file in `webapp/migrations/versions/`, then `alembic upgrade head`.
+Revision IDs are sequential (`001`, `002`, ...), passed explicitly via `--rev-id`
+— Alembic does not number them this way by default.
 
 Schedule `webapp.runner` on cron the same way as the direct bot path (every
 minute during the session) if you switch to the multi-account setup; the UI

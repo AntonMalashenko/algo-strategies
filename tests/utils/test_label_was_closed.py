@@ -38,3 +38,29 @@ def test_closed_label_stays_closed_across_a_fresh_logger_instance(tmp_path):
 
     second = StrategyLogger("S007TEST", log_root=str(tmp_path), console=False)
     assert second.label_was_closed(label) is True
+
+
+def test_unknown_label_was_not_opened(tmp_path):
+    log = StrategyLogger("S007TEST", log_root=str(tmp_path), console=False)
+    assert log.label_was_opened("S007:2026-07-30:999") is False
+
+
+def test_opened_label_was_opened_even_before_any_close(tmp_path):
+    # This is the 2026-07-30 gap: label_was_opened() must be checkable BEFORE
+    # a close is ever recorded, so a caller can tell "we placed this for
+    # real" apart from "we never touched this label" while the close itself
+    # hasn't been logged yet (see bot/s007_paper.py::decide).
+    log = StrategyLogger("S007TEST", log_root=str(tmp_path), console=False)
+    label = "S007:2026-07-30:3"
+    log.position(label, "open", side="buy", entry=25388.2, sl=25318.2, tp=25543.4, is_add=False)
+    assert log.label_was_opened(label) is True
+    assert log.label_was_closed(label) is False
+
+
+def test_opened_then_closed_label_is_both(tmp_path):
+    log = StrategyLogger("S007TEST", log_root=str(tmp_path), console=False)
+    label = "S007:2026-07-30:3"
+    log.position(label, "open", side="buy", entry=25388.2, sl=25318.2, tp=25543.4, is_add=False)
+    log.position(label, "close", reason="broker_side_close_detected")
+    assert log.label_was_opened(label) is True
+    assert log.label_was_closed(label) is True

@@ -8,7 +8,15 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DB_URL = os.environ.get("APP_DB_URL", "sqlite:///data/app.db")
+ROOT = Path(__file__).resolve().parent.parent
+# Resolved against the repo root, not the process CWD -- a bare relative
+# "sqlite:///data/app.db" default resolves relative to wherever the process
+# happens to be invoked from. Incident 2026-07-28: running Alembic from
+# webapp/ silently pointed at webapp/data/app.db instead of the repo root's
+# data/app.db. See tests/webapp/test_db.py for the CWD-independence regression
+# tests. APP_DB_URL, when set, is still used verbatim (no resolution applied).
+DEFAULT_DB_PATH = ROOT / "data" / "app.db"
+DB_URL = os.environ.get("APP_DB_URL", f"sqlite:///{DEFAULT_DB_PATH}")
 
 _connect_args = {"check_same_thread": False} if DB_URL.startswith("sqlite") else {}
 engine = create_engine(DB_URL, connect_args=_connect_args, future=True)

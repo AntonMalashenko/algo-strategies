@@ -20,6 +20,7 @@ import pandas as pd
 
 from webapp.db import get_session, init_db
 from webapp.models import Account, User, Position
+from bot import accounts_config as _accounts
 from bot import s007_config as C
 from bot.s007_signals import plan_now
 from utils.trade_logger import StrategyLogger
@@ -28,11 +29,13 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _creds_for(user: User) -> dict:
-    """Per-user cTrader creds; client_id/secret fall back to the global app env."""
+    """Per-user cTrader creds. Priority: DB (encrypted, set via /creds) first,
+    then configs/accounts.yml matched by username, then CTRADER_* in .env."""
+    yml = _accounts.ctrader_creds(user.username)
     return dict(
-        client_id=user.ctrader_client_id or os.environ.get("CTRADER_CLIENT_ID"),
-        client_secret=user.client_secret or os.environ.get("CTRADER_CLIENT_SECRET"),
-        access_token=user.access_token or os.environ.get("CTRADER_ACCESS_TOKEN"),
+        client_id=user.ctrader_client_id or yml.get("client_id") or os.environ.get("CTRADER_CLIENT_ID"),
+        client_secret=user.client_secret or yml.get("client_secret") or os.environ.get("CTRADER_CLIENT_SECRET"),
+        access_token=user.access_token or yml.get("access_token") or os.environ.get("CTRADER_ACCESS_TOKEN"),
         account_id=None,  # set per account below
     )
 
