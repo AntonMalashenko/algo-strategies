@@ -21,11 +21,17 @@ The bot is stateless: each cycle rebuilds the day's state from recent M1 bars vi
 the validated engine and reconciles the broker to it. The common 0.5 stop and the
 day target are attached to each order (server-side); the bot only opens new
 entries/adds and closes everything at the day's target or at 16:59.
+
+`run_cycle_for_account()` below is the same decide()/reconcile logic, factored
+out so webapp/runner.py's multi-account DB-driven runner can drive it for any
+number of DB-registered accounts (each with its own creds/preset/risk/lot),
+without re-implementing the trading rules a second time. `live()` (the CLI
+above) is unchanged behaviour-wise: it just calls that function with the
+module's own C.*/STOP_FLAG/LOG defaults, exactly as before this refactor.
 """
 from __future__ import annotations
 
 import argparse
-import json
 from datetime import datetime
 from pathlib import Path
 
@@ -128,11 +134,44 @@ def check():
     print(f"OK: symbol resolved to '{sym}'. Connection + auth working.")
 
 
-def live():
+def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, fixed_lot: float,
+                          use_fixed_lot: bool, magic: str, logger: StrategyLogger,
+                          symbol_candidates=None, history_days: int | None = None,
+                          daily_risk_cap_pct: float | None = None, fx_rate: float | None = None,
+                          stop_flag_active=None) -> dict:
+    """One S007 reconcile cycle for an arbitrary account, reusing the exact
+    decide()/reconcile logic `live()` below uses for the single .env/
+    accounts.yml-configured account -- so a DB-registered multi-account run
+    (webapp/runner.py) and the original single-account CLI can never drift
+    apart into two competing implementations of the same trading rules.
+
+    `creds`: same shape CTraderS007(creds=...) expects (client_id,
+    client_secret, access_token, account_id, host), or None to fall back to
+    CTraderAdapter's own .env/accounts.yml single-account resolution (what
+    `live()` below still does, unchanged).
+
+    symbol_candidates/history_days/daily_risk_cap_pct/fx_rate default to
+    bot.s007_config (C) when omitted -- override only where a specific
+    account genuinely differs (none do yet). stop_flag_active defaults to
+    "never stopped" (no per-account manual kill-switch file exists yet;
+    the module-level STOP_FLAG below is single-account-only by design).
+
+    Returns dict(cycle_id, actions, error, day_done, in_window, filtered,
+    manual_stop) -- actions is a list of dicts, each either
+    {kind: "open", label, side, entry, sl, tp, is_add, volume_lots} or
+    {kind: "close", label, reason}. `error` is None on success or a short
+    repr() of the exception that ended the cycle early.
+    """
     from bot.ctrader_s007 import CTraderS007
-    cid = LOG.cycle_start(mode="live", preset=C.PRESET)
-    actions_taken = []
-    status = {}
+    symbol_candidates = symbol_candidates or C.SYMBOL_CANDIDATES
+    history_days = history_days or C.HISTORY_DAYS
+    daily_risk_cap_pct = C.DAILY_RISK_CAP_PCT if daily_risk_cap_pct is None else daily_risk_cap_pct
+    fx_rate = C.EUR_TO_USD_FX_RATE_APPROX if fx_rate is None else fx_rate
+    stop_flag_active = stop_flag_active or (lambda: False)
+
+    cid = logger.cycle_start(mode="live", preset=preset)
+    actions_taken: list[dict] = []
+    status_info: dict = {}
 
     def decide(symbol, m1, broker_positions, balance, money_per_point_per_lot):
         """Pure decision step (no I/O): plan_now() + diff against what the
@@ -149,13 +188,13 @@ def live():
         # refresh this snapshot rate. Applied here, before any logging or
         # sizing, so every downstream $ figure (risk_amount comparisons, the
         # "state"/"size" log events, lots_for_risk) is already in real USD.
-        money_per_point_per_lot = money_per_point_per_lot * C.EUR_TO_USD_FX_RATE_APPROX
-        res = plan_now(m1)
-        manual_stop = _stop_flag_active()
-        status.update(day_done=res["day_done"], in_window=res["in_window"],
-                      filtered=res.get("filtered", False), manual_stop=manual_stop)
-        have = {p["label"]: p for p in broker_positions if p["label"].startswith(C.MAGIC)}
-        risk_amount = balance * C.RISK_PCT / 100.0
+        money_per_point_per_lot = money_per_point_per_lot * fx_rate
+        res = plan_now(m1, preset=preset)
+        manual_stop = stop_flag_active()
+        status_info.update(day_done=res["day_done"], in_window=res["in_window"],
+                           filtered=res.get("filtered", False), manual_stop=manual_stop)
+        have = {p["label"]: p for p in broker_positions if p["label"].startswith(magic)}
+        risk_amount = balance * risk_pct / 100.0
 
         # Real potential loss already on the books, from the broker's own fill
         # price/stopLoss (not our nominal risk_amount) -- volume is in Open API
@@ -164,20 +203,20 @@ def live():
         # (volume/100)*|price-sl|*FX == lots*lotSize*FX*|price-sl|, the lotSize
         # cancels and no separate contract-size lookup is needed.
         open_risk = sum(
-            (p["volume"] / 100.0) * abs(p["price"] - p["stop_loss"]) * C.EUR_TO_USD_FX_RATE_APPROX
+            (p["volume"] / 100.0) * abs(p["price"] - p["stop_loss"]) * fx_rate
             for p in have.values() if p.get("price") and p.get("stop_loss")
         )
-        risk_cap = balance * C.DAILY_RISK_CAP_PCT / 100.0
+        risk_cap = balance * daily_risk_cap_pct / 100.0
 
-        LOG.event("state", cycle=cid, symbol=symbol,
-                  last_bar=str(m1.index[-1]) if len(m1) else None,
-                  in_window=res["in_window"], day_done=res["day_done"], flat=res["flat"],
-                  direction=res["direction"], context=res.get("context"),
-                  broker_positions=len(broker_positions), ours_open=len(have),
-                  n_desired=len(res["positions"]), balance=balance,
-                  money_per_point_per_lot=money_per_point_per_lot,
-                  risk_amount=risk_amount, use_fixed_lot=C.USE_FIXED_LOT,
-                  open_risk=open_risk, risk_cap=risk_cap)
+        logger.event("state", cycle=cid, symbol=symbol,
+                     last_bar=str(m1.index[-1]) if len(m1) else None,
+                     in_window=res["in_window"], day_done=res["day_done"], flat=res["flat"],
+                     direction=res["direction"], context=res.get("context"),
+                     broker_positions=len(broker_positions), ours_open=len(have),
+                     n_desired=len(res["positions"]), balance=balance,
+                     money_per_point_per_lot=money_per_point_per_lot,
+                     risk_amount=risk_amount, use_fixed_lot=use_fixed_lot,
+                     open_risk=open_risk, risk_cap=risk_cap)
 
         out = []
         if manual_stop or res["day_done"] or res["flat"] or not res["in_window"]:
@@ -192,7 +231,7 @@ def live():
             for lab, o in want.items():       # open new entries/adds (server-side SL/TP)
                 if lab in have:
                     continue
-                if LOG.label_was_opened(lab) and not LOG.label_was_closed(lab):
+                if logger.label_was_opened(lab) and not logger.label_was_closed(lab):
                     # We ourselves already placed this label successfully and
                     # the broker no longer reports it open -- it has, by
                     # construction, already closed broker-side (stop/TP/manual),
@@ -203,54 +242,49 @@ def live():
                     # "want" this label and we'd re-place it with a stop the
                     # live price has already moved past (bug found live
                     # 2026-07-30, see decisions-log.md).
-                    LOG.position(lab, "close", cycle=cid, reason="broker_side_close_detected")
-                    LOG.event("skip_reopen", cycle=cid, label=lab,
-                              reason="broker_side_close_detected")
+                    logger.position(lab, "close", cycle=cid, reason="broker_side_close_detected")
+                    logger.event("skip_reopen", cycle=cid, label=lab,
+                                 reason="broker_side_close_detected")
                     continue
-                if LOG.label_was_closed(lab):
+                if logger.label_was_closed(lab):
                     # Broker doesn't show it open, but OUR log already saw it
                     # close today -- a real stop-out the current M1 bar just
                     # hasn't caught up to yet, not "never opened". Re-placing
                     # here is exactly the 2026-07-21 duplicate-reopen bug.
-                    LOG.event("skip_reopen", cycle=cid, label=lab,
-                              reason="already_closed_today_per_position_log")
+                    logger.event("skip_reopen", cycle=cid, label=lab,
+                                 reason="already_closed_today_per_position_log")
                     continue
                 stop_distance = abs(o["entry"] - o["sl"])
-                if C.USE_FIXED_LOT:
-                    lot = C.FIXED_LOT
+                if use_fixed_lot:
+                    lot = fixed_lot
                 else:
                     lot = lots_for_risk(risk_amount, stop_distance,
-                                        money_per_point_per_lot, min_lot=C.FIXED_LOT)
+                                        money_per_point_per_lot, min_lot=fixed_lot)
                 new_risk = lot * stop_distance * money_per_point_per_lot
                 if open_risk + new_risk > risk_cap:
                     # Would push today's summed potential loss (already-open +
                     # this one) past DAILY_RISK_CAP_PCT -- skip, don't open.
-                    LOG.event("skip_risk_cap", cycle=cid, label=lab,
-                              open_risk=open_risk, new_risk=new_risk, risk_cap=risk_cap)
+                    logger.event("skip_risk_cap", cycle=cid, label=lab,
+                                 open_risk=open_risk, new_risk=new_risk, risk_cap=risk_cap)
                     continue
                 open_risk += new_risk
-                LOG.event("size", cycle=cid, label=lab, stop_distance=stop_distance,
-                          risk_amount=risk_amount, money_per_point_per_lot=money_per_point_per_lot,
-                          lot=lot)
+                logger.event("size", cycle=cid, label=lab, stop_distance=stop_distance,
+                             risk_amount=risk_amount, money_per_point_per_lot=money_per_point_per_lot,
+                             lot=lot)
                 out.append(dict(kind="place", label=lab, side=o["side"], sl=o["sl"], tp=o["tp"],
                                 volume_lots=lot, entry=o["entry"], is_add=o["is_add"]))
         return out
 
     # CTraderS007() is constructed OUTSIDE the try below, deliberately: its
-    # __init__ loads credentials (configs/accounts.yml via bot.accounts_config,
-    # falling back to .env) before any broker call. A malformed accounts.yml
-    # or missing credential must crash this subprocess loudly (non-zero exit)
-    # so scripts/s007_tick.py::run_cycle() logs "live cycle subprocess exited
-    # non-zero" once -- not get swallowed into the per-cycle except below and
-    # silently re-logged every minute forever. Real incident 2026-07-29: a
-    # stray leading space in accounts.yml broke YAML parsing; because
-    # construction used to happen inside this try, the bot did nothing for
-    # ~4 min while looking, from the scheduler's point of view, like a normal
-    # zero-action cycle. See tests/configs/test_accounts_yaml.py for the file-
-    # shape regression test and decisions-log.md for the incident writeup.
-    api = CTraderS007()
+    # __init__ loads credentials before any broker call. A malformed
+    # credential/config must crash this process loudly (non-zero exit), not
+    # get swallowed into the per-cycle except below and silently re-logged
+    # every minute forever. Real incident 2026-07-29, see
+    # tests/configs/test_accounts_yaml.py and decisions-log.md.
+    api = CTraderS007(creds=creds)
+    error = None
     try:
-        cyc = api.run_live_cycle(C.SYMBOL_CANDIDATES, C.HISTORY_DAYS, decide)
+        cyc = api.run_live_cycle(symbol_candidates, history_days, decide)
         symbol = cyc["symbol"]
         for r in cyc["results"]:
             a, err, res_ = r["action"], r["error"], r["result"]
@@ -258,35 +292,50 @@ def live():
             if a["kind"] == "close":
                 req = dict(position_id=a["position_id"], volume=a["volume"])
                 if err is not None:
-                    LOG.order(lab, "close_position", cycle=cid, request=req, error=err)
+                    logger.order(lab, "close_position", cycle=cid, request=req, error=err)
                     continue
-                LOG.order(lab, "close_position", cycle=cid, request=req, result=res_)
-                LOG.position(lab, "close", cycle=cid, reason=a["reason"])
-                actions_taken.append(f"close {lab} ({a['reason']})")
+                logger.order(lab, "close_position", cycle=cid, request=req, result=res_)
+                logger.position(lab, "close", cycle=cid, reason=a["reason"])
+                actions_taken.append(dict(kind="close", label=lab, reason=a["reason"]))
             else:
                 req = dict(symbol=symbol, side=a["side"], sl=a["sl"], tp=a["tp"], lot=a["volume_lots"])
                 if err is not None:
-                    LOG.order(lab, "place_market", cycle=cid, request=req, error=err)
+                    logger.order(lab, "place_market", cycle=cid, request=req, error=err)
                     continue
-                LOG.order(lab, "place_market", cycle=cid, request=req, result=res_)
-                LOG.position(lab, "open", cycle=cid, side=a["side"], entry=a["entry"],
-                             sl=a["sl"], tp=a["tp"], is_add=a["is_add"], volume_lots=a["volume_lots"])
-                actions_taken.append(
-                    f"open {lab} {a['side']} lot={a['volume_lots']:.3f} SL{a['sl']:.1f} TP{a['tp']:.1f}")
+                logger.order(lab, "place_market", cycle=cid, request=req, result=res_)
+                logger.position(lab, "open", cycle=cid, side=a["side"], entry=a["entry"],
+                                sl=a["sl"], tp=a["tp"], is_add=a["is_add"], volume_lots=a["volume_lots"])
+                actions_taken.append(dict(kind="open", label=lab, side=a["side"], entry=a["entry"],
+                                          sl=a["sl"], tp=a["tp"], is_add=a["is_add"],
+                                          volume_lots=a["volume_lots"]))
     except Exception as e:
-        LOG.error("live cycle failed", exc=e, cycle=cid)
-    LOG.cycle_end(cid, actions=len(actions_taken))
+        logger.error("live cycle failed", exc=e, cycle=cid)
+        error = repr(e)[:500]
+    logger.cycle_end(cid, actions=len(actions_taken))
+    return dict(cycle_id=cid, actions=actions_taken, error=error, **status_info)
+
+
+def live():
+    result = run_cycle_for_account(
+        None, preset=C.PRESET, risk_pct=C.RISK_PCT, fixed_lot=C.FIXED_LOT,
+        use_fixed_lot=C.USE_FIXED_LOT, magic=C.MAGIC, logger=LOG,
+        stop_flag_active=_stop_flag_active)
+    actions_taken = result["actions"]
     print(f"cycle done: {len(actions_taken)} actions")
-    for a_ in actions_taken:
-        print(" ", a_)
-    if status:
+    for a in actions_taken:
+        if a["kind"] == "close":
+            print(f"  close {a['label']} ({a['reason']})")
+        else:
+            print(f"  open {a['label']} {a['side']} lot={a['volume_lots']:.3f} "
+                  f"SL{a['sl']:.1f} TP{a['tp']:.1f}")
+    if result.get("day_done") is not None:
         # machine-readable marker for the scheduling loop (scripts/s007_loop.py):
         # once day_done (target reached) OR filtered (today's Frankfurt range
         # already failed the height filter -- a verdict that can't change for
         # the rest of the day, see s007_signals.py::plan_now) it can stop
         # polling every minute and sleep until the next session window instead.
-        print(f"STATUS day_done={status.get('day_done')} in_window={status.get('in_window')} "
-              f"filtered={status.get('filtered')} manual_stop={status.get('manual_stop')} "
+        print(f"STATUS day_done={result.get('day_done')} in_window={result.get('in_window')} "
+              f"filtered={result.get('filtered')} manual_stop={result.get('manual_stop')} "
               f"actions={len(actions_taken)}")
 
 

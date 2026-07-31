@@ -1,184 +1,274 @@
 """Multi-account runner — the trading process (decoupled from the UI).
 
-Reads ENABLED accounts from the DB and runs one S007 reconcile cycle for each,
-using that account's owner credentials and per-account strategy config. Writes
-status/positions back to the DB and logs per account via the shared StrategyLogger.
+S007 only for now (S009/Bybit multi-account parallel support needs a separate
+state-storage refactor first — see bot/s009_paper.py's module-level
+load_state()/save_state(): it keeps one shared ledger file for the whole
+strategy, not one per (account, strategy), so running several Bybit accounts
+through it in parallel would have them clobber each other's state).
 
-Schedule it every minute during the session (cron), independently of the web UI:
-    * 10-16 * * 1-5  python -m webapp.runner
-Add --dry to test the whole DB->runner->status pipeline offline from local M1 CSV
-(no broker, no SDK needed).
+Two modes, same file:
+
+  Coordinator (default) -- one call per strategy per tick, e.g.:
+      python -m webapp.runner --strategy S007
+    Loads the strategy's enabled AccountStrategy rows from the DB and spawns
+    one WORKER subprocess per account, in parallel, waiting up to --timeout
+    seconds (default 55s, leaving headroom in a 60s scheduler tick) before
+    killing stragglers. Exits 0 as long as the tick itself could be planned
+    and run -- an individual account's cycle failing is recorded on that
+    account_strategy row (status='error', last_error=...), NOT surfaced as
+    the coordinator's own exit code, since one bad account must never look
+    like "the whole tick failed" to Ofelia/the scheduler.
+
+  Worker (internal, spawned by the coordinator; --worker --account-strategy-id N):
+    Runs exactly ONE S007 cycle for ONE (account, strategy) row, then exits.
+
+Why subprocess-per-account instead of threads/asyncio in one process: cTrader
+(CTraderAdapter._run) drives its whole session through `reactor.run()`
+(Twisted) and stops the reactor when the session ends. A Twisted reactor can
+only be reactor.run()'d ONCE per OS process -- a second call in the same
+process raises ReactorNotRestartable. So N accounts in one tick can only run
+truly in parallel as N separate processes, each with its own reactor; that is
+exactly what the coordinator does below, and it also happens to be a clean
+fit for "one job, one exit code, no persistent state" containerization later
+(each worker subprocess IS that unit, just not yet wrapped in its own
+container -- see the multi-user-architecture decision, Docker/Ofelia stage,
+not started yet).
+
+Logging split: curated business events (cycle_start/cycle_end/position_open/
+position_close/error) go to the DB `logs` table via _log_event() below, for
+the future API/UI. Everything else -- the full per-cycle debug detail
+(state/size/skip_* events, order requests/results) -- keeps going to
+utils.trade_logger.StrategyLogger's per-account JSONL files under
+reports/logs/, same as the single-account bot; those files are also where
+label_was_opened()/label_was_closed() read their history-based dedup state
+from, so they are NOT optional debug output that can simply be dropped in a
+container -- containerizing this runner will need reports/ on a persistent
+volume, not a fresh ephemeral filesystem per tick (open item, not solved
+here).
+
+Schedule the coordinator once per strategy per tick, e.g. (cron for now,
+Ofelia/cloud scheduler later):
+    * 10-16 * * 1-5  python -m webapp.runner --strategy S007
 """
 from __future__ import annotations
 
 import argparse
-import os
+import subprocess
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
+from webapp.db import get_session
+from webapp.models import Account, AccountStrategy, LogEntry, Position, Strategy, User
+from webapp.schemas import LogEntryCreate, LogKind, LogLevel
 
-from webapp.db import get_session, init_db
-from webapp.models import Account, User, Position
-from bot import accounts_config as _accounts
-from bot import s007_config as C
-from bot.s007_signals import plan_now
+from bot.s007_paper import run_cycle_for_account
 from utils.trade_logger import StrategyLogger
 
 ROOT = Path(__file__).resolve().parent.parent
 
-
-def _creds_for(user: User) -> dict:
-    """Per-user cTrader creds. Priority: DB (encrypted, set via /creds) first,
-    then configs/accounts.yml matched by username, then CTRADER_* in .env."""
-    yml = _accounts.ctrader_creds(user.username)
-    return dict(
-        client_id=user.ctrader_client_id or yml.get("client_id") or os.environ.get("CTRADER_CLIENT_ID"),
-        client_secret=user.client_secret or yml.get("client_secret") or os.environ.get("CTRADER_CLIENT_SECRET"),
-        access_token=user.access_token or yml.get("access_token") or os.environ.get("CTRADER_ACCESS_TOKEN"),
-        account_id=None,  # set per account below
-    )
+DEFAULT_TIMEOUT_S = 55.0
 
 
-def _logger_for(acc: Account) -> StrategyLogger:
-    name = f"{acc.strategy}-acct{acc.ctid_trader_account_id}"
-    return StrategyLogger(name, log_root=str(ROOT / "reports" / "logs"))
+def _log_event(session, kind: LogKind, *, message: str | None = None,
+               level: LogLevel = LogLevel.INFO, user: User | None = None,
+               account: Account | None = None, strategy: Strategy | None = None,
+               cycle_id: str | None = None, payload: dict | None = None) -> None:
+    """Write one curated LogEntry row. Goes through webapp/schemas/logs.py
+    first (same validation boundary the CLI/migration script use) so a bad
+    kind/level fails loud here rather than as a later DB constraint surprise.
+    `payload` must never contain decrypted credentials -- see logs.py."""
+    validated = LogEntryCreate(
+        level=level, kind=kind, message=message, payload=payload, cycle_id=cycle_id,
+        user_id=user.id if user else None, account_id=account.id if account else None,
+        strategy_id=strategy.id if strategy else None)
+    entry = LogEntry(level=validated.level.value, kind=validated.kind.value,
+                     message=validated.message, cycle_id=validated.cycle_id,
+                     user_id=validated.user_id, account_id=validated.account_id,
+                     strategy_id=validated.strategy_id)
+    entry.payload = validated.payload
+    session.add(entry)
 
 
-def _load_local_m1() -> pd.DataFrame:
-    path = ROOT / C.DRY_RUN_DATA
-    comp = "gzip" if str(path).endswith(".gz") else None
-    df = pd.read_csv(path, compression=comp)
-    df.columns = [c.lower() for c in df.columns]
-    idx = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str))
-    df.index = idx
-    return df[["open", "high", "low", "close"]].sort_index()
-
-
-def run_account(session, acc: Account, dry: bool = False, at: str | None = None) -> str:
-    """One reconcile cycle for a single account. Returns a status string."""
-    log = _logger_for(acc)
-    cid = log.cycle_start(mode="dry" if dry else "live", account=acc.ctid_trader_account_id,
-                          preset=acc.preset, enabled=acc.enabled)
-    try:
-        if dry:
-            m1 = _load_local_m1()
-            if at:
-                m1 = m1.loc[:pd.Timestamp(at)]
-            m1 = m1.tail(C.HISTORY_DAYS * 1440)
-            res = plan_now(m1, preset=acc.preset)
-            log.event("state", cycle=cid, dry=True, in_window=res["in_window"],
-                      day_done=res["day_done"], direction=res["direction"],
-                      context=res.get("context"), n_desired=len(res["positions"]))
-            _sync_positions(session, acc, res, cid, log, broker=None, dry=True)
-            status = f"dry: {len(res['positions'])} desired"
-        else:
-            from bot.ctrader_s007 import CTraderS007
-            creds = _creds_for(acc.user)
-            creds["account_id"] = acc.ctid_trader_account_id
-            creds["host"] = acc.host
-            api = CTraderS007(creds=creds)
-            symbol = acc.symbol or api.resolve_symbol(C.SYMBOL_CANDIDATES)
-            m1 = api.get_m1(symbol, C.HISTORY_DAYS)
-            res = plan_now(m1, preset=acc.preset)
-            broker = {p["label"]: p for p in api.open_positions()
-                      if p["label"].startswith(acc.strategy)}
-            log.event("state", cycle=cid, symbol=symbol, in_window=res["in_window"],
-                      day_done=res["day_done"], direction=res["direction"],
-                      context=res.get("context"), broker_open=len(broker),
-                      n_desired=len(res["positions"]))
-            status = _reconcile_broker(api, symbol, acc, res, broker, cid, log, session)
-        acc.status = status
-        acc.last_error = None
-    except Exception as e:                       # never let one account kill the loop
-        log.error(f"account {acc.ctid_trader_account_id} cycle failed", exc=e, cycle=cid)
-        acc.status = "error"
-        acc.last_error = repr(e)[:500]
-        status = "error"
-    acc.last_cycle_at = datetime.now(timezone.utc)
-    log.cycle_end(cid, status=status)
-    session.commit()
-    return status
-
-
-def _reconcile_broker(api, symbol, acc, res, broker, cid, log, session) -> str:
-    lot = acc.fixed_lot
-    actions = 0
-    if res["day_done"] or res["flat"] or not res["in_window"]:
-        reason = "target" if res["day_done"] else ("flat_time" if res["flat"] else "closed")
-        for lab, p in broker.items():
-            req = dict(position_id=p["position_id"], volume=p["volume"])
-            try:
-                r = api.close_position(p["position_id"], p["volume"])
-                log.order(lab, "close_position", cycle=cid, request=req, result=r)
-                log.position(lab, "close", cycle=cid, reason=reason)
-                _close_position_db(session, acc, lab, reason)
-                actions += 1
-            except Exception as e:
-                log.order(lab, "close_position", cycle=cid, request=req, error=e)
-        return f"flat ({reason}): {actions} closed"
-    want = {p["label"]: p for p in res["positions"]}
-    for lab, o in want.items():
-        if lab in broker:
-            continue
-        req = dict(symbol=symbol, side=o["side"], sl=o["sl"], tp=o["tp"], lot=lot)
-        try:
-            r = api.place_market(symbol, o["side"], o["sl"], o["tp"], volume_lots=lot, label=lab)
-            log.order(lab, "place_market", cycle=cid, request=req, result=r)
-            log.position(lab, "open", cycle=cid, side=o["side"], entry=o["entry"],
-                         sl=o["sl"], tp=o["tp"], is_add=o["is_add"])
-            _open_position_db(session, acc, o)
-            actions += 1
-        except Exception as e:
-            log.order(lab, "place_market", cycle=cid, request=req, error=e)
-    return f"live: {len(want)} desired, {actions} new"
-
-
-def _sync_positions(session, acc, res, cid, log, broker, dry):
-    """Dry mode: mirror desired positions into the DB + per-position log."""
-    if res["day_done"] or res["flat"]:
-        for pos in [p for p in acc.positions if p.status == "open"]:
-            _close_position_db(session, acc, pos.label, "target" if res["day_done"] else "flat")
-        return
-    for o in res["positions"]:
-        log.position(o["label"], "desired", cycle=cid, side=o["side"], entry=o["entry"],
-                     sl=o["sl"], tp=o["tp"], is_add=o["is_add"])
-        _open_position_db(session, acc, o)
-
-
-def _open_position_db(session, acc, o):
-    exists = next((p for p in acc.positions if p.label == o["label"] and p.status == "open"), None)
+def _open_position_db(session, acc: Account, strat: Strategy, a: dict) -> None:
+    exists = session.query(Position).filter_by(
+        account_id=acc.id, strategy_id=strat.id, label=a["label"], status="open").first()
     if exists:
         return
-    session.add(Position(account_id=acc.id, label=o["label"], side=o["side"],
-                         entry=o["entry"], sl=o["sl"], tp=o["tp"], is_add=o["is_add"],
-                         status="open"))
+    session.add(Position(account_id=acc.id, strategy_id=strat.id, label=a["label"],
+                         side=a["side"], entry=a["entry"], sl=a["sl"], tp=a["tp"],
+                         is_add=a["is_add"], status="open"))
 
 
-def _close_position_db(session, acc, label, reason):
-    for p in acc.positions:
-        if p.label == label and p.status == "open":
-            p.status = "closed"
-            p.reason = reason
-            p.closed_at = datetime.now(timezone.utc)
+def _close_position_db(session, acc: Account, strat: Strategy, label: str, reason: str) -> None:
+    pos = session.query(Position).filter_by(
+        account_id=acc.id, strategy_id=strat.id, label=label, status="open").first()
+    if pos:
+        pos.status = "closed"
+        pos.reason = reason
+        pos.closed_at = datetime.now(timezone.utc)
 
 
-def run_all(dry: bool = False, at: str | None = None) -> int:
-    init_db()
+def run_worker(account_strategy_id: int) -> int:
+    """Run one S007 cycle for one (account, strategy) DB row, in THIS
+    process, then return an exit code. See the module docstring for why this
+    must be its own OS process rather than a thread.
+
+    Fail-fast: a bad row id, a broker/strategy mismatch, or a credential
+    error raised while constructing CTraderS007 (inside
+    run_cycle_for_account) all crash this process loudly (uncaught
+    exception / SystemExit -> non-zero exit) rather than being swallowed --
+    same principle as bot/s007_paper.py's CTraderS007() construction comment.
+    A cycle that runs but the BROKER rejects/errors on is different: that is
+    caught inside run_cycle_for_account and reported back as result["error"],
+    recorded on the account_strategy row, with a clean (0) process exit --
+    a broker-side problem for one account is not a runner-crash.
+    """
     session = get_session()
-    accounts = session.query(Account).filter(Account.enabled.is_(True)).all()
-    n = 0
-    for acc in accounts:
-        run_account(session, acc, dry=dry, at=at)
-        n += 1
+    link = session.get(AccountStrategy, account_strategy_id)
+    if link is None:
+        raise SystemExit(f"account_strategy {account_strategy_id} not found")
+    if not link.enabled:
+        print(f"[runner] account_strategy {account_strategy_id} is disabled -- skipping")
+        session.close()
+        return 0
+
+    acc = link.account
+    strat = link.strategy
+    if strat.name != "S007" or acc.broker != "CTRADER":
+        raise SystemExit(
+            f"account_strategy {account_strategy_id} is broker={acc.broker}/"
+            f"strategy={strat.name} -- webapp.runner only drives CTRADER/S007 today")
+    user = acc.user
+
+    creds_row = acc.credentials
+    creds = dict(client_id=creds_row.get("client_id"), client_secret=creds_row.get("client_secret"),
+                access_token=creds_row.get("access_token"),
+                account_id=int(acc.external_account_id) if acc.external_account_id else None,
+                host=acc.broker_host)
+
+    logger = StrategyLogger(f"S007-acct{acc.external_account_id or acc.id}",
+                            log_root=str(ROOT / "reports" / "logs"))
+    preset = link.preset or strat.default_preset
+
+    print(f"[runner] S007 cycle starting: account_strategy={link.id} account={acc.id} "
+          f"({acc.label or acc.external_account_id}) user={user.username}")
+    _log_event(session, LogKind.CYCLE_START, message="cycle start", user=user, account=acc,
+              strategy=strat)
+    session.commit()
+
+    result = run_cycle_for_account(
+        creds, preset=preset, risk_pct=link.risk_pct, fixed_lot=link.fixed_lot,
+        use_fixed_lot=link.use_fixed_lot, magic=strat.name, logger=logger)
+
+    for a in result["actions"]:
+        if a["kind"] == "open":
+            _open_position_db(session, acc, strat, a)
+            _log_event(session, LogKind.POSITION_OPEN, message=a["label"], user=user,
+                      account=acc, strategy=strat, cycle_id=result.get("cycle_id"), payload=a)
+        else:
+            _close_position_db(session, acc, strat, a["label"], a["reason"])
+            _log_event(session, LogKind.POSITION_CLOSE, message=a["label"], user=user,
+                      account=acc, strategy=strat, cycle_id=result.get("cycle_id"), payload=a)
+
+    ok = True
+    if result["error"]:
+        link.status = "error"
+        link.last_error = result["error"]
+        _log_event(session, LogKind.ERROR, level=LogLevel.ERROR, message=result["error"],
+                  user=user, account=acc, strategy=strat, cycle_id=result.get("cycle_id"))
+        print(f"[runner] account_strategy {link.id}: ERROR {result['error']}")
+        ok = False
+    else:
+        n_actions = len(result["actions"])
+        link.status = f"live: {n_actions} action(s)" if n_actions else "idle"
+        link.last_error = None
+        print(f"[runner] account_strategy {link.id}: {n_actions} action(s), "
+              f"day_done={result.get('day_done')} in_window={result.get('in_window')}")
+    link.last_cycle_at = datetime.now(timezone.utc)
+    _log_event(session, LogKind.CYCLE_END, message="cycle end", user=user, account=acc,
+              strategy=strat, cycle_id=result.get("cycle_id"),
+              payload=dict(actions=len(result["actions"]), error=result["error"]))
+    session.commit()
     session.close()
-    return n
+    return 0 if ok else 1
+
+
+def run_coordinator(strategy_name: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> int:
+    """One tick for `strategy_name` -- see module docstring for the subprocess
+    fan-out rationale and the "one bad account != tick failure" exit-code
+    contract."""
+    session = get_session()
+    strat = session.query(Strategy).filter_by(name=strategy_name).one_or_none()
+    if strat is None:
+        raise SystemExit(f"strategy '{strategy_name}' not found in DB -- seed it first "
+                          f"(python -m webapp.cli add-strategy)")
+    links = (session.query(AccountStrategy)
+             .filter_by(strategy_id=strat.id, enabled=True).all())
+    link_ids = [link.id for link in links]
+    session.close()
+
+    if not link_ids:
+        print(f"[runner] no enabled account_strategy rows for '{strategy_name}' -- nothing to do")
+        return 0
+
+    print(f"[runner] {strategy_name}: fanning out {len(link_ids)} account(s), "
+          f"budget={timeout_s:.0f}s")
+    procs = {lid: subprocess.Popen(
+        [sys.executable, "-m", "webapp.runner", "--worker", "--account-strategy-id", str(lid)])
+        for lid in link_ids}
+
+    deadline = time.monotonic() + timeout_s
+    results = {}
+    for lid, p in procs.items():
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            results[lid] = p.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            results[lid] = -9
+            print(f"[runner] account_strategy {lid}: TIMEOUT after {timeout_s:.0f}s, killed")
+
+    ok = sum(1 for rc in results.values() if rc == 0)
+    print(f"[runner] {strategy_name}: {ok}/{len(link_ids)} account cycle(s) ok "
+          f"({', '.join(f'{lid}={rc}' for lid, rc in results.items())})")
+
+    # A killed/crashed worker never got to write its own status (a clean
+    # in-process failure already set status='error' inside run_worker) --
+    # mark those here so the DB never shows a stale "idle"/last good status
+    # after a timeout or hard crash.
+    failed = {lid: rc for lid, rc in results.items() if rc != 0}
+    if failed:
+        session = get_session()
+        for lid, rc in failed.items():
+            link = session.get(AccountStrategy, lid)
+            if link and link.status != "error":
+                link.status = "error"
+                link.last_error = f"worker exited rc={rc} (killed/crashed before self-reporting)"
+        session.commit()
+        session.close()
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--strategy", default="S007",
+                    help="strategy name to run this tick (coordinator mode, default S007)")
+    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S,
+                    help=f"per-tick budget in seconds before killing stragglers "
+                         f"(coordinator mode, default {DEFAULT_TIMEOUT_S:.0f})")
+    ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--account-strategy-id", type=int, default=None, help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    if a.worker:
+        if a.account_strategy_id is None:
+            raise SystemExit("--worker requires --account-strategy-id")
+        sys.exit(run_worker(a.account_strategy_id))
+    sys.exit(run_coordinator(a.strategy, timeout_s=a.timeout))
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry", action="store_true", help="offline test from local M1 CSV")
-    ap.add_argument("--at", default=None, help="dry: simulate 'now' at this timestamp")
-    a = ap.parse_args()
-    count = run_all(dry=a.dry, at=a.at)
-    print(f"runner: processed {count} enabled account(s)")
+    main()
