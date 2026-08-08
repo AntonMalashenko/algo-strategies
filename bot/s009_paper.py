@@ -164,10 +164,15 @@ def save_state(st: dict) -> None:
     _state_store.save(st)
 
 
-def append_ledger(row: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    hdr = not LEDGER_FILE.exists()
-    pd.DataFrame([row]).to_csv(LEDGER_FILE, mode="a", header=hdr, index=False)
+def append_ledger(row: dict, ledger_file: Path | None = None) -> None:
+    # `ledger_file: Path | None = None` (not `= LEDGER_FILE`) deliberately:
+    # a bound default is captured once at def-time and would stop honoring
+    # `monkeypatch.setattr(s009, "LEDGER_FILE", ...)` in tests -- look the
+    # module global up fresh on every call instead.
+    path = ledger_file if ledger_file is not None else LEDGER_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdr = not path.exists()
+    pd.DataFrame([row]).to_csv(path, mode="a", header=hdr, index=False)
 
 
 # --------------------------------------------------------------------------
@@ -279,7 +284,8 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
 def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingCarryConfig,
                           state, logger: StrategyLogger, data_dir: Path = DATA_DIR,
                           do_fetch: bool = True, drop_forming: bool = True,
-                          broker: str = "off", allow_mainnet: bool = False) -> dict:
+                          broker: str = "off", allow_mainnet: bool = False,
+                          ledger_file: Path | None = None) -> dict:
     """One S009 daily cycle for an arbitrary account, reusing the exact
     engine/book/ledger logic `run_once()` below uses for the single
     accounts.yml-configured account -- so a DB-registered multi-account run
@@ -295,6 +301,15 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
     `creds`: {"api_key", "api_secret"} passed straight to BybitExec, or None
     to fall back to accounts.yml resolution via `account_key` as the yml
     `name:` (what `run_once()` below still does, unchanged).
+    `ledger_file`: append each booked day's row to this CSV, or write no
+    ledger at all when `None` (the default). There is no per-account ledger
+    file yet -- a bare filename passed in here would collide across
+    accounts exactly like the old shared state.json did -- so the
+    DB-driven multi-account caller (webapp/runner.py's _worker_s009)
+    deliberately leaves this `None` and relies on the day_pnl events
+    `logger` already writes (StrategyLogger is per-account by construction,
+    see the `logger` param). Only `run_once()`'s single-account CLI path
+    passes its own LEDGER_FILE, unchanged from before this refactor.
 
     Never raises: catches any exception from the engine/state/broker steps
     and reports it as `error` instead, mirroring bot/s007_paper.py's
@@ -352,7 +367,8 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
                     "turnover": round(float(out.loc[d, "turnover"]), 4),
                     "n_pos": int(out.loc[d, "n_pos"]), "equity": round(equity, 6),
                 }
-                append_ledger(row)
+                if ledger_file is not None:
+                    append_ledger(row, ledger_file)
                 logger.event("day_pnl", cycle=cid, **row)
                 booked += 1
 
@@ -400,7 +416,7 @@ def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_formi
     result = run_cycle_for_account(
         account_key=BYBIT_ACCOUNT_NAME, creds=None, cfg=cfg, state=_state_store, logger=log,
         data_dir=data_dir, do_fetch=do_fetch, drop_forming=drop_forming,
-        broker=broker, allow_mainnet=allow_mainnet)
+        broker=broker, allow_mainnet=allow_mainnet, ledger_file=LEDGER_FILE)
 
     if result["error"]:
         print(f"ERROR: {result['error']}")

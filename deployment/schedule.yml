@@ -19,8 +19,22 @@ strategies:
   # (TRADE_START/EXIT_END = "10:00"/"16:59", bot/s007_config.py:111).
   - name: S007
     schedule: "* 10-16 * * 1-5"
-  # S009 is not listed yet -- webapp/runner.py only dispatches S007 today;
-  # add S009 here once its DB-driven multi-account path lands.
+  # S009 rebalances at most once a day (a new closed UTC day), but unlike
+  # S007's tick this one has NO cheap "already up to date, skip" check
+  # before webapp/runner.py -> _worker_s009 -> run_cycle_for_account does a
+  # real (public, unauthenticated) Bybit data refresh + full engine
+  # recompute -- every invocation, not just the first one that finds new
+  # data. Scheduling it every minute like S007 would hammer Bybit's public
+  # API 1440x/day for nothing, so this fires once daily instead, shortly
+  # after UTC midnight so the just-closed day's funding/kline data has had
+  # time to land. Self-healing if a run is missed or the data isn't ready
+  # yet: run_cycle_for_account books every day between last_day and the
+  # latest available one, not just "yesterday", so the next successful run
+  # catches up automatically -- no separate retry schedule needed.
+  # Still `broker="off"` hardcoded in _worker_s009 -- shadow-only, no
+  # orders, regardless of how often this fires.
+  - name: S009
+    schedule: "5 0 * * *"
 
 # Background jobs unrelated to any single (account, strategy) pair (data
 # refresh, cleanup, ...). `command` is run as-is via subprocess (module path,

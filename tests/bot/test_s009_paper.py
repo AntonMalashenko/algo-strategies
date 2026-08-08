@@ -47,6 +47,28 @@ def _stub_engine(monkeypatch):
     monkeypatch.setattr(s009, "refresh_data", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_paper_dirs(tmp_path, monkeypatch):
+    """No test may touch the LIVE reports/paper_s009/ tree.
+
+    run_cycle_for_account() books each closed day through append_ledger(),
+    which resolves LEDGER_FILE/STATE_DIR from module globals -- so without
+    this fixture a plain `pytest` run appended fake rows (FAKE_DAY + 1,
+    equity 1.02) straight into the running paper bot's ledger.csv and
+    corrupted the only record of live performance (found 2026-08-08: three
+    such rows were already there, and `--reconcile` reads exactly this file).
+
+    Same class of leak, and same fix, as the S007 positions-log cleanup
+    fixture -- see decisions-log.md 2026-07-21.
+    """
+    paper_dir = tmp_path / "paper_s009"
+    paper_dir.mkdir()
+    monkeypatch.setattr(s009, "REPO", tmp_path)
+    monkeypatch.setattr(s009, "STATE_DIR", paper_dir)
+    monkeypatch.setattr(s009, "STATE_FILE", paper_dir / "state.json")
+    monkeypatch.setattr(s009, "LEDGER_FILE", paper_dir / "ledger.csv")
+
+
 class _FakeBybitExec:
     """Stands in for bot.bybit_exec.BybitExec -- captures constructor args
     for the creds-passthrough assertion, no network."""
@@ -201,3 +223,38 @@ def test_run_once_uses_the_module_level_state_store(tmp_path, monkeypatch, capsy
     out = capsys.readouterr().out
     assert "TARGET BOOK" in out
     assert "BTCUSDT" in out
+
+
+# --- ledger.csv: per-caller opt-in, not a shared-by-default file ---------
+#
+# Regression coverage for a real incident found 2026-08-08: append_ledger()
+# used to always write the module-global LEDGER_FILE regardless of which
+# `state` was passed in, so even after state.json was made per-account, the
+# DB-driven multi-account path would still have every account's day_pnl
+# rows land in the SAME reports/paper_s009/ledger.csv -- exactly the
+# collision the state.json refactor was supposed to eliminate. A run of
+# this very test file (before the fix + the _isolate_paper_dirs fixture
+# above existed) wrote fake rows into the real live ledger.
+
+def test_run_once_writes_to_the_ledger_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(s009, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(s009, "_state_store",
+                        FileStateStore(tmp_path / "state.json", default_factory=s009._default_state))
+    monkeypatch.setattr(s009, "LEDGER_FILE", tmp_path / "ledger.csv")
+    monkeypatch.setattr(s009, "REPO", tmp_path)
+    s009._state_store.save({"last_day": FAKE_DAY, "equity": 1.0, "book": {}})  # so the next run books a day
+
+    s009.run_once(s009.DATA_DIR, s009.DEPLOY, do_fetch=False, drop_forming=False, broker="off")
+
+    assert (tmp_path / "ledger.csv").exists()
+    assert f"{FAKE_DAY + 1}," in (tmp_path / "ledger.csv").read_text()
+
+
+def test_run_cycle_for_account_without_ledger_file_writes_no_csv(tmp_path):
+    state = _store(tmp_path)
+    state.save({"last_day": FAKE_DAY, "equity": 1.0, "book": {}})
+    s009.run_cycle_for_account(
+        account_key="acct-a", creds=None, cfg=s009.DEPLOY, state=state, logger=_log(tmp_path),
+        do_fetch=False, drop_forming=False, broker="off")   # no ledger_file -- the DB-driven default
+
+    assert list(tmp_path.glob("*.csv")) == []
