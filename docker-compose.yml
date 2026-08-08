@@ -1,19 +1,25 @@
-# Docker/Ofelia scaffold: "one job per STRATEGY", DB-driven fan-out across
-# every enabled (account, strategy) row -- see docs/DEV_PLANS.md's "Multi-
-# account Docker migration" decisions. Run `docker compose`/`podman compose`
-# from the repo root (uses ${PWD} for bind-mount paths below).
+# Docker/Ofelia scaffold: ONE static Ofelia job, forever -- see
+# docs/DEV_PLANS.md's "Multi-account Docker migration" decisions. Run
+# `docker compose`/`podman compose` from the repo root (uses ${PWD} for
+# bind-mount paths below).
 #
 # `worker` only describes the image build -- `docker compose up` does NOT
-# start it (profile gate below); Ofelia's job-run spins up short-lived
-# containers from `algo-worker:latest` directly via the Docker/Podman socket,
-# one per scheduled tick, matching the stateless-tick design already used by
-# scripts/s007_tick.py / scripts/s009_tick.py.
+# start it (profile gate below); Ofelia's job-run spins up a short-lived
+# container from `algo-worker:latest` once a minute, running
+# `scripts/scheduler_tick.py` (see that module's docstring). THAT script,
+# not this file, decides which strategy/task is actually due this minute by
+# reading deployment/schedule.yml -- so adding a strategy's schedule or a
+# background task is a schedule.yml edit, never a docker-compose.yml edit.
+# `webapp.runner --strategy S007` still runs as a plain subprocess INSIDE
+# that same container (not a separate container-per-strategy), which is why
+# the mounts/env below live on this one job, not on a per-strategy label.
 #
-# Only S007 is wired into a schedule here -- webapp/runner.py itself is still
-# S007/CTRADER-only today; generalizing its dispatch to other strategies is a
-# separate follow-up. Do not `docker compose up -d ofelia` unattended while
-# the legacy launchd job `com.anton.algo.s007bot` is also loaded: both would
-# drive the same demo account (ctrader-47939312) independently.
+# Only S007 has an entry in deployment/schedule.yml so far -- webapp/runner.py
+# itself is still S007/CTRADER-only today; generalizing its dispatch to other
+# strategies is a separate follow-up. Do not `docker compose up -d ofelia`
+# unattended while the legacy launchd job `com.anton.algo.s007bot` is also
+# loaded: both would drive the same demo account (ctrader-47939312)
+# independently.
 
 services:
   worker:
@@ -52,18 +58,28 @@ services:
       - /run/podman/podman.sock:/var/run/docker.sock:rw
     labels:
       ofelia.enabled: "true"
-      # Standard 5-field cron (min hour dom month dow) -- Ofelia 0.4.x+ does
-      # NOT use a seconds field (github.com/mcuadros/ofelia README: "seconds
-      # optional, not recommended", robfig/cron v3 default parser). Every
-      # minute, 10:00-16:59 weekdays -- mirrors scripts/s007_tick.py's
-      # in_session() exactly (TRADE_START/EXIT_END = "10:00"/"16:59",
-      # bot/s007_config.py:111).
-      ofelia.job-run.s007tick.schedule: "* 10-16 * * 1-5"
-      ofelia.job-run.s007tick.image: "algo-worker:latest"
-      ofelia.job-run.s007tick.command: "python -m webapp.runner --strategy S007"
-      ofelia.job-run.s007tick.delete: "true"
+      # 6-field cron, SECONDS FIRST (sec min hour dom month dow) -- verified
+      # empirically against the actual pulled mcuadros/ofelia:latest image
+      # (2026-08-08): its README claims 0.4.x+ made seconds optional, but
+      # this image fires "* * * * *" (5 fields) EVERY SECOND, not every
+      # minute -- only a leading seconds field ("0 * * * * *") gives the
+      # intended once-a-minute cadence. Do not "simplify" this back to 5
+      # fields without re-verifying live (see `podman run ... daemon
+      # --docker` + watch `Started -` log lines) -- the doc and the shipped
+      # image disagree here.
+      #
+      # This is Ofelia's OWN outer schedule (Go robfig/cron, 6-field) and is
+      # entirely separate from deployment/schedule.yml's per-strategy/task
+      # cron strings, which stay standard 5-field (min hour dom month dow) --
+      # those are parsed by Python's `croniter` inside
+      # scripts/scheduler_tick.py, a different library with a different
+      # field count. Don't copy one format into the other.
+      ofelia.job-run.dispatch.schedule: "0 * * * * *"
+      ofelia.job-run.dispatch.image: "algo-worker:latest"
+      ofelia.job-run.dispatch.command: "python -m scripts.scheduler_tick"
+      ofelia.job-run.dispatch.delete: "true"
       # Multi-value fields need a JSON array (Ofelia label syntax, not compose's).
-      ofelia.job-run.s007tick.volume: >-
+      ofelia.job-run.dispatch.volume: >-
         ["${PWD}/data:/app/data:rw", "${PWD}/reports:/app/reports:rw"]
-      ofelia.job-run.s007tick.environment: >-
+      ofelia.job-run.dispatch.environment: >-
         ["APP_SECRET_KEY=${APP_SECRET_KEY}", "APP_DB_URL=sqlite:////app/data/app.db"]

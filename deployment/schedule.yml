@@ -1,0 +1,29 @@
+# Single source of truth for "what runs, on what cron schedule" -- read by
+# scripts/scheduler_tick.py, which Ofelia invokes every minute (see
+# docker-compose.yml). Adding/changing a strategy's cadence or a background
+# task is a plain edit + code review here, NOT a docker-compose.yml change --
+# that file's Ofelia job never needs to change again.
+#
+# Schedule strings are standard 5-field cron (min hour dom month dow),
+# evaluated against the container's local wall-clock time (TZ=Europe/Kyiv,
+# set on the ofelia service in docker-compose.yml) -- matches every other
+# schedule in this repo (bot/s007_config.py's TRADE_START/EXIT_END are also
+# local Kyiv time).
+
+strategies:
+  # name must match webapp Strategy.name -- dispatched as
+  # `python -m webapp.runner --strategy <name>`, which itself queries the DB
+  # for enabled AccountStrategy rows and fans out per account. The schedule
+  # here is a property of the STRATEGY (one job per strategy, not per
+  # account/user) -- mirrors scripts/s007_tick.py::in_session()'s window
+  # (TRADE_START/EXIT_END = "10:00"/"16:59", bot/s007_config.py:111).
+  - name: S007
+    schedule: "* 10-16 * * 1-5"
+  # S009 is not listed yet -- webapp/runner.py only dispatches S007 today;
+  # add S009 here once its DB-driven multi-account path lands.
+
+# Background jobs unrelated to any single (account, strategy) pair (data
+# refresh, cleanup, ...). `command` is run as-is via subprocess (module path,
+# e.g. "python -m scripts.dump_today_m1"). Empty for now -- populate as
+# concrete needs come up, not speculatively.
+tasks: []

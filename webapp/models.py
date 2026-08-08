@@ -129,6 +129,40 @@ class AccountStrategy(Base):
     strategy: Mapped["Strategy"] = relationship(back_populates="account_links")
 
 
+class StrategyState(Base):
+    """Generic cross-cycle persistent state for a strategy that needs one --
+    e.g. S009's daily target book/equity/last-booked-day, which used to live
+    in a single file (reports/paper_s009/state.json) shared by every
+    account, making a second enabled S009 account collide with the first.
+    One JSON blob per (account, strategy) pair, keyed by account_strategy_id
+    so it moves and deletes with that row. NOT every strategy needs this --
+    S007 carries no state between cycles (it re-derives everything from the
+    broker + its own event log each time) -- rows exist only for strategies
+    whose worker actually calls webapp/state_store.py's DBStateStore.
+
+    DB-backed rather than a file so it survives an ephemeral container
+    (Docker/k8s CronJob has no guaranteed persistent local disk between
+    runs, unlike the long-lived launchd/VM setup files used historically).
+    """
+    __tablename__ = "strategy_state"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_strategy_id: Mapped[int] = mapped_column(
+        ForeignKey("account_strategies.id"), unique=True, nullable=False)
+    _state: Mapped[str] = mapped_column("state_json", Text, nullable=False, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    account_strategy: Mapped["AccountStrategy"] = relationship()
+
+    @property
+    def state(self) -> dict:
+        return json.loads(self._state) if self._state else {}
+
+    @state.setter
+    def state(self, value: dict):
+        self._state = json.dumps(value)
+
+
 class Position(Base):
     """Bot-tracked position lifecycle (mirrors the file log; here for the UI)."""
     __tablename__ = "positions"

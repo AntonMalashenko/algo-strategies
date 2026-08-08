@@ -1,10 +1,18 @@
 """Multi-account runner — the trading process (decoupled from the UI).
 
-S007 only for now (S009/Bybit multi-account parallel support needs a separate
-state-storage refactor first — see bot/s009_paper.py's module-level
-load_state()/save_state(): it keeps one shared ledger file for the whole
-strategy, not one per (account, strategy), so running several Bybit accounts
-through it in parallel would have them clobber each other's state).
+Strategy-agnostic dispatch: STRATEGY_WORKERS (bottom of this module) maps a
+Strategy.name to the worker function that knows how to run one cycle for
+one (account, strategy) row. Adding a new strategy here means writing that
+one worker function and registering it -- run_worker()/run_coordinator()
+themselves never need to change. S007 (_worker_s007, CTRADER) and S009
+(_worker_s009, BYBIT) are registered; S009's worker is deliberately
+shadow-only (broker="off") until enabling real orders through this
+DB-driven path is its own explicit decision. S009's per-account state
+(book/equity/last-booked-day) is DB-backed (webapp/state_store.py's
+DBStateStore, the `strategy_state` table) instead of the single shared
+file bot/s009_paper.py's single-account CLI path still uses -- that is
+what made running several Bybit accounts through here safe: the old shared
+reports/paper_s009/state.json would have had them clobber each other.
 
 Two modes, same file:
 
@@ -46,9 +54,9 @@ container -- containerizing this runner will need reports/ on a persistent
 volume, not a fresh ephemeral filesystem per tick (open item, not solved
 here).
 
-Schedule the coordinator once per strategy per tick, e.g. (cron for now,
-Ofelia/cloud scheduler later):
-    * 10-16 * * 1-5  python -m webapp.runner --strategy S007
+Scheduling (which strategy ticks when) lives in deployment/schedule.yml,
+read by scripts/scheduler_tick.py -- not here and not in Ofelia's own
+config, which stays one static job forever (see docker-compose.yml).
 """
 from __future__ import annotations
 
@@ -63,8 +71,9 @@ from webapp.db import get_session
 from webapp.models import Account, AccountStrategy, LogEntry, Position, Strategy, User
 from webapp.schemas import LogEntryCreate, LogKind, LogLevel
 
-from bot.s007_paper import run_cycle_for_account
+from bot.s007_paper import run_cycle_for_account as run_s007_cycle
 from utils.trade_logger import StrategyLogger
+from webapp.state_store import DBStateStore
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -116,42 +125,32 @@ def _close_position_db(session, acc: Account, strat: Strategy, label: str, reaso
         pos.closed_at = datetime.now(timezone.utc)
 
 
-def run_worker(account_strategy_id: int, budget_s: float | None = None) -> int:
-    """Run one S007 cycle for one (account, strategy) DB row, in THIS
-    process, then return an exit code. See the module docstring for why this
-    must be its own OS process rather than a thread.
+def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
+    """Run one S007/CTRADER cycle for one (account, strategy) DB row.
 
-    Fail-fast: a bad row id, a broker/strategy mismatch, or a credential
-    error raised while constructing CTraderS007 (inside
-    run_cycle_for_account) all crash this process loudly (uncaught
-    exception / SystemExit -> non-zero exit) rather than being swallowed --
-    same principle as bot/s007_paper.py's CTraderS007() construction comment.
-    A cycle that runs but the BROKER rejects/errors on is different: that is
-    caught inside run_cycle_for_account and reported back as result["error"],
-    recorded on the account_strategy row, with a clean (0) process exit --
-    a broker-side problem for one account is not a runner-crash.
+    Fail-fast: a broker mismatch, or a credential error raised while
+    constructing CTraderS007 (inside run_s007_cycle) crashes this process
+    loudly (uncaught exception / SystemExit -> non-zero exit) rather than
+    being swallowed -- same principle as bot/s007_paper.py's CTraderS007()
+    construction comment. A cycle that runs but the BROKER rejects/errors on
+    is different: that is caught inside run_s007_cycle and reported back as
+    result["error"], recorded on the account_strategy row, with a clean (0)
+    process exit -- a broker-side problem for one account is not a
+    runner-crash.
 
     `budget_s` is the wall-clock this worker has before the coordinator kills
-    it. It is used only to decide how much time is left for the end-of-cycle
-    position sync; None means "not launched by the coordinator" and falls back
-    to SYNC_BUDGET_S.
+    it. Used only to decide how much time is left for the end-of-cycle
+    position sync; None means "not launched by the coordinator" and falls
+    back to SYNC_BUDGET_S.
     """
     started = time.monotonic()
-    session = get_session()
-    link = session.get(AccountStrategy, account_strategy_id)
-    if link is None:
-        raise SystemExit(f"account_strategy {account_strategy_id} not found")
-    if not link.enabled:
-        print(f"[runner] account_strategy {account_strategy_id} is disabled -- skipping")
-        session.close()
-        return 0
-
+    account_strategy_id = link.id
     acc = link.account
     strat = link.strategy
-    if strat.name != "S007" or acc.broker != "CTRADER":
+    if acc.broker != "CTRADER":
         raise SystemExit(
-            f"account_strategy {account_strategy_id} is broker={acc.broker}/"
-            f"strategy={strat.name} -- webapp.runner only drives CTRADER/S007 today")
+            f"account_strategy {account_strategy_id} is broker={acc.broker} -- "
+            f"the S007 worker only drives CTRADER accounts")
     user = acc.user
 
     creds_row = acc.credentials
@@ -170,7 +169,7 @@ def run_worker(account_strategy_id: int, budget_s: float | None = None) -> int:
               strategy=strat)
     session.commit()
 
-    result = run_cycle_for_account(
+    result = run_s007_cycle(
         creds, preset=preset, risk_pct=link.risk_pct, fixed_lot=link.fixed_lot,
         use_fixed_lot=link.use_fixed_lot, magic=strat.name, logger=logger)
 
@@ -219,6 +218,103 @@ def run_worker(account_strategy_id: int, budget_s: float | None = None) -> int:
     #     thing that actually matters.
     _sync_after_cycle(account_strategy_id, started, budget_s)
     return 0 if ok else 1
+
+
+def _worker_s009(link: AccountStrategy, session, budget_s: float | None) -> int:
+    """Run one S009/BYBIT shadow cycle for one (account, strategy) DB row.
+
+    Deliberately `broker="off"` (shadow-only) here, always -- enabling real
+    demo/mainnet orders through this DB-driven path is a separate, explicit
+    decision to make later, not a side effect of registering S009. No
+    Position-table writes and no end-of-cycle sync: S009's "position" is a
+    target-book weight, not a broker position id, and
+    webapp/sync_positions.py is CTRADER-only by design (Bybit's positions()
+    has no per-position id to reconcile a Position row against -- see that
+    module's docstring).
+
+    Per-account state (book/equity/last-booked-day) lives in the
+    `strategy_state` DB table via DBStateStore, keyed by this
+    account_strategy row -- so a second enabled S009 account never collides
+    with the first the way the single shared reports/paper_s009/state.json
+    file would.
+    """
+    from bot.s009_paper import run_cycle_for_account as run_s009_cycle, DEPLOY
+
+    account_strategy_id = link.id
+    acc = link.account
+    strat = link.strategy
+    if acc.broker != "BYBIT":
+        raise SystemExit(
+            f"account_strategy {account_strategy_id} is broker={acc.broker} -- "
+            f"the S009 worker only drives BYBIT accounts")
+    user = acc.user
+
+    creds_row = acc.credentials
+    creds = dict(api_key=creds_row.get("api_key"), api_secret=creds_row.get("api_secret"))
+    logger = StrategyLogger(f"S009-acct{acc.id}", log_root=str(ROOT / "reports" / "logs"))
+    state = DBStateStore(link.id, session)
+
+    print(f"[runner] S009 cycle starting: account_strategy={link.id} account={acc.id} "
+          f"({acc.label or acc.id}) user={user.username}")
+    _log_event(session, LogKind.CYCLE_START, message="cycle start", user=user, account=acc,
+              strategy=strat)
+    session.commit()
+
+    result = run_s009_cycle(
+        account_key=acc.label or f"acct{acc.id}", creds=creds, cfg=DEPLOY, state=state,
+        logger=logger, broker="off", allow_mainnet=False)
+
+    ok = True
+    if result["error"]:
+        link.status = "error"
+        link.last_error = result["error"]
+        _log_event(session, LogKind.ERROR, level=LogLevel.ERROR, message=result["error"],
+                  user=user, account=acc, strategy=strat)
+        print(f"[runner] account_strategy {link.id}: ERROR {result['error']}")
+        ok = False
+    else:
+        link.status = (f"shadow: {result['booked']} day(s) booked, "
+                       f"{len(result['target'])} target position(s)")
+        link.last_error = None
+        print(f"[runner] account_strategy {link.id}: booked={result['booked']} "
+              f"target={len(result['target'])} equity={result['equity']}")
+    link.last_cycle_at = datetime.now(timezone.utc)
+    _log_event(session, LogKind.CYCLE_END, message="cycle end", user=user, account=acc,
+              strategy=strat, payload=dict(booked=result["booked"], error=result["error"]))
+    session.commit()
+    session.close()
+    return 0 if ok else 1
+
+
+# Strategy.name -> worker(link, session, budget_s) -> exit code. The only
+# place a new strategy needs registering; run_worker()/run_coordinator()
+# never need to change for one to be added.
+STRATEGY_WORKERS = {
+    "S007": _worker_s007,
+    "S009": _worker_s009,
+}
+
+
+def run_worker(account_strategy_id: int, budget_s: float | None = None) -> int:
+    """Load one (account, strategy) DB row and dispatch to its registered
+    STRATEGY_WORKERS entry, in THIS process, then return an exit code. See
+    the module docstring for why each cycle is its own OS process rather
+    than a thread."""
+    session = get_session()
+    link = session.get(AccountStrategy, account_strategy_id)
+    if link is None:
+        raise SystemExit(f"account_strategy {account_strategy_id} not found")
+    if not link.enabled:
+        print(f"[runner] account_strategy {account_strategy_id} is disabled -- skipping")
+        session.close()
+        return 0
+
+    worker_fn = STRATEGY_WORKERS.get(link.strategy.name)
+    if worker_fn is None:
+        raise SystemExit(
+            f"account_strategy {account_strategy_id}: no runner worker registered for "
+            f"strategy={link.strategy.name!r} (known: {sorted(STRATEGY_WORKERS)})")
+    return worker_fn(link, session, budget_s)
 
 
 def _sync_after_cycle(account_strategy_id: int, started: float,

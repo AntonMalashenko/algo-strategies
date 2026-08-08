@@ -35,7 +35,6 @@ long bottom-2, dollar-neutral, daily rebalance, taker 0.055%/side, vol-target 20
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
 import time
@@ -50,6 +49,7 @@ from strategies.funding_carry import (  # noqa: E402
     FundingCarryConfig, load_panels, run_backtest, MS_PER_DAY, DEFAULT_UNIVERSE,
 )
 from utils.trade_logger import StrategyLogger  # noqa: E402  (shared project logger)
+from utils.strategy_state import FileStateStore  # noqa: E402
 
 DATA_DIR = REPO / "data" / "raw" / "crypto_funding"
 STATE_DIR = REPO / "reports" / "paper_s009"
@@ -143,15 +143,25 @@ def refresh_data(universe, data_dir: Path, lookback_days: int = REFRESH_LOOKBACK
 # State
 # --------------------------------------------------------------------------
 
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+def _default_state() -> dict:
     return {"last_day": None, "equity": 1.0, "book": {}}
 
 
+# The single-account CLI's state store (--once/--loop/--status/--reconcile,
+# and scripts/s009_tick.py's `load_state`/`_expected_last_closed_day`
+# imports below) -- unchanged file location/format from before
+# run_cycle_for_account() existed. A DB-driven multi-account caller
+# (webapp/runner.py) builds its own webapp/state_store.py::DBStateStore
+# per account instead of using this module-level singleton.
+_state_store = FileStateStore(STATE_FILE, default_factory=_default_state)
+
+
+def load_state() -> dict:
+    return _state_store.load()
+
+
 def save_state(st: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(st, indent=2))
+    _state_store.save(st)
 
 
 def append_ledger(row: dict) -> None:
@@ -266,81 +276,151 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
     return plan
 
 
+def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingCarryConfig,
+                          state, logger: StrategyLogger, data_dir: Path = DATA_DIR,
+                          do_fetch: bool = True, drop_forming: bool = True,
+                          broker: str = "off", allow_mainnet: bool = False) -> dict:
+    """One S009 daily cycle for an arbitrary account, reusing the exact
+    engine/book/ledger logic `run_once()` below uses for the single
+    accounts.yml-configured account -- so a DB-registered multi-account run
+    (webapp/runner.py) and the original single-account CLI can never drift
+    apart into two competing implementations of the same trading rules
+    (mirrors bot/s007_paper.py::run_cycle_for_account()'s reasoning).
+
+    `state`: any object with `.load() -> dict` / `.save(dict)` (see
+    utils/strategy_state.py) -- a FileStateStore for the single-account CLI
+    below, webapp/state_store.py's DBStateStore for the multi-account
+    runner, so each enabled account keeps its own book/equity/last-booked-
+    day instead of colliding on one shared file.
+    `creds`: {"api_key", "api_secret"} passed straight to BybitExec, or None
+    to fall back to accounts.yml resolution via `account_key` as the yml
+    `name:` (what `run_once()` below still does, unchanged).
+
+    Never raises: catches any exception from the engine/state/broker steps
+    and reports it as `error` instead, mirroring bot/s007_paper.py's
+    run_cycle_for_account so a future parallel multi-account fan-out can
+    isolate one account's failure from the rest. cycle_start/cycle_end are
+    always paired, even on failure, so log analysis never sees an orphaned
+    cycle_start.
+
+    Prints nothing -- purely a data function; `run_once()` below does the
+    human-readable printing from the returned dict, same output as before
+    this refactor.
+
+    Returns dict(booked, target, equity, broker_orders, error, date,
+    latest_net_ret, broker_env, broker_plan).
+    """
+    cid = logger.cycle_start(mode="paper-shadow", account=account_key, fetched=do_fetch)
+    booked = 0
+    target: dict = {}
+    equity = None
+    date = None
+    latest_net_ret = None
+    broker_env = None
+    broker_equity = None
+    broker_plan: list = []
+    error = None
+    try:
+        if do_fetch:
+            refresh_data(cfg.universe, data_dir)
+        close, funding, out, w, price_comp, fund_comp = _engine(data_dir, cfg)
+
+        days = list(out.index)
+        if drop_forming:
+            # drop the last daily bar if it belongs to the current (still-forming) UTC day
+            today = int(time.time() * 1000) // MS_PER_DAY
+            days = [d for d in days if d < today]
+        if days:
+            latest = days[-1]
+            latest_net_ret = float(out.loc[latest, "net_ret"])
+            date = pd.to_datetime(latest * MS_PER_DAY, unit="ms", utc=True).strftime("%Y-%m-%d")
+
+            st = state.load() or _default_state()
+
+            # First run: seed the book to hold now, book NO already-closed day.
+            # Subsequent runs: realise every day that closed since we last set a book.
+            start = (st["last_day"] + 1) if st["last_day"] is not None else latest + 1
+            equity = st["equity"]
+            for d in [x for x in days if start <= x <= latest]:
+                net = float(out.loc[d, "net_ret"])
+                equity *= (1 + net)
+                d_date = pd.to_datetime(d * MS_PER_DAY, unit="ms", utc=True).strftime("%Y-%m-%d")
+                row = {
+                    "day": int(d), "date": d_date, "net_ret": round(net, 6),
+                    "price_comp": round(float(price_comp.loc[d]), 6),
+                    "funding_comp": round(float(fund_comp.loc[d]), 6),
+                    "turnover": round(float(out.loc[d, "turnover"]), 4),
+                    "n_pos": int(out.loc[d, "n_pos"]), "equity": round(equity, 6),
+                }
+                append_ledger(row)
+                logger.event("day_pnl", cycle=cid, **row)
+                booked += 1
+
+            target = forward_target_book(close, funding, cfg)
+            # Log the target book per symbol (one file per coin under positions/).
+            for sym, wt in target.items():
+                logger.position(f"S009:{sym}", "desired", cycle=cid,
+                                side="long" if wt > 0 else "short", weight=wt, for_date=date)
+            st.update({"last_day": int(latest), "equity": round(equity, 6), "book": target})
+            state.save(st)
+
+            # Broker execution (optional): reconcile the target book to real positions.
+            if broker != "off" and target:
+                from bot.bybit_exec import BybitExec
+                client = (BybitExec(api_key=creds.get("api_key"), api_secret=creds.get("api_secret"),
+                                    allow_mainnet=allow_mainnet) if creds
+                         else BybitExec(name=account_key, allow_mainnet=allow_mainnet))
+                broker_env = client.env
+                broker_equity = client.wallet_equity()
+                logger.event("broker", cycle=cid, env=client.env, equity=round(broker_equity, 2), mode=broker)
+                broker_plan = reconcile_to_target(client, target, broker_equity, logger, cid,
+                                                  execute=(broker == "execute"))
+    except Exception as e:
+        logger.error("S009 cycle failed", exc=e, cycle=cid)
+        error = repr(e)[:500]
+
+    logger.cycle_end(cid, status=f"paper-shadow: {len(target)} positions, {booked} day(s) booked, "
+                               f"broker={broker} orders={len(broker_plan)}",
+                    equity=equity)
+    return dict(booked=booked, target=target, equity=equity, broker_orders=len(broker_plan),
+               error=error, date=date, latest_net_ret=latest_net_ret,
+               broker_env=broker_env, broker_equity=broker_equity, broker_plan=broker_plan)
+
+
 def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_forming: bool = True,
              broker: str = "off", allow_mainnet: bool = False) -> None:
+    """Thin CLI wrapper around run_cycle_for_account() for the single
+    accounts.yml-configured account (BYBIT_ACCOUNT_NAME) and the module's
+    file-backed state (_state_store / STATE_FILE) -- same account/state
+    location/printed summary as before run_cycle_for_account() existed.
+    scripts/s009_tick.py's `--once` subprocess call is unaffected."""
     if do_fetch:
         print("Refreshing data from Bybit (public)...")
-        refresh_data(cfg.universe, data_dir)
-    close, funding, out, w, price_comp, fund_comp = _engine(data_dir, cfg)
-
-    days = list(out.index)
-    if drop_forming:
-        # drop the last daily bar if it belongs to the current (still-forming) UTC day
-        today = int(time.time() * 1000) // MS_PER_DAY
-        days = [d for d in days if d < today]
-    if not days:
-        print("No closed day to process."); return
-    latest = days[-1]
-
-    st = load_state()
-    date = pd.to_datetime(latest * MS_PER_DAY, unit="ms", utc=True).strftime("%Y-%m-%d")
-
-    # Route through the shared project logger (uniform with S004/S007). We only
-    # USE its public API — the logger itself is unchanged. One cycle per daily run.
     log = StrategyLogger("S009", log_root=REPO / "reports" / "logs", console=False)
-    cid = log.cycle_start(mode="paper-shadow", latest_day=date,
-                          equity=round(st["equity"], 6), universe=len(cfg.universe),
-                          fetched=do_fetch)
+    result = run_cycle_for_account(
+        account_key=BYBIT_ACCOUNT_NAME, creds=None, cfg=cfg, state=_state_store, logger=log,
+        data_dir=data_dir, do_fetch=do_fetch, drop_forming=drop_forming,
+        broker=broker, allow_mainnet=allow_mainnet)
 
-    # First run: seed the book to hold now, book NO already-closed day.
-    # Subsequent runs: realise every day that closed since we last set a book.
-    start = (st["last_day"] + 1) if st["last_day"] is not None else latest + 1
-    equity = st["equity"]
-    booked = 0
-    for d in [x for x in days if start <= x <= latest]:
-        net = float(out.loc[d, "net_ret"])
-        equity *= (1 + net)
-        d_date = pd.to_datetime(d * MS_PER_DAY, unit="ms", utc=True).strftime("%Y-%m-%d")
-        row = {
-            "day": int(d), "date": d_date, "net_ret": round(net, 6),
-            "price_comp": round(float(price_comp.loc[d]), 6),
-            "funding_comp": round(float(fund_comp.loc[d]), 6),
-            "turnover": round(float(out.loc[d, "turnover"]), 4),
-            "n_pos": int(out.loc[d, "n_pos"]), "equity": round(equity, 6),
-        }
-        append_ledger(row)
-        log.event("day_pnl", cycle=cid, **row)
-        booked += 1
+    if result["error"]:
+        print(f"ERROR: {result['error']}")
+        return
+    if result["date"] is None:
+        print("No closed day to process.")
+        return
 
-    target = forward_target_book(close, funding, cfg)
-    # Log the target book per symbol (one file per coin under positions/).
-    for sym, wt in target.items():
-        log.position(f"S009:{sym}", "desired", cycle=cid,
-                     side="long" if wt > 0 else "short", weight=wt, for_date=date)
-    st.update({"last_day": int(latest), "equity": round(equity, 6), "book": target})
-    save_state(st)
-
-    # Broker execution (optional): reconcile the target book to real positions.
-    plan = []
-    if broker != "off" and target:
-        from bot.bybit_exec import BybitExec
-        client = BybitExec(name=BYBIT_ACCOUNT_NAME, allow_mainnet=allow_mainnet)
-        broker_eq = client.wallet_equity()
-        log.event("broker", cycle=cid, env=client.env, equity=round(broker_eq, 2), mode=broker)
-        plan = reconcile_to_target(client, target, broker_eq, log, cid, execute=(broker == "execute"))
-        print(f"\nbroker[{client.env}] equity={broker_eq:.2f}  mode={broker}  orders={len(plan)}")
-        for r in plan:
+    target = result["target"]
+    if result["broker_env"] is not None:
+        print(f"\nbroker[{result['broker_env']}] equity={result['broker_equity']:.2f}  "
+              f"mode={broker}  orders={result['broker_orders']}")
+        for r in result["broker_plan"]:
             extra = f" fill={r.get('fill')} slip={r.get('slippage')}" if "fill" in r else ""
             print(f"  {r['side']:>4} {r['qty']} {r['symbol']} @~{r['ref_price']}  (cur {r['cur_qty']} → tgt {r['target_qty']}){extra}")
 
-    log.cycle_end(cid, status=f"paper-shadow: {len(target)} positions, {booked} day(s) booked, "
-                             f"broker={broker} orders={len(plan)}",
-                  equity=round(equity, 6))
-
     longs = {s: v for s, v in target.items() if v > 0}
     shorts = {s: v for s, v in target.items() if v < 0}
-    print(f"\n=== S009 paper cycle {date} ===")
-    print(f"paper equity: {equity:.4f}  (last day net {float(out.loc[latest,'net_ret']):+.4%})")
+    print(f"\n=== S009 paper cycle {result['date']} ===")
+    print(f"paper equity: {result['equity']:.4f}  (last day net {result['latest_net_ret']:+.4%})")
     print(f"TARGET BOOK (hold into next day):")
     print(f"  LONG : {longs}")
     print(f"  SHORT: {shorts}")
