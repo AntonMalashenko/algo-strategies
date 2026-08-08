@@ -4,7 +4,7 @@ truth for users/accounts (see the multi-account-architecture memory) --
 accounts.yml stays only as an import/bootstrap convenience and a fallback
 credential source (bot/accounts_config.py).
 
-Mapping:
+Mapping (applied only when CREATING a new AccountStrategy link -- see below):
   CTRADER entries -> Strategy "S007" (broker CTRADER)
   BYBIT entries    -> Strategy "S009" (broker BYBIT)
   active           -> AccountStrategy.enabled
@@ -21,8 +21,26 @@ Mapping:
 
 One User row per unique `username`, shared across broker sections if the
 same email appears in both (as in the current accounts.yml). Re-running is
-safe: existing users are left alone (password only used for NEW users),
-existing accounts/links are updated in place, not duplicated.
+safe and idempotent, with one asymmetry by design: existing users are left
+alone (password only used for NEW users); existing Account rows have their
+credentials/env/label/broker_host refreshed from accounts.yml every run
+(yml stays the source of truth for credentials); existing AccountStrategy
+LINKS are left completely untouched on re-run -- enabled/initial_balance/
+preset/etc. are operator-tuned live via the webapp once a link exists, and
+a stale accounts.yml must never be able to silently revert that (2026-08-06/
+07 incident: this script used to clobber enabled/initial_balance on every
+run, see `_upsert_account_strategy`). Nothing here is ever duplicated.
+
+Account identity: cTrader rows are keyed by ACCOUNT_ID (ctidTraderAccountId).
+Bybit has no such id in the yml, so a BYBIT row is keyed by its `name:` label
+instead, which is also what bot/accounts_config.py uses to tell two
+sub-accounts of the same person apart. This matters: keying Bybit on
+(user_id, broker, external_account_id=None) alone -- as this script did until
+2026-08-06 -- makes every BYBIT row of one user collide, so a second entry
+does not create a second account, it silently OVERWRITES the first one's
+credentials. A BYBIT entry without `name:` still falls back to
+`bybit-<username>`, which is safe only while that user has exactly one Bybit
+account.
 
 Usage:
     python -m scripts.migrate_accounts_yml --password '<plaintext>'
@@ -81,9 +99,15 @@ def _get_or_create_strategy(s, name: str) -> Strategy:
 
 
 def _upsert_account(s, payload: AccountCreate) -> Account:
-    existing = s.query(Account).filter_by(
-        user_id=payload.user_id, broker=payload.broker.value,
-        external_account_id=payload.external_account_id).one_or_none()
+    # Identity: the broker's own account id when there is one (cTrader), the
+    # label otherwise (Bybit -- see the module docstring). Matching on a NULL
+    # external_account_id would make every Bybit row of one user the same row.
+    q = s.query(Account).filter_by(user_id=payload.user_id, broker=payload.broker.value)
+    if payload.external_account_id:
+        q = q.filter_by(external_account_id=payload.external_account_id)
+    else:
+        q = q.filter_by(external_account_id=None, label=payload.label)
+    existing = q.one_or_none()
     if existing:
         existing.env = payload.env.value
         existing.label = payload.label
@@ -104,19 +128,37 @@ def _upsert_account(s, payload: AccountCreate) -> Account:
 
 
 def _upsert_account_strategy(s, payload: AccountStrategyCreate) -> AccountStrategy:
+    """Create the link on first import; leave an existing link's tunables
+    alone on every re-run.
+
+    2026-08-06/07 incident: this used to overwrite enabled/preset/symbol/
+    risk_pct/fixed_lot/use_fixed_lot/initial_balance on EVERY run, including
+    for a link that already existed. enabled and initial_balance are
+    operator-tuned live via the webapp (Anton manually flipped
+    Bybit-tradebot1/Bybit-algo009's enabled state and corrected algo009's
+    initial_balance 50->100 straight in the DB on 2026-08-06) -- a stale
+    accounts.yml (still active: true / initial_balance: 50 for algo009) that
+    happened to get re-run would have silently reverted both. Per the module
+    docstring, the DB is the source of truth once a link exists; accounts.yml
+    only seeds it once. If accounts.yml's link settings genuinely need to
+    change, edit the DB (or the webapp UI) directly, not by re-running this
+    script.
+    """
     link = s.query(AccountStrategy).filter_by(
         account_id=payload.account_id, strategy_id=payload.strategy_id).one_or_none()
-    if link is None:
-        link = AccountStrategy(account_id=payload.account_id, strategy_id=payload.strategy_id)
-        s.add(link)
-    link.enabled = payload.enabled
-    link.preset = payload.preset
-    link.symbol = payload.symbol
-    link.risk_pct = payload.risk_pct
-    link.fixed_lot = payload.fixed_lot
-    link.use_fixed_lot = payload.use_fixed_lot
-    link.initial_balance = payload.initial_balance
+    if link is not None:
+        print(f"  account_strategy link (id={link.id}) already exists -- left untouched "
+              f"(enabled/preset/initial_balance/etc. are operator-tuned, not re-imported)")
+        return link
+    link = AccountStrategy(
+        account_id=payload.account_id, strategy_id=payload.strategy_id,
+        enabled=payload.enabled, preset=payload.preset, symbol=payload.symbol,
+        risk_pct=payload.risk_pct, fixed_lot=payload.fixed_lot,
+        use_fixed_lot=payload.use_fixed_lot, initial_balance=payload.initial_balance,
+    )
+    s.add(link)
     s.flush()
+    print(f"  created account_strategy link (id={link.id})")
     return link
 
 
@@ -147,13 +189,13 @@ def migrate(password: str):
         _upsert_account_strategy(s, link_payload)
 
     for row in data.get("BYBIT", []):
-        print(f"BYBIT ({row['username']}):")
+        print(f"BYBIT {row.get('name') or ''} ({row['username']}):")
         user = _get_or_create_user(s, row["username"], password)
         strat = _get_or_create_strategy(s, "S009")
         env = row.get("env") or ("testnet" if row.get("TESTNET") else "mainnet")
         acc_payload = AccountCreate(
             user_id=user.id, broker=Broker.BYBIT, external_account_id=None, env=Env(env),
-            label=f"bybit-{row['username']}",
+            label=row.get("name") or f"bybit-{row['username']}",
             credentials=dict(api_key=row["API_KEY"], api_secret=row["API_SECRET"]))
         acc = _upsert_account(s, acc_payload)
         link_payload = AccountStrategyCreate(

@@ -63,6 +63,11 @@ documents, flag the drift and propose the skill update for consent — don't app
 - **`webapp`** — the multi-user / multi-account control panel (`webapp/`): FastAPI UI,
   `User/Account/Position` models, Fernet-encrypted creds, PBKDF2 auth, and the decoupled
   runner. Use for: the dashboard, login, accounts, credential storage, the DB, the runner.
+- **`trading-analysis`** — on-demand diagnosis of a strategy's live/paper trading
+  behavior from its logs (+ read-only broker check): is it doing the right thing right
+  now, and if it holds no position, is that a bug or expected. Strategy-agnostic (S007,
+  S009, future ones). Use for: "проанализируй торговлю <NNN/name>", "why are there no
+  positions", "is this a bug or normal", auditing a session or a wider date range.
 - **`orchestrator`** (this) — routing + response format. Always first.
 
 If a task matches no domain skill (a plain factual question, a one-off calculation), still

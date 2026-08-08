@@ -32,7 +32,9 @@ multi-account web control panel. Primary markets: futures / forex / indices.
   Live/paper logs land under `reports/logs/<STRATEGY>/` (see `utils/trade_logger.py`).
 - `notebooks/` — research notebooks.
 - `tests/` — pytest test suite.
-- `docs/` — in-repo technical docs (e.g. `EXPERIMENTS.md`, `STRATEGY_S004.md`).
+- `docs/` — in-repo technical docs (e.g. `EXPERIMENTS.md`, `STRATEGY_S004.md`,
+  `DEV_PLANS.md` for decided-but-not-yet-built engineering initiatives like
+  the multi-account Docker migration).
 - `.claude/skills/` — repo-scoped Claude skills documenting this codebase's
   conventions (architecture, strategy lifecycle, modifiers, logging, webapp).
 

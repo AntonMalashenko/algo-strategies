@@ -1,20 +1,58 @@
 {% extends "base.html" %}{% block title %}Add account{% endblock %}
 {% block body %}
-<div class="card" style="max-width:520px">
-  <h2>Add cTrader account</h2>
-  <form method="post" action="/accounts/add">
-    <label>ctidTraderAccountId (numeric)</label><input name="ctid" required style="width:100%">
-    <label>Label</label><input name="label" placeholder="demo-1" style="width:100%">
-    <label>Strategy preset</label>
-    <select name="preset" style="width:100%">{% for p in presets %}<option>{{ p }}</option>{% endfor %}</select>
-    <div class="row" style="gap:16px">
-      <div><label>Risk % per position</label><input name="risk" value="0.25" style="width:120px"></div>
-      <div><label>Fixed lot</label><input name="lot" value="0.01" style="width:120px"></div>
+<div class="card" style="max-width:560px">
+  <h2>Add broker account</h2>
+  <form method="post" action="/accounts/add" id="add-account-form">
+    <label>Broker</label>
+    <select name="broker" id="broker-select" style="width:100%">
+      {% for b in env_by_broker %}<option value="{{ b }}">{{ b }}</option>{% endfor %}
+    </select>
+
+    <label>Environment</label>
+    <select name="env" id="env-select" style="width:100%"></select>
+
+    <label>Label (optional, e.g. "demo-1")</label>
+    <input name="label" style="width:100%">
+
+    <label>External account id <span class="mut">(cTrader ctidTraderAccountId -- leave blank for Bybit)</span></label>
+    <input name="external_account_id" style="width:100%">
+
+    <label>Broker host <span class="mut">(optional override)</span></label>
+    <input name="broker_host" style="width:100%">
+
+    <div id="fields-CTRADER" class="broker-fields">
+      <label>Client ID</label><input name="client_id" style="width:100%">
+      <label>Client secret</label><input name="client_secret" type="password" style="width:100%">
+      <label>Access token</label><input name="access_token" type="password" style="width:100%">
     </div>
-    <label><input type="checkbox" name="is_live" value="true"> Live account (default demo)</label>
+    <div id="fields-BYBIT" class="broker-fields">
+      <label>API key</label><input name="api_key" style="width:100%">
+      <label>API secret</label><input name="api_secret" type="password" style="width:100%">
+    </div>
+
     <div style="margin-top:16px"><button>Add account</button>
       <a class="btn ghost" href="/">Cancel</a></div>
   </form>
-  <p class="mut">Get the id from cTrader, or run <small class="mono">python -m bot.s007_paper --accounts</small>.</p>
+  <p class="mut">Credentials are encrypted at rest (Fernet) and never shown again after saving.</p>
 </div>
+<script>
+  const ENV_BY_BROKER = {{ env_by_broker | tojson }};
+  const brokerSelect = document.getElementById('broker-select');
+  const envSelect = document.getElementById('env-select');
+
+  function syncBroker() {
+    const broker = brokerSelect.value;
+    envSelect.innerHTML = '';
+    (ENV_BY_BROKER[broker] || []).forEach(env => {
+      const opt = document.createElement('option');
+      opt.value = env; opt.textContent = env;
+      envSelect.appendChild(opt);
+    });
+    document.querySelectorAll('.broker-fields').forEach(el => {
+      el.style.display = (el.id === 'fields-' + broker) ? 'block' : 'none';
+    });
+  }
+  brokerSelect.addEventListener('change', syncBroker);
+  syncBroker();
+</script>
 {% endblock %}

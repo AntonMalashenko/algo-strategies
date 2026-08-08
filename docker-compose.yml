@@ -1,0 +1,69 @@
+# Docker/Ofelia scaffold: "one job per STRATEGY", DB-driven fan-out across
+# every enabled (account, strategy) row -- see docs/DEV_PLANS.md's "Multi-
+# account Docker migration" decisions. Run `docker compose`/`podman compose`
+# from the repo root (uses ${PWD} for bind-mount paths below).
+#
+# `worker` only describes the image build -- `docker compose up` does NOT
+# start it (profile gate below); Ofelia's job-run spins up short-lived
+# containers from `algo-worker:latest` directly via the Docker/Podman socket,
+# one per scheduled tick, matching the stateless-tick design already used by
+# scripts/s007_tick.py / scripts/s009_tick.py.
+#
+# Only S007 is wired into a schedule here -- webapp/runner.py itself is still
+# S007/CTRADER-only today; generalizing its dispatch to other strategies is a
+# separate follow-up. Do not `docker compose up -d ofelia` unattended while
+# the legacy launchd job `com.anton.algo.s007bot` is also loaded: both would
+# drive the same demo account (ctrader-47939312) independently.
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: algo-worker:latest
+    profiles: ["build-only"]   # excluded from `up`/`start` by default
+
+  ofelia:
+    image: mcuadros/ofelia:latest
+    command: daemon --docker
+    environment:
+      - TZ=Europe/Kyiv   # S007's session window (bot/s007_config.py) is local Kyiv time
+    # --- Podman machine (Fedora CoreOS + SELinux enforcing) specifics ---
+    # Verified live on this host (2026-08-08). Plain Docker Engine/Desktop
+    # would instead just need `- /var/run/docker.sock:/var/run/docker.sock:ro`
+    # with no security_opt -- both quirks below are Podman-machine-only:
+    #   1. rw, not ro: job-run needs to CREATE/start/remove containers via
+    #      this socket, not just list them -- a read-only mount 403s on the
+    #      create call.
+    #   2. /run/podman/podman.sock (the socket AS SEEN INSIDE the podman-
+    #      machine VM), not the macOS-side /var/run/docker.sock forward --
+    #      the latter is a symlink chain that resolves outside the VM's
+    #      virtiofs-shared paths, so bind-mounting it into a container
+    #      running INSIDE the VM fails at the mount step.
+    #   3. security_opt label=disable: without it, connecting to the
+    #      bind-mounted socket fails with "permission denied" even as root
+    #      in the container -- an SELinux AVC denial (Fedora CoreOS is
+    #      enforcing by default), not a Unix file-permission issue; `:z`
+    #      relabeling alone did not clear it in testing, disabling SELinux
+    #      confinement for this one (trusted, local-only) container did.
+    security_opt:
+      - label=disable
+    volumes:
+      - /run/podman/podman.sock:/var/run/docker.sock:rw
+    labels:
+      ofelia.enabled: "true"
+      # Standard 5-field cron (min hour dom month dow) -- Ofelia 0.4.x+ does
+      # NOT use a seconds field (github.com/mcuadros/ofelia README: "seconds
+      # optional, not recommended", robfig/cron v3 default parser). Every
+      # minute, 10:00-16:59 weekdays -- mirrors scripts/s007_tick.py's
+      # in_session() exactly (TRADE_START/EXIT_END = "10:00"/"16:59",
+      # bot/s007_config.py:111).
+      ofelia.job-run.s007tick.schedule: "* 10-16 * * 1-5"
+      ofelia.job-run.s007tick.image: "algo-worker:latest"
+      ofelia.job-run.s007tick.command: "python -m webapp.runner --strategy S007"
+      ofelia.job-run.s007tick.delete: "true"
+      # Multi-value fields need a JSON array (Ofelia label syntax, not compose's).
+      ofelia.job-run.s007tick.volume: >-
+        ["${PWD}/data:/app/data:rw", "${PWD}/reports:/app/reports:rw"]
+      ofelia.job-run.s007tick.environment: >-
+        ["APP_SECRET_KEY=${APP_SECRET_KEY}", "APP_DB_URL=sqlite:////app/data/app.db"]

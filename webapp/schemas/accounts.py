@@ -8,7 +8,7 @@ shape; this is the one place that does.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from webapp.schemas.enums import Broker, Env
 
@@ -21,15 +21,17 @@ ENV_BY_BROKER: dict[Broker, set[Env]] = {
 }
 
 
+# min_length=1 on every field: a blank form field must be rejected at this
+# boundary, not silently stored and then blow up inside a runner cycle.
 class CtraderCredentials(BaseModel):
-    client_id: str
-    client_secret: str
-    access_token: str
+    client_id: str = Field(min_length=1)
+    client_secret: str = Field(min_length=1)
+    access_token: str = Field(min_length=1)
 
 
 class BybitCredentials(BaseModel):
-    api_key: str
-    api_secret: str
+    api_key: str = Field(min_length=1)
+    api_secret: str = Field(min_length=1)
 
 
 CREDENTIALS_BY_BROKER: dict[Broker, type[BaseModel]] = {

@@ -37,3 +37,6 @@ accounts.yml
 # Claude Code local machine settings (per-machine permission grants, not shared)
 .claude/settings.local.json
 data/app.db
+
+# Scratch holding pen for files pending manual deletion (device_bash cannot rm)
+_to_delete/

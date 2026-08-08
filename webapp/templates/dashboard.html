@@ -1,53 +1,79 @@
 {% extends "base.html" %}{% block title %}Dashboard{% endblock %}
 {% block body %}
 <meta http-equiv="refresh" content="30">
-{% if not has_token %}<div class="flash err">No cTrader access token set — add it in
-  <a href="/creds">Credentials</a> before starting an account.</div>{% endif %}
-<div class="card">
-  <div class="row"><h2 style="margin:0">Accounts</h2><span class="sp" style="flex:1"></span>
-    <a class="btn" href="/accounts/add">+ Add account</a></div>
-  {% if not accounts %}<p class="mut">No accounts yet.</p>{% else %}
-  <table>
-    <tr><th>Account</th><th>Type</th><th>Strategy</th><th>Risk/Lot</th><th>Status</th>
-        <th>Open</th><th>Last cycle</th><th></th></tr>
-    {% for a in accounts %}
+<div class="row" style="margin-bottom:14px">
+  <h2 style="margin:0">Accounts</h2><span class="sp" style="flex:1"></span>
+  <a class="btn" href="/accounts/add">+ Add account</a>
+</div>
+{% if not accounts %}
+<div class="card"><p class="mut">No accounts yet -- add one to get started.</p></div>
+{% endif %}
+{% for a in accounts %}
+<div class="account-block">
+  <div class="account-head">
+    <strong>{{ a.label or a.external_account_id or ('account #' ~ a.id) }}</strong>
+    <span class="badge">{{ a.broker }}</span>
+    <span class="badge {{ 'live' if a.env in ('live','mainnet') else '' }}">{{ a.env }}</span>
+    {% if a.external_account_id %}<small class="mono">{{ a.external_account_id }}</small>{% endif %}
+    <span class="sp" style="flex:1"></span>
+    <a class="btn ghost" href="/accounts/{{ a.id }}/link-strategy">+ Link strategy</a>
+    <form method="post" action="/accounts/{{ a.id }}/delete"
+          onsubmit="return confirm('Remove account {{ a.label or a.id }} and everything linked to it?')">
+      <button class="ghost">✕</button>
+    </form>
+  </div>
+  {% if not a.strategy_links %}
+    <p class="mut" style="margin:6px 0 0">No strategy linked to this account yet.</p>
+  {% else %}
+  <table class="inner">
+    <tr><th>Strategy</th><th>Preset</th><th>Risk/Lot</th><th>Status</th><th>Open</th>
+        <th>Last cycle</th><th></th></tr>
+    {% for link in a.strategy_links %}
     <tr>
-      <td><strong>{{ a.ctid_trader_account_id }}</strong><br><small class="mono">{{ a.label }}</small></td>
-      <td>{{ 'LIVE' if a.is_live else 'demo' }}</td>
-      <td>{{ a.preset }}</td>
-      <td>{{ a.risk_pct }}% / {{ a.fixed_lot }}</td>
+      <td><a href="/account-strategies/{{ link.id }}"><strong>{{ link.strategy.name }}</strong></a>
+        {% if link.enabled %}<br><span class="pill on">running</span>
+        {% else %}<br><span class="pill off">stopped</span>{% endif %}
+      </td>
+      <td>{{ link.preset or '—' }}{% if link.symbol %}<br><small class="mono">{{ link.symbol }}</small>{% endif %}</td>
+      <td>{% if link.use_fixed_lot %}{{ link.fixed_lot }} lot{% else %}{{ link.risk_pct }}% risk{% endif %}</td>
       <td>
-        {% if a.enabled %}<span class="pill on">running</span>{% else %}<span class="pill off">stopped</span>{% endif %}
-        <br><small class="mono">{{ a.status }}</small>
-        {% if a.last_error %}<br><small style="color:#f87171">{{ a.last_error[:60] }}</small>{% endif %}
+        <small class="mono">{{ link.status }}</small>
+        {% if link.last_error %}<br><span class="pill err">{{ link.last_error[:70] }}</span>{% endif %}
       </td>
       <td>
-        {% for p in open_pos[a.id] %}
+        {% for p in open_pos.get(link.id, []) %}
           <small class="mono">{{ p.side }} @{{ '%.1f'|format(p.entry) }}{% if p.is_add %} +{% endif %}</small><br>
         {% else %}<span class="mut">—</span>{% endfor %}
       </td>
-      <td><small class="mono">{{ a.last_cycle_at.strftime('%H:%M:%S') if a.last_cycle_at else '—' }}</small></td>
-      <td class="row">
-        <form method="post" action="/accounts/{{ a.id }}/toggle">
-          <button class="{{ 'stop' if a.enabled else '' }}">{{ 'Stop' if a.enabled else 'Start' }}</button></form>
-        <form method="post" action="/accounts/{{ a.id }}/delete"
-              onsubmit="return confirm('Remove account {{ a.ctid_trader_account_id }}?')">
-          <button class="ghost">✕</button></form>
+      <td><small class="mono">{{ link.last_cycle_at.strftime('%H:%M:%S') if link.last_cycle_at else '—' }}</small></td>
+      <td class="row" style="gap:6px">
+        <form method="post" action="/account-strategies/{{ link.id }}/toggle">
+          <button class="{{ 'stop' if link.enabled else '' }}">{{ 'Stop' if link.enabled else 'Start' }}</button>
+        </form>
+        <form method="post" action="/account-strategies/{{ link.id }}/unlink"
+              onsubmit="return confirm('Unlink {{ link.strategy.name }}?')">
+          <button class="ghost">Unlink</button>
+        </form>
       </td>
     </tr>
-    <tr><td colspan="8" style="padding-top:0;border:0">
-      <form method="post" action="/accounts/{{ a.id }}/save" class="row" style="gap:8px">
+    <tr><td colspan="7" style="padding-top:0;border:0">
+      <form method="post" action="/account-strategies/{{ link.id }}/save" class="row" style="gap:8px">
         <small class="mut">edit:</small>
-        <select name="preset">{% for p in ['BASELINE_S007','FILTERED_S007','WORKING_S007','WORKING_S007_V2'] %}
-          <option {{ 'selected' if p==a.preset else '' }}>{{ p }}</option>{% endfor %}</select>
-        <input name="risk" value="{{ a.risk_pct }}" size="4" title="risk %"> %
-        <input name="lot" value="{{ a.fixed_lot }}" size="4" title="lot">
+        <input name="preset" value="{{ link.preset or '' }}" placeholder="preset" style="width:160px">
+        <input name="symbol" value="{{ link.symbol or '' }}" placeholder="symbol (auto if blank)" style="width:160px">
+        <input name="risk_pct" value="{{ link.risk_pct }}" size="4" title="risk %"> % risk
+        <input name="fixed_lot" value="{{ link.fixed_lot }}" size="5" title="fixed lot"> lot
+        <label style="display:inline;margin:0"><input type="checkbox" name="use_fixed_lot" value="true"
+          {{ 'checked' if link.use_fixed_lot else '' }}> use fixed lot</label>
         <button class="ghost">Save</button>
-      </form></td></tr>
+      </form>
+    </td></tr>
     {% endfor %}
   </table>
   {% endif %}
 </div>
-<p class="mut">Trading runs in a separate <code>webapp.runner</code> process (cron every minute).
-   Start/Stop just enables the account; auto-refreshes every 30s.</p>
+{% endfor %}
+<p class="mut">Trading runs in separate <code>webapp.runner --strategy &lt;NAME&gt;</code> processes
+   (one scheduler tick per strategy, one subprocess per account). Start/Stop here only flips the DB
+   switch the next tick reads -- this page never talks to a broker. Auto-refreshes every 30s.</p>
 {% endblock %}

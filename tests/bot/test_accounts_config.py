@@ -34,6 +34,26 @@ BYBIT:
     active: true
 """
 
+# Two active BYBIT rows sharing one `username` -- the real shape that broke
+# S009 on 2026-08-06 (a second sub-account added for the strategy's own $50
+# account, alongside an existing one). `username` alone can no longer tell
+# them apart; `name` must.
+MULTI_BYBIT_FIXTURE_YAML = """\
+BYBIT:
+  - username: alice@example.com
+    name: Bybit-primary
+    API_KEY: bkey-primary
+    API_SECRET: bsecret-primary
+    TESTNET: false
+    active: true
+  - username: alice@example.com
+    name: Bybit-strategy009
+    API_KEY: bkey-009
+    API_SECRET: bsecret-009
+    TESTNET: false
+    active: true
+"""
+
 
 @pytest.fixture
 def fixture_config(tmp_path, monkeypatch):
@@ -41,6 +61,16 @@ def fixture_config(tmp_path, monkeypatch):
     path.write_text(FIXTURE_YAML)
     monkeypatch.setenv(AC.ACCOUNTS_CONFIG_PATH_ENV, str(path))
     AC._cache, AC._cache_path = None, None      # bust the module-level cache
+    yield path
+    AC._cache, AC._cache_path = None, None
+
+
+@pytest.fixture
+def multi_bybit_config(tmp_path, monkeypatch):
+    path = tmp_path / "accounts.yml"
+    path.write_text(MULTI_BYBIT_FIXTURE_YAML)
+    monkeypatch.setenv(AC.ACCOUNTS_CONFIG_PATH_ENV, str(path))
+    AC._cache, AC._cache_path = None, None
     yield path
     AC._cache, AC._cache_path = None, None
 
@@ -77,3 +107,30 @@ def test_missing_file_returns_empty(tmp_path, monkeypatch):
     assert AC.ctrader_creds("anyone") == {}
     assert AC.bybit_creds("anyone") == {}
     AC._cache, AC._cache_path = None, None
+
+
+def test_bybit_creds_two_rows_same_username_ambiguous_without_name(multi_bybit_config):
+    # Two active rows share "alice@example.com" -- username alone must NOT
+    # silently pick the first one (that was the 2026-08-06 bug). No selector
+    # at all is ambiguous too.
+    assert AC.bybit_creds("alice@example.com") == {}
+    assert AC.bybit_creds() == {}
+
+
+def test_bybit_creds_two_rows_resolved_by_name(multi_bybit_config):
+    primary = AC.bybit_creds(name="Bybit-primary")
+    strategy009 = AC.bybit_creds(name="Bybit-strategy009")
+    assert primary == dict(api_key="bkey-primary", api_secret="bsecret-primary", testnet=False)
+    assert strategy009 == dict(api_key="bkey-009", api_secret="bsecret-009", testnet=False)
+    assert primary != strategy009
+
+
+def test_bybit_creds_name_wins_even_if_username_also_passed(multi_bybit_config):
+    # name is authoritative -- passing a (correct, but non-disambiguating)
+    # username alongside it must not change the result.
+    creds = AC.bybit_creds(username="alice@example.com", name="Bybit-strategy009")
+    assert creds == dict(api_key="bkey-009", api_secret="bsecret-009", testnet=False)
+
+
+def test_bybit_creds_unknown_name_returns_empty(multi_bybit_config):
+    assert AC.bybit_creds(name="Bybit-does-not-exist") == {}

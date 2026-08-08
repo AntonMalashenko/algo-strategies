@@ -1,0 +1,102 @@
+{% extends "base.html" %}{% block title %}Journal{% endblock %}
+{% macro qs(over={}) -%}
+{%- set base = {'tab': tab, 'account_id': f.account_id, 'strategy_id': f.strategy_id,
+                'level': f.level, 'kind': f.kind, 'status': f.status, 'page': page} -%}
+{%- set _ = base.update(over) -%}
+{%- for k, v in base.items() if v -%}{{ '&' if not loop.first }}{{ k }}={{ v }}{%- endfor -%}
+{%- endmacro %}
+{% block body %}
+<h2 style="margin:0 0 12px">Journal</h2>
+
+<div class="tabs">
+  <a href="/journal?tab=events" class="{{ 'active' if tab == 'events' }}">Events</a>
+  <a href="/journal?tab=positions" class="{{ 'active' if tab == 'positions' }}">Position history</a>
+</div>
+
+<form method="get" action="/journal" class="filters">
+  <input type="hidden" name="tab" value="{{ tab }}">
+  <div><label>Account</label>
+    <select name="account_id">
+      <option value="0">all</option>
+      {% for a in accounts %}<option value="{{ a.id }}" {{ 'selected' if f.account_id == a.id }}>
+        {{ a.label or a.external_account_id or ('#' ~ a.id) }} ({{ a.broker }})</option>{% endfor %}
+    </select></div>
+  <div><label>Strategy</label>
+    <select name="strategy_id">
+      <option value="0">all</option>
+      {% for s in strategies %}<option value="{{ s.id }}" {{ 'selected' if f.strategy_id == s.id }}>{{ s.name }}</option>{% endfor %}
+    </select></div>
+  {% if tab == 'events' %}
+  <div><label>Level</label>
+    <select name="level"><option value="">all</option>
+      {% for l in levels %}<option value="{{ l }}" {{ 'selected' if f.level == l }}>{{ l }}</option>{% endfor %}
+    </select></div>
+  <div><label>Kind</label>
+    <select name="kind"><option value="">all</option>
+      {% for k in kinds %}<option value="{{ k }}" {{ 'selected' if f.kind == k }}>{{ k }}</option>{% endfor %}
+    </select></div>
+  {% else %}
+  <div><label>Status</label>
+    <select name="status"><option value="">all</option>
+      {% for st in ['open', 'closed'] %}<option value="{{ st }}" {{ 'selected' if f.status == st }}>{{ st }}</option>{% endfor %}
+    </select></div>
+  {% endif %}
+  <div><button>Filter</button></div>
+  <div><a class="btn ghost" href="/journal?tab={{ tab }}">Reset</a></div>
+</form>
+
+<div class="card">
+  {% if not rows %}
+    <p class="mut">Nothing here yet{% if f.account_id or f.strategy_id or f.level or f.kind or f.status %}
+      for these filters{% else %} -- the runner writes rows as it cycles{% endif %}.</p>
+  {% elif tab == 'events' %}
+  <table>
+    <tr><th>Time (UTC)</th><th>Level</th><th>Kind</th><th>Account</th><th>Strategy</th><th>Message</th></tr>
+    {% for r in rows %}
+    <tr>
+      <td><small class="mono">{{ r.ts.strftime('%Y-%m-%d %H:%M:%S') if r.ts else '—' }}</small></td>
+      <td class="lvl-{{ r.level }}"><small class="mono">{{ r.level }}</small></td>
+      <td><small class="mono">{{ r.kind }}</small></td>
+      <td>{{ (r.account.label or r.account.external_account_id or ('#' ~ r.account.id)) if r.account else '—' }}</td>
+      <td>{{ r.strategy.name if r.strategy else '—' }}</td>
+      <td>{{ r.message or '—' }}
+        {% if r.payload %}<br><small class="mono mut">{{ r.payload | tojson }}</small>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <table>
+    <tr><th>Opened (UTC)</th><th>Closed</th><th>Account</th><th>Strategy</th><th>Label</th>
+        <th>Side</th><th>Lots</th><th>Entry → Exit</th><th>SL / TP</th><th>PnL</th>
+        <th>Status</th><th>Reason</th></tr>
+    {% for p in rows %}
+    <tr>
+      <td><small class="mono">{{ p.opened_at.strftime('%Y-%m-%d %H:%M') if p.opened_at else '—' }}</small></td>
+      <td><small class="mono">{{ p.closed_at.strftime('%Y-%m-%d %H:%M') if p.closed_at else '—' }}</small></td>
+      <td>{{ (p.account.label or p.account.external_account_id or ('#' ~ p.account.id)) if p.account else '—' }}</td>
+      <td>{{ p.strategy.name if p.strategy else '—' }}</td>
+      <td><small class="mono">{{ p.label }}</small>{% if p.is_add %} <span class="badge">add</span>{% endif %}{% if p.origin == 'adopted' %} <span class="badge adopted" title="opened outside this bot, adopted by the position sync">adopted</span>{% endif %}</td>
+      <td>{{ p.side }}</td>
+      <td><small class="mono mut">{% if p.volume_lots is none %}—{% else %}{{ '%.2f'|format(p.volume_lots) }}{% endif %}</small></td>
+      <td><small class="mono">{{ '%.1f'|format(p.entry) }}{% if p.exit_price is not none %} → {{ '%.1f'|format(p.exit_price) }}{% endif %}</small></td>
+      <td><small class="mono mut">{{ '%.1f'|format(p.sl) }} / {{ '%.1f'|format(p.tp) }}</small></td>
+      {# NULL pnl renders as '—', never 0.00 -- see base.html's .money.na note #}
+      <td><small class="mono {% if p.pnl is none %}money na{% elif p.pnl >= 0 %}money up{% else %}money down{% endif %}">{% if p.pnl is none %}—{% else %}{{ '%+.2f'|format(p.pnl) }}{% endif %}</small></td>
+      <td><span class="pill {{ 'on' if p.status == 'open' else 'off' }}">{{ p.status }}</span></td>
+      <td><small class="mono">{{ p.reason or '—' }}</small></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+
+{% if pages > 1 %}
+<div class="row" style="gap:10px;align-items:center">
+  {% if page > 1 %}<a class="btn ghost" href="/journal?{{ qs({'page': page - 1}) }}">← Prev</a>{% endif %}
+  <span class="mut">page {{ page }} of {{ pages }} &middot; {{ total }} rows</span>
+  {% if page < pages %}<a class="btn ghost" href="/journal?{{ qs({'page': page + 1}) }}">Next →</a>{% endif %}
+</div>
+{% else %}
+<p class="mut">{{ total }} row{{ '' if total == 1 else 's' }}.</p>
+{% endif %}
+{% endblock %}

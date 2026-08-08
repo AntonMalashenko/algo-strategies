@@ -1,0 +1,22 @@
+# Never bake these into the image -- .venv is a macOS-built venv (would not run in
+# a Linux container even if copied), and data/reports/.env are bind-mounted at
+# runtime instead (see docker-compose.yml) so the container always sees the same
+# live files the host does.
+.venv/
+venv/
+env/
+.git/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+data/
+reports/
+.env
+*.key
+secrets.*
+configs/accounts.yml
+_to_delete/
+_deploy_incoming.tgz

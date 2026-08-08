@@ -182,6 +182,22 @@ class StrategyLogger:
         """
         return self._label_has_action(label, "open")
 
+    def label_was_ghosted(self, label: str) -> bool:
+        """True if this label's position log already recorded a 'ghost' action.
+
+        A 'ghost' is a signal the engine detected AND fully resolved (stop/TP/
+        daycap) within the same M1 bars a reconcile cycle replayed to reach
+        "now" -- see plan_now()'s `resolved` list in bot/s007_signals.py. Only
+        positions still 'eod' (open as of "now") ever become real broker
+        orders, so a ghost trade never gets placed live and would otherwise
+        never appear in any log at all. The engine keeps returning it in
+        `resolved` for the rest of the day (it's a fact about already-elapsed
+        bars, not a per-cycle event), so this guard is what keeps decide()
+        from re-logging the same ghost every single cycle for the rest of the
+        day (found live 2026-08-05, see decisions-log.md).
+        """
+        return self._label_has_action(label, "ghost")
+
     def order(self, label: str, op: str, cycle: str | None = None,
               request: dict | None = None, result=None, error=None) -> None:
         """Log a broker order attempt with its request and result/error, per-position."""

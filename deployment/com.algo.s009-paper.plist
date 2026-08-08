@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- S009 funding-carry live scheduler tick (scripts/s009_tick.py). launchd
+         invokes it once a wall-clock minute, around the clock (crypto trades
+         24/7; there is no session window to gate on the way S007 has one).
+         It is NOT a long-running process: each invocation reads S009's own
+         paper-state file, does at most one daily rebalance cycle, and exits.
+         See scripts/s009_tick_install.sh for install/uninstall, and
+         decisions-log.md 2026-07-23 for why this design was chosen over a
+         long-lived loop (a long-lived bash sleep silently failed to wake for
+         about 17 hours under a plain background process; delegating "when to
+         run next" to launchd removes that whole failure class instead of
+         just shortening the sleep; see also scripts/s009_tick.py's
+         module docstring for the S009-specific version of this reasoning). -->
+    <key>Label</key>
+    <string>com.algo.s009-paper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Anton_Malashenko/Trading/algo/.venv/bin/python3</string>
+        <string>/Users/Anton_Malashenko/Trading/algo/scripts/s009_tick.py</string>
+        <string>--broker</string>
+        <string>execute</string>
+        <string>--allow-mainnet</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/Anton_Malashenko/Trading/algo</string>
+
+    <!-- StartCalendarInterval with an empty dict means "every minute of every
+         hour of every day", anchored to the real wall clock, NOT
+         StartInterval: StartInterval schedules N seconds after the
+         previous actual start, so any per-cycle overhead compounds into
+         drift with no daily reset (see decisions-log.md 2026-07-23, follow-up
+         on interval drift). Because it exits every time, do NOT add
+         KeepAlive here: that key is for a job meant to keep running, and
+         would fight this schedule (launchd would treat each normal exit as a
+         crash to restart immediately). Running every minute is cheap: once
+         today's rebalance is already booked, a tick is a near-instant no-op
+         (one small local JSON read, no network call). -->
+    <key>StartCalendarInterval</key>
+    <dict/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Anton_Malashenko/Trading/algo/reports/logs/S009/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Anton_Malashenko/Trading/algo/reports/logs/S009/launchd.err.log</string>
+</dict>
+</plist>

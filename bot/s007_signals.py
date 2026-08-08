@@ -61,7 +61,7 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
     fr = df[(df.date_only == today) & (df.time_only >= C.FR_START) & (df.time_only <= C.FR_END)]
     if len(fr) < cfg.min_fr_bars:
         return dict(in_window=in_window, day_done=False, flat=flat, positions=[],
-                    direction=None, context=None)
+                    resolved=[], direction=None, context=None)
     rh, rl = fr["high"].max(), fr["low"].min()
     mid = (rh + rl) / 2
     height = rh - rl
@@ -77,36 +77,55 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
         # shape but for reasons that CAN still resolve later today (bars still
         # arriving, or no A/B scenario yet) -- those must NOT set filtered.
         return dict(in_window=in_window, day_done=False, flat=flat, positions=[],
-                    direction=None, context=None, filtered=True)
+                    resolved=[], direction=None, context=None, filtered=True)
 
     ld = df[(df.date_only == today) & (df.time_only >= C.TRADE_START) & (df.time_only <= now_hm)]
     if len(ld) < 2:
         return dict(in_window=in_window, day_done=False, flat=flat, positions=[],
-                    direction=None, context=None)
+                    resolved=[], direction=None, context=None)
     bars = ld.reset_index(drop=True)
 
     lv = daily_levels(df) if cfg.tp_mode == "liquidity" else {}
     r = simulate_day(bars, rh, rl, mid, height, lv.get(today, {}), cfg)
     if r.get("scenario") not in ("A", "B"):
         return dict(in_window=in_window, day_done=False, flat=flat, positions=[],
-                    direction=None, context=None)
+                    resolved=[], direction=None, context=None)
 
     reached = bool(r["reached_tp"])
     tp = r["tp"]
     context = dict(scenario=r["scenario"], direction=r["direction"],
                    rh=float(rh), rl=float(rl), mid=float(mid), height=float(height),
-                   tp=float(tp), n_pos=int(r["n_pos"]))
+                   tp=float(tp), n_pos=int(r["n_pos"]), reached_tp=reached,
+                   n_recovery=int(r["n_recovery"]))
     wanted = []
-    # positions still alive now = those left 'open' at the last bar (engine marks
-    # them 'eod' at loop end); 'stop'/'tp'/'daycap' are already closed.
+    # 'resolved' = positions the engine entered AND already saw stop/tp/daycap
+    # within the SAME bars this call replayed to reach "now" -- the live bot
+    # never had a chance to place a broker order for these (only 'eod' status
+    # positions, still open as of "now", become wanted/live orders below), so
+    # they would otherwise vanish from view entirely. Surfaced separately so a
+    # caller can log them (see bot/s007_paper.py::decide ghost-trade logging)
+    # instead of silently losing "the signal fired but resolved before we saw
+    # it" history -- came up live 2026-08-05 investigating a B setup that
+    # never produced an order.
+    resolved = []
     for p in r["positions"]:
-        if p["status"] != "eod":
-            continue
         side = "buy" if p["up"] else "sell"
-        wanted.append(dict(
-            label=f"{C.MAGIC}:{today.isoformat()}:{p['idx']}",
-            side=side, entry=float(p["entry"]), sl=float(p["stop"]),
-            tp=float(tp), is_add=bool(p["is_add"]),
-        ))
+        label = f"{C.MAGIC}:{today.isoformat()}:{p['idx']}"
+        # Each position carries its OWN tp (engine.py::_simulate_leg stores the
+        # tp it was actually simulated against) -- a b-reversal leg runs with a
+        # different target (tp_A, the opposite boundary) than the primary B leg
+        # (tp, the day-level value above). Using the day-level `tp` here for
+        # every position sent a live reversal BUY out with the primary SELL
+        # leg's (lower) target attached -- cTrader rejected it outright
+        # (TRADING_BAD_STOPS: TP below entry on a BUY), found live 2026-08-06.
+        p_tp = float(p.get("tp", tp))
+        if p["status"] == "eod":
+            wanted.append(dict(label=label, side=side, entry=float(p["entry"]),
+                               sl=float(p["stop"]), tp=p_tp, is_add=bool(p["is_add"])))
+        else:
+            resolved.append(dict(label=label, side=side, entry=float(p["entry"]),
+                                 sl=float(p["stop"]), exit=float(p["exit"]),
+                                 status=p["status"], is_add=bool(p["is_add"]),
+                                 is_recovery=bool(p.get("is_recovery", False)), r=float(p["R"])))
     return dict(in_window=in_window, day_done=reached, flat=flat,
-                positions=wanted, direction=r["direction"], context=context)
+                positions=wanted, resolved=resolved, direction=r["direction"], context=context)

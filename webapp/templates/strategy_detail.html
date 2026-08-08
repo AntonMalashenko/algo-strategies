@@ -1,0 +1,143 @@
+{% extends "base.html" %}{% block title %}{{ link.strategy.name }} on {{ link.account.label }}{% endblock %}
+{% block body %}
+<div class="row" style="margin-bottom:14px;align-items:center">
+  <h2 style="margin:0">{{ link.strategy.name }}
+    <span class="mut">on</span>
+    {{ link.account.label or link.account.external_account_id or ('account #' ~ link.account.id) }}</h2>
+  <span class="badge">{{ link.account.broker }}</span>
+  <span class="badge {{ 'live' if link.account.env in ('live','mainnet') else '' }}">{{ link.account.env }}</span>
+  {% if link.enabled %}<span class="pill on">running</span>{% else %}<span class="pill off">stopped</span>{% endif %}
+  <span class="sp" style="flex:1"></span>
+  <a class="btn ghost" href="/journal?tab=positions&account_id={{ link.account.id }}&strategy_id={{ link.strategy_id }}">Full history</a>
+  <a class="btn ghost" href="/">Back</a>
+</div>
+
+<div class="card">
+  <div class="row" style="gap:16px;flex-wrap:wrap">
+    <div><small class="k mut">Preset</small><br><span class="mono">{{ link.preset or '—' }}</span></div>
+    <div><small class="k mut">Symbol</small><br><span class="mono">{{ link.symbol or 'auto' }}</span></div>
+    <div><small class="k mut">Sizing</small><br><span class="mono">{% if link.use_fixed_lot %}{{ link.fixed_lot }} lot{% else %}{{ link.risk_pct }}% risk{% endif %}</span></div>
+    <div><small class="k mut">Status</small><br><span class="mono">{{ link.status }}</span></div>
+    <div><small class="k mut">Last cycle</small><br><span class="mono">{{ link.last_cycle_at.strftime('%Y-%m-%d %H:%M:%S') if link.last_cycle_at else '—' }}</span></div>
+  </div>
+  {% if link.last_error %}<p><span class="pill err">{{ link.last_error }}</span></p>{% endif %}
+</div>
+
+<div class="stat-grid" style="margin-bottom:14px">
+  <div class="stat"><div class="n">{{ s.total }}</div><div class="k">Positions total</div></div>
+  <div class="stat"><div class="n">{{ s.open }}</div><div class="k">Open now</div></div>
+  <div class="stat"><div class="n">{{ s.closed }}</div><div class="k">Closed</div></div>
+  <div class="stat"><div class="n">{{ s.buys }} / {{ s.sells }}</div><div class="k">Buy / Sell</div></div>
+  <div class="stat"><div class="n">{{ '%.0f'|format(s.adds_pct) }}%</div><div class="k">Adds ({{ s.adds }})</div></div>
+  <div class="stat"><div class="n">{% if s.avg_hold is not none %}{{ '%.0f'|format(s.avg_hold) }}m{% else %}—{% endif %}</div><div class="k">Avg hold</div></div>
+  <div class="stat"><div class="n">{% if s.median_hold is not none %}{{ '%.0f'|format(s.median_hold) }}m{% else %}—{% endif %}</div><div class="k">Median hold</div></div>
+  <div class="stat"><div class="n {{ 'lvl-error' if s.errors_24h }}">{{ s.errors_24h }}</div><div class="k">Errors 24h</div></div>
+</div>
+
+{# Money block. Every figure below is computed over CLOSED positions that have
+   a non-NULL pnl, i.e. ones webapp/sync_positions.py matched to a broker
+   closing deal. Unpriced rows are counted separately rather than folded in as
+   zeros -- see _link_stats' docstring. #}
+<div class="stat-grid" style="margin-bottom:6px">
+  <div class="stat">
+    <div class="n {% if s.pnl_total is none %}money na{% elif s.pnl_total >= 0 %}money up{% else %}money down{% endif %}">
+      {% if s.pnl_total is none %}—{% else %}{{ '%+.2f'|format(s.pnl_total) }}{% endif %}</div>
+    <div class="k">Realised PnL</div></div>
+  <div class="stat"><div class="n">{% if s.win_rate is none %}—{% else %}{{ '%.0f'|format(s.win_rate) }}%{% endif %}</div>
+    <div class="k">Win rate ({{ s.wins }}/{{ s.losses }})</div></div>
+  <div class="stat"><div class="n">{% if s.profit_factor is none %}—{% else %}{{ '%.2f'|format(s.profit_factor) }}{% endif %}</div>
+    <div class="k">Profit factor</div></div>
+  <div class="stat"><div class="n money up">{% if s.avg_win is none %}—{% else %}{{ '%+.2f'|format(s.avg_win) }}{% endif %}</div>
+    <div class="k">Avg win</div></div>
+  <div class="stat"><div class="n money down">{% if s.avg_loss is none %}—{% else %}{{ '%+.2f'|format(s.avg_loss) }}{% endif %}</div>
+    <div class="k">Avg loss</div></div>
+  <div class="stat"><div class="n money up">{% if s.best is none %}—{% else %}{{ '%+.2f'|format(s.best) }}{% endif %}</div>
+    <div class="k">Best</div></div>
+  <div class="stat"><div class="n money down">{% if s.worst is none %}—{% else %}{{ '%+.2f'|format(s.worst) }}{% endif %}</div>
+    <div class="k">Worst</div></div>
+  <div class="stat"><div class="n money down">{% if s.max_dd is none %}—{% else %}{{ '%.2f'|format(s.max_dd) }}{% endif %}</div>
+    <div class="k">Max drawdown</div></div>
+</div>
+<p class="mut" style="margin-top:0">
+  Money figures cover the {{ s.priced_n }} closed position(s) matched to a broker deal.
+  {% if s.unpriced_n %}<strong>{{ s.unpriced_n }}</strong> closed position(s) have no PnL yet —
+  they closed before the position sync existed, or outside its deal lookback window; they are
+  left out rather than counted as break-even.{% endif %}
+  {% if s.adopted_n %} {{ s.adopted_n }} position(s) were opened outside this bot and adopted by
+  the sync; their money counts here, their hold times do not.{% endif %}
+</p>
+
+<div class="row" style="gap:14px;align-items:flex-start;flex-wrap:wrap">
+  <div class="card" style="flex:1;min-width:300px">
+    <h2>Why positions closed</h2>
+    {% if not s.reasons %}<p class="mut">Nothing closed yet.</p>{% else %}
+    <table>
+      {% for reason, n in s.reasons %}
+      <tr>
+        <td style="width:110px"><small class="mono">{{ reason }}</small></td>
+        <td style="width:50px">{{ n }}</td>
+        <td><div class="bar"><i style="width:{{ (100.0 * n / s.closed_n) | round(1) }}%"></i></div></td>
+        <td style="width:50px" class="mut">{{ (100.0 * n / s.closed_n) | round(0) | int }}%</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+  </div>
+
+  <div class="card" style="flex:1;min-width:300px">
+    <h2>Opened per day (30d)</h2>
+    {% if not s.day_max %}<p class="mut">No positions in the last 30 days.</p>{% else %}
+    <div class="row" style="gap:2px;align-items:flex-end;height:90px">
+      {% for day, n in s.per_day %}
+      <div title="{{ day }}: {{ n }}" style="flex:1;background:{{ 'var(--blue)' if n else '#0b1220' }};
+           height:{{ (6 + 84 * n / s.day_max) | round(0) | int if n else 4 }}px;border-radius:2px"></div>
+      {% endfor %}
+    </div>
+    <p class="mut"><small class="mono">{{ s.per_day[0][0] }} → {{ s.per_day[-1][0] }}, max {{ s.day_max }}/day</small></p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Recent positions</h2>
+  {% if not s.recent %}<p class="mut">None yet.</p>{% else %}
+  <table>
+    <tr><th>Opened</th><th>Closed</th><th>Label</th><th>Side</th><th>Lots</th><th>Entry → Exit</th>
+        <th>SL / TP</th><th>PnL</th><th>Status</th><th>Reason</th></tr>
+    {% for p in s.recent %}
+    <tr>
+      <td><small class="mono">{{ p.opened_at.strftime('%m-%d %H:%M') if p.opened_at else '—' }}</small></td>
+      <td><small class="mono">{{ p.closed_at.strftime('%m-%d %H:%M') if p.closed_at else '—' }}</small></td>
+      <td><small class="mono">{{ p.label }}</small>{% if p.is_add %} <span class="badge">add</span>{% endif %}{% if p.origin == 'adopted' %} <span class="badge adopted" title="opened outside this bot, adopted by the position sync">adopted</span>{% endif %}</td>
+      <td>{{ p.side }}</td>
+      <td><small class="mono mut">{% if p.volume_lots is none %}—{% else %}{{ '%.2f'|format(p.volume_lots) }}{% endif %}</small></td>
+      <td><small class="mono">{{ '%.1f'|format(p.entry) }}{% if p.exit_price is not none %} → {{ '%.1f'|format(p.exit_price) }}{% endif %}</small></td>
+      <td><small class="mono mut">{{ '%.1f'|format(p.sl) }} / {{ '%.1f'|format(p.tp) }}</small></td>
+      {# '—' rather than 0.00 when pnl is NULL: unknown, not break-even #}
+      <td><small class="mono {% if p.pnl is none %}money na{% elif p.pnl >= 0 %}money up{% else %}money down{% endif %}">{% if p.pnl is none %}—{% else %}{{ '%+.2f'|format(p.pnl) }}{% endif %}</small></td>
+      <td><span class="pill {{ 'on' if p.status == 'open' else 'off' }}">{{ p.status }}</span></td>
+      <td><small class="mono">{{ p.reason or '—' }}</small></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Recent events</h2>
+  {% if not s.logs %}<p class="mut">No events logged for this pair yet.</p>{% else %}
+  <table>
+    <tr><th>Time (UTC)</th><th>Level</th><th>Kind</th><th>Message</th></tr>
+    {% for r in s.logs %}
+    <tr>
+      <td><small class="mono">{{ r.ts.strftime('%Y-%m-%d %H:%M:%S') if r.ts else '—' }}</small></td>
+      <td class="lvl-{{ r.level }}"><small class="mono">{{ r.level }}</small></td>
+      <td><small class="mono">{{ r.kind }}</small></td>
+      <td>{{ r.message or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p><a class="btn ghost" href="/journal?tab=events&account_id={{ link.account.id }}&strategy_id={{ link.strategy_id }}">All events →</a></p>
+  {% endif %}
+</div>
+{% endblock %}

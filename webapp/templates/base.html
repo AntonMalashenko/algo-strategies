@@ -15,10 +15,10 @@
     header a { color:var(--ink); text-decoration:none; }
     header .sp { flex:1; }
     header .mut { color:var(--mut); }
-    main { max-width:1000px; margin:24px auto; padding:0 16px; }
+    main { max-width:1100px; margin:24px auto; padding:0 16px; }
     .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
             padding:18px 20px; margin-bottom:18px; }
-    h1,h2 { margin:0 0 12px; }
+    h1,h2,h3 { margin:0 0 12px; }
     table { width:100%; border-collapse:collapse; }
     th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
     th { color:var(--mut); font-weight:600; font-size:12px; text-transform:uppercase; }
@@ -26,18 +26,48 @@
                    border-radius:7px; padding:8px 10px; font-size:14px; }
     label { display:block; margin:10px 0 4px; color:var(--mut); }
     button, .btn { background:var(--blue); color:#fff; border:0; border-radius:7px;
-                   padding:8px 14px; font-size:14px; cursor:pointer; text-decoration:none; }
+                   padding:8px 14px; font-size:14px; cursor:pointer; text-decoration:none;
+                   display:inline-block; }
     button.ghost { background:#334155; }
     button.danger { background:var(--err); }
     button.stop { background:#b45309; }
     .pill { padding:2px 9px; border-radius:999px; font-size:12px; }
     .pill.on { background:rgba(5,150,105,.2); color:#34d399; }
     .pill.off { background:#334155; color:var(--mut); }
+    .pill.err { background:rgba(220,38,38,.2); color:#f87171; }
     .flash { padding:10px 14px; border-radius:8px; margin-bottom:14px; }
     .flash.ok { background:rgba(5,150,105,.15); color:#34d399; }
     .flash.err { background:rgba(220,38,38,.15); color:#f87171; }
-    .mut { color:var(--mut); } .row { display:flex; gap:10px; align-items:center; }
+    .mut { color:var(--mut); } .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     small.mono { font-family:ui-monospace,Menlo,monospace; color:var(--mut); }
+    .account-block { border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+    .account-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+    .badge { font-size:11px; text-transform:uppercase; padding:2px 8px; border-radius:6px;
+             background:#0b1220; color:var(--mut); border:1px solid var(--line); }
+    .badge.live, .badge.mainnet { color:#f87171; border-color:#7f1d1d; }
+    .stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; }
+    .stat { background:#0b1220; border:1px solid var(--line); border-radius:9px; padding:10px 12px; }
+    .stat .n { font-size:22px; font-weight:600; }
+    .stat .k { font-size:11px; color:var(--mut); text-transform:uppercase; letter-spacing:.03em; }
+    .bar { height:8px; background:#0b1220; border-radius:999px; overflow:hidden; min-width:60px; }
+    .bar > i { display:block; height:100%; background:var(--blue); }
+    .tabs { display:flex; gap:8px; margin-bottom:14px; }
+    .tabs a { padding:7px 14px; border-radius:8px; text-decoration:none; color:var(--mut);
+              background:#0b1220; border:1px solid var(--line); }
+    .tabs a.active { color:var(--ink); background:var(--card); border-color:var(--blue); }
+    .filters { display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px; }
+    .filters label { margin:0 0 3px; font-size:11px; text-transform:uppercase; }
+    .filters select, .filters input { padding:6px 8px; font-size:13px; }
+    .lvl-error { color:#f87171; } .lvl-warning { color:#fbbf24; }
+    /* money: green/red for a signed result, muted for an UNKNOWN one. A NULL
+       pnl (position not synced from the broker yet, or a broker that cannot
+       report it) must never render as a green/red zero -- it is not a
+       break-even trade, it is a number we do not have. */
+    .money.up { color:#34d399; } .money.down { color:#f87171; }
+    .money.na { color:var(--mut); }
+    .badge.adopted { color:#fbbf24; border-color:#78350f; }
+    table.inner { margin-top:6px; }
+    table.inner th, table.inner td { border-bottom:1px solid #263449; padding:6px 8px; }
   </style>
 </head>
 <body>
@@ -45,7 +75,7 @@
   <header>
     <strong>⚙ Algo bot</strong>
     <a href="/">Dashboard</a>
-    <a href="/creds">Credentials</a>
+    <a href="/journal">Journal</a>
     <a href="/accounts/add">Add account</a>
     {% if user.is_admin %}<a href="/users">Users</a>{% endif %}
     <span class="sp"></span>

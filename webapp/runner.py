@@ -69,6 +69,12 @@ from utils.trade_logger import StrategyLogger
 ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_TIMEOUT_S = 55.0
+# Cap on the end-of-cycle position sync, and the floor below which it is
+# skipped instead of started. Read-only and cheap (reconcile + one deal-list
+# window + one symbol lookup, all in one session), so it does not need much --
+# but it must not be what pushes a worker past the coordinator's kill line.
+SYNC_BUDGET_S = 25.0
+MIN_SYNC_BUDGET_S = 8.0
 
 
 def _log_event(session, kind: LogKind, *, message: str | None = None,
@@ -110,7 +116,7 @@ def _close_position_db(session, acc: Account, strat: Strategy, label: str, reaso
         pos.closed_at = datetime.now(timezone.utc)
 
 
-def run_worker(account_strategy_id: int) -> int:
+def run_worker(account_strategy_id: int, budget_s: float | None = None) -> int:
     """Run one S007 cycle for one (account, strategy) DB row, in THIS
     process, then return an exit code. See the module docstring for why this
     must be its own OS process rather than a thread.
@@ -124,7 +130,13 @@ def run_worker(account_strategy_id: int) -> int:
     caught inside run_cycle_for_account and reported back as result["error"],
     recorded on the account_strategy row, with a clean (0) process exit --
     a broker-side problem for one account is not a runner-crash.
+
+    `budget_s` is the wall-clock this worker has before the coordinator kills
+    it. It is used only to decide how much time is left for the end-of-cycle
+    position sync; None means "not launched by the coordinator" and falls back
+    to SYNC_BUDGET_S.
     """
+    started = time.monotonic()
     session = get_session()
     link = session.get(AccountStrategy, account_strategy_id)
     if link is None:
@@ -192,7 +204,47 @@ def run_worker(account_strategy_id: int) -> int:
               payload=dict(actions=len(result["actions"]), error=result["error"]))
     session.commit()
     session.close()
+
+    # Refresh the DB from the broker now that the cycle is over, so the UI
+    # reflects reality (fills, stops that fired between ticks, manual trades)
+    # instead of only what this runner intended -- see webapp/sync_positions.py.
+    #
+    # Deliberately AFTER session.close() and outside the ok/error decision:
+    #   * as a SUBPROCESS, because this process has already spent its Twisted
+    #     reactor on the cycle and a reactor cannot be run twice
+    #     (ReactorNotRestartable);
+    #   * it can never change this worker's exit code. A broker hiccup while
+    #     re-reading positions does not mean the trading cycle failed, and
+    #     letting it flip the row to status='error' would be a lie about the
+    #     thing that actually matters.
+    _sync_after_cycle(account_strategy_id, started, budget_s)
     return 0 if ok else 1
+
+
+def _sync_after_cycle(account_strategy_id: int, started: float,
+                      budget_s: float | None) -> None:
+    """Spend whatever is left of the tick budget on a position sync.
+
+    Skipped rather than truncated when little time remains: a sync killed
+    halfway is not a partial sync of the DB (apply_snapshot commits once, at
+    the end) but simply a wasted subprocess, and it would leave the
+    coordinator's kill landing on us instead. The next cycle syncs anyway.
+    """
+    from webapp.sync_positions import spawn_sync_worker   # local: avoids a
+    # webapp.runner <-> webapp.sync_positions import cycle (sync_positions
+    # imports _log_event from here).
+
+    budget = SYNC_BUDGET_S if budget_s is None else (budget_s - (time.monotonic() - started))
+    budget = min(budget, SYNC_BUDGET_S)
+    if budget < MIN_SYNC_BUDGET_S:
+        print(f"[runner] account_strategy {account_strategy_id}: skipping position "
+              f"sync, only {budget:.0f}s of the tick budget left")
+        return
+    try:
+        spawn_sync_worker(account_strategy_id, budget)
+    except Exception as e:                       # noqa: BLE001 - see run_worker
+        print(f"[runner] account_strategy {account_strategy_id}: position sync "
+              f"failed: {e!r} (cycle result unaffected)")
 
 
 def run_coordinator(strategy_name: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> int:
@@ -215,8 +267,11 @@ def run_coordinator(strategy_name: str, timeout_s: float = DEFAULT_TIMEOUT_S) ->
 
     print(f"[runner] {strategy_name}: fanning out {len(link_ids)} account(s), "
           f"budget={timeout_s:.0f}s")
+    # --budget tells each worker how long it has before the kill below, so it
+    # can decide whether the end-of-cycle position sync still fits.
     procs = {lid: subprocess.Popen(
-        [sys.executable, "-m", "webapp.runner", "--worker", "--account-strategy-id", str(lid)])
+        [sys.executable, "-m", "webapp.runner", "--worker",
+         "--account-strategy-id", str(lid), "--budget", str(timeout_s)])
         for lid in link_ids}
 
     deadline = time.monotonic() + timeout_s
@@ -262,11 +317,12 @@ def main():
                          f"(coordinator mode, default {DEFAULT_TIMEOUT_S:.0f})")
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--account-strategy-id", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--budget", type=float, default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.worker:
         if a.account_strategy_id is None:
             raise SystemExit("--worker requires --account-strategy-id")
-        sys.exit(run_worker(a.account_strategy_id))
+        sys.exit(run_worker(a.account_strategy_id, budget_s=a.budget))
     sys.exit(run_coordinator(a.strategy, timeout_s=a.timeout))
 
 

@@ -4,17 +4,19 @@ description: >-
   Read and write the repo's per-component change log under
   .claude/change-log/ (one JSONL file per package -- bot.jsonl, webapp.jsonl,
   utils.jsonl, ... -- and one per strategy -- ger40_lonfra.jsonl,
-  fvg_mtf.jsonl, ...). READ the relevant file(s) BEFORE starting non-trivial
-  work on a package or strategy's code (e.g. before touching bot/, read
-  bot.jsonl; before touching strategies/ger40_lonfra/ or bot/s007_*, read
-  BOTH bot.jsonl and ger40_lonfra.jsonl). WRITE an entry to the relevant
-  file(s) after finishing a logical change, right before your closing
-  summary. Also use this whenever the user asks "what changed and when",
-  "log this fix", "when did we last touch X", or wants change history for a
-  package/strategy.
+  fvg_mtf.jsonl, ...). Covers ANY change to the repo, not just source code --
+  docs, config, scripts, this skill itself. READ the relevant file(s) BEFORE
+  starting non-trivial work on a package or strategy (e.g. before touching
+  bot/, read bot.jsonl; before touching strategies/ger40_lonfra/ or
+  bot/s007_*, read BOTH bot.jsonl and ger40_lonfra.jsonl). WRITE an entry to
+  the relevant file(s) after finishing a logical change, right before your
+  closing summary -- including docs-only changes (new/updated files under
+  docs/, README.md, this skill's own files). Also use this whenever the user
+  asks "what changed and when", "log this fix", "when did we last touch X",
+  or wants change history for a package/strategy.
 ---
 
-# code-change-log — per-package/per-strategy change history
+# code-change-log — per-package/per-strategy change history for ANY repo change
 
 `.claude/change-log/` holds one append-only JSONL file per **component**:
 one per package (`bot.jsonl`, `webapp.jsonl`, `utils.jsonl`, `scripts.jsonl`,
@@ -23,9 +25,13 @@ module under `strategies/`: `ger40_lonfra.jsonl`, `donchian.jsonl`,
 `fvg_mtf.jsonl`, `fx_carry.jsonl`, `funding_carry.jsonl`,
 `crypto_mtf.jsonl`, ...), plus `repo.jsonl` for cross-cutting/meta changes
 (README, requirements.txt, CLAUDE.md, AGENTS.md, pyproject.toml, `.claude/`
-itself). A change that spans a package AND a strategy (the common case for
-`bot/s007_*.py`) gets the **same entry appended to both files** — this is
-intentional duplication, not an error, so each file is readable standalone.
+itself, and anything under `docs/` that isn't clearly tied to one
+package/strategy — e.g. `docs/DEV_PLANS.md`). A change that spans a package
+AND a strategy (the common case for `bot/s007_*.py`) gets the **same entry
+appended to both files** — this is intentional duplication, not an error, so
+each file is readable standalone. This log is not limited to source code:
+doc-only changes, config edits, new scripts, and changes to this skill's own
+files all get logged the same way.
 
 This is separate from two things that look similar but aren't:
 - `reports/logs/` — runtime/trading logs the STRATEGIES produce while

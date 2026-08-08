@@ -21,11 +21,12 @@ if HAVE_SDK:
     from ctrader_open_api import Client, TcpProtocol, EndPoints
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOAGetTrendbarsReq, ProtoOANewOrderReq, ProtoOAClosePositionReq,
-        ProtoOAReconcileReq, ProtoOASymbolByIdReq,
+        ProtoOAReconcileReq, ProtoOASymbolByIdReq, ProtoOADealListReq,
         ProtoOAOrderErrorEvent, ProtoOAErrorRes,
     )
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
         ProtoOAOrderType, ProtoOATradeSide, ProtoOATrendbarPeriod,
+        ProtoOADealStatus,
     )
 
 PRICE_SCALE = 100000.0   # Open API trendbar/price integers = human_price * 1e5
@@ -199,10 +200,151 @@ class CTraderS007(CTraderAdapter):
                     # positions (bot/s007_paper.py's daily risk cap).
                     price=p.price,
                     stop_loss=p.stopLoss,
+                    # additive, for sync_snapshot: which instrument this is, so
+                    # broker volume units can be turned back into lots and an
+                    # unknown ("adopted") position can be named. Existing
+                    # callers ignore the extra keys.
+                    symbol_id=td.symbolId,
+                    take_profit=p.takeProfit,
+                    opened_ts=td.openTimestamp,
                 ))
             return out
         d.addCallback(fin)
         return d
+
+    # ---------- read-only account snapshot (webapp/sync_positions.py) --------
+
+    # cTrader rejects a ProtoOADealListReq spanning more than a week, so a
+    # longer lookback has to be split into <=7-day windows and stitched here.
+    _DEAL_WINDOW_DAYS = 7
+
+    def _deal_list_step(self, from_ms: int, to_ms: int, max_rows: int = 1000):
+        """Closing deals in [from_ms, to_ms). Read-only: places nothing.
+
+        Only deals that actually closed something are returned -- a deal
+        carries `closePositionDetail` exactly when it reduced/closed a
+        position, and that sub-message (not the deal itself) is where the
+        realised money lives. Opening deals are dropped: the DB already has
+        the entry from when the runner opened the row.
+        """
+        req = ProtoOADealListReq()
+        req.ctidTraderAccountId = self.account
+        req.fromTimestamp = int(from_ms)
+        req.toTimestamp = int(to_ms)
+        req.maxRows = max_rows
+        d = self.client.send(req)
+        d.addCallback(self._check_response)
+        d.addCallback(self._parse_deals)
+        return d
+
+    @staticmethod
+    def _parse_deals(msg) -> list:
+        ok = (ProtoOADealStatus.FILLED, ProtoOADealStatus.PARTIALLY_FILLED)
+        out = []
+        for dl in msg.deal:
+            if dl.dealStatus not in ok or not dl.HasField("closePositionDetail"):
+                continue
+            cpd = dl.closePositionDetail
+            # Money fields are int64 scaled by 10^moneyDigits (moneyDigits is
+            # per-message, NOT a constant -- a JPY-deposit account reports a
+            # different scale than a USD one), so never hardcode /100 here.
+            scale = 10.0 ** (cpd.moneyDigits or dl.moneyDigits or 2)
+            gross = cpd.grossProfit / scale
+            swap = cpd.swap / scale
+            comm = cpd.commission / scale
+            out.append(dict(
+                deal_id=dl.dealId,
+                position_id=dl.positionId,
+                symbol_id=dl.symbolId,
+                side="buy" if dl.tradeSide == ProtoOATradeSide.BUY else "sell",
+                # plain doubles in the Open API, unlike trendbars -- do NOT
+                # divide these by PRICE_SCALE.
+                exit_price=dl.executionPrice,
+                entry_price=cpd.entryPrice,
+                closed_volume=cpd.closedVolume,
+                gross_profit=gross,
+                swap=swap,
+                commission=comm,
+                # swap and commission arrive already signed, so the net is a
+                # plain sum, not gross - fees.
+                pnl=gross + swap + comm,
+                balance_after=cpd.balance / scale,
+                executed_ms=dl.executionTimestamp,
+            ))
+        return out
+
+    def _lot_sizes_step(self, symbol_ids):
+        """{symbol_id: lotSize} in one request (symbolId is repeated), so a
+        multi-instrument account costs one round trip, not one per symbol."""
+        if not symbol_ids:
+            return defer.succeed({})
+        req = ProtoOASymbolByIdReq()
+        req.ctidTraderAccountId = self.account
+        for sid in symbol_ids:
+            req.symbolId.append(int(sid))
+        d = self.client.send(req)
+        d.addCallback(self._check_response)
+        d.addCallback(lambda m: {s.symbolId: s.lotSize for s in m.symbol})
+        return d
+
+    @staticmethod
+    def _lots_from_volume(volume: int, lot_size) -> float | None:
+        """Inverse of _volume_from_lots. None (not 0.0) when the instrument's
+        lotSize is unknown -- a wrong lot figure in the UI is worse than a
+        blank one."""
+        if not lot_size:
+            return None
+        return volume / (100.0 * lot_size)
+
+    def sync_snapshot(self, days: int = 7) -> dict:
+        """Everything webapp/sync_positions.py needs, in ONE session.
+
+        Read-only by construction: reconcile + deal list + symbol metadata,
+        no order is ever sent from here. It has to be a single session for
+        the same reason run_live_cycle does -- the demo server drops a fresh
+        connection reconnected too soon after the previous one closed.
+
+        Returns {"positions", "deals", "symbols_by_id", "lot_sizes",
+        "fetched_at"}; positions/deals carry `symbol` and `volume_lots`.
+        """
+        def work(done):
+            @defer.inlineCallbacks
+            def flow():
+                yield self._load_symbols()
+                by_id = {ls.symbolId: name for name, ls in self._symbols.items()}
+
+                positions = yield self._reconcile_step()
+
+                now = datetime.now(timezone.utc)
+                deals = []
+                start = now - timedelta(days=max(1, int(days)))
+                while start < now:
+                    end = min(start + timedelta(days=self._DEAL_WINDOW_DAYS), now)
+                    chunk = yield self._deal_list_step(
+                        int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+                    deals.extend(chunk)
+                    start = end
+
+                need = ({p["symbol_id"] for p in positions}
+                        | {d["symbol_id"] for d in deals})
+                lot_sizes = yield self._lot_sizes_step(sorted(need))
+
+                for p in positions:
+                    p["symbol"] = by_id.get(p["symbol_id"], "")
+                    p["volume_lots"] = self._lots_from_volume(
+                        p["volume"], lot_sizes.get(p["symbol_id"]))
+                for dl in deals:
+                    dl["symbol"] = by_id.get(dl["symbol_id"], "")
+                    dl["volume_lots"] = self._lots_from_volume(
+                        dl["closed_volume"], lot_sizes.get(dl["symbol_id"]))
+
+                return dict(positions=positions, deals=deals,
+                            symbols_by_id=by_id, lot_sizes=lot_sizes,
+                            fetched_at=now)
+
+            d = flow()
+            d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
+        return self._run(work)
 
     @staticmethod
     def _check_response(resp):
@@ -287,8 +429,17 @@ class CTraderS007(CTraderAdapter):
             req.orderType = ProtoOAOrderType.MARKET
             req.tradeSide = ProtoOATradeSide.BUY if side == "buy" else ProtoOATradeSide.SELL
             req.volume = self._volume_from_lots(volume_lots, full)
-            req.stopLoss = float(sl_price)
-            req.takeProfit = float(tp_price)
+            # Round to the symbol's own price precision (full.digits, e.g. 2
+            # for DE40) before sending: sl_price/tp_price are derived through
+            # several float ops (range mid, swing stops, etc.) on quotes that
+            # arrive with up to 5 decimals (see PRICE_SCALE), so an unrounded
+            # value routinely comes out as e.g. 26081.200000000004 -- valid
+            # Python float, but cTrader's INVALID_REQUEST rejects anything
+            # with more decimal digits than the symbol allows (found live
+            # 2026-08-06: every cycle that minute rejected with "Order price
+            # ... has more digits than symbol allows", see decisions-log.md).
+            req.stopLoss = round(float(sl_price), full.digits)
+            req.takeProfit = round(float(tp_price), full.digits)
             req.label = label
             req.comment = "S007"
             d = self.client.send(req)

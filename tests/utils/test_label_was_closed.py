@@ -64,3 +64,22 @@ def test_opened_then_closed_label_is_both(tmp_path):
     log.position(label, "close", reason="broker_side_close_detected")
     assert log.label_was_opened(label) is True
     assert log.label_was_closed(label) is True
+
+
+def test_unknown_label_was_not_ghosted(tmp_path):
+    log = StrategyLogger("S007TEST", log_root=str(tmp_path), console=False)
+    assert log.label_was_ghosted("S007:2026-08-05:999") is False
+
+
+def test_ghosted_label_is_ghosted_but_not_opened_or_closed(tmp_path):
+    # A ghost is a signal that entered AND resolved within already-replayed
+    # bars, so no broker order was ever placed for it -- it must show up as
+    # ghosted without also looking like a real open/close (see
+    # bot/s007_paper.py::decide ghost-trade logging, added 2026-08-05).
+    log = StrategyLogger("S007TEST", log_root=str(tmp_path), console=False)
+    label = "S007:2026-08-05:3"
+    log.position(label, "ghost", side="buy", entry=24855.655, sl=24833.2325,
+                exit=24833.2325, status="stop", is_add=False, is_recovery=False, r=-1.0)
+    assert log.label_was_ghosted(label) is True
+    assert log.label_was_opened(label) is False
+    assert log.label_was_closed(label) is False

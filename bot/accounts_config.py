@@ -15,17 +15,31 @@ Shape:
         initial_balance: 10000
     BYBIT:
       - username: <login>
+        name: <optional label, e.g. "Bybit-algo009">
         API_KEY: ...
         API_SECRET: ...
         TESTNET: false
         active: true
         initial_balance: 100
 
-Lookup is by `username` when given (multi-account case — the webapp runner
-passes the owning User.username). With no username and exactly one active
-entry for the broker, that entry is used (single-account scripts/CLI case).
-Missing file / missing entry returns {} — callers decide the fallback
-(env vars, error), they never crash here.
+Lookup, in order: `name` (an exact label match — the only way to pick one of
+several sub-accounts that share the same `username`, e.g. one person running
+more than one Bybit sub-account for different strategies) > `username` (works
+ONLY while exactly one active row has that username — see below) > no
+selector at all (works ONLY while exactly one active row exists for the
+broker, full stop).
+
+**Multiple active rows under the same `username` are a real, expected shape**
+(one person, several broker sub-accounts) — `username` alone cannot disambiguate
+those, by design (it identifies the *owner*, not the *account*). A caller in
+that situation MUST pass `name`; passing only `username` (or nothing) resolves
+to {} (ambiguous) rather than silently picking one — silently picking the
+first row previously caused a real bug (2026-08-06): a second BYBIT entry was
+added for S009's dedicated account, and the S009 bot's `BybitExec()` call
+(no username, no name) started resolving to {} on the yml side and falling
+back to the unrelated `.env` mainnet keys instead of erroring loudly. Missing
+file / missing entry / ambiguous match all return {} — callers decide the
+fallback (env vars, error), this module never crashes or guesses.
 """
 from __future__ import annotations
 
@@ -69,17 +83,29 @@ def _active_entries(broker: str) -> list[dict]:
     return [r for r in rows if r.get("active", True)]
 
 
-def _pick(broker: str, username: str | None) -> dict | None:
+def _pick(broker: str, username: str | None = None, name: str | None = None) -> dict | None:
+    """Resolve one active row, or None if there isn't exactly one unambiguous
+    match. `name` (an entry's own `name:` label) takes priority when given —
+    it is the only selector that can tell apart two active rows that share
+    the same `username`. `username` alone only resolves when it matches
+    exactly one active row; if it matches more than one (several sub-accounts
+    for the same person), that is ambiguous on purpose — see module docstring
+    for why silently picking the first row is exactly the bug this guards
+    against."""
     rows = _active_entries(broker)
+    if name:
+        return next((r for r in rows if r.get("name") == name), None)
     if username:
-        return next((r for r in rows if r.get("username") == username), None)
-    return rows[0] if len(rows) == 1 else None  # ambiguous multi-entry: caller must pass username
+        matches = [r for r in rows if r.get("username") == username]
+        return matches[0] if len(matches) == 1 else None
+    return rows[0] if len(rows) == 1 else None
 
 
-def ctrader_creds(username: str | None = None) -> dict[str, str | int | None]:
-    """CTRADER credentials for `username`, or the sole active entry if omitted
-    and unambiguous. Returns {} if nothing matches."""
-    row = _pick("CTRADER", username)
+def ctrader_creds(username: str | None = None, name: str | None = None) -> dict[str, str | int | None]:
+    """CTRADER credentials for `name` (exact label) or `username` (only if it
+    resolves to exactly one active row), or the sole active entry if both are
+    omitted and unambiguous. Returns {} if nothing matches unambiguously."""
+    row = _pick("CTRADER", username, name)
     if not row:
         return {}
     return dict(
@@ -90,10 +116,11 @@ def ctrader_creds(username: str | None = None) -> dict[str, str | int | None]:
     )
 
 
-def bybit_creds(username: str | None = None) -> dict[str, str | bool | None]:
-    """BYBIT credentials for `username`, or the sole active entry if omitted
-    and unambiguous. Returns {} if nothing matches."""
-    row = _pick("BYBIT", username)
+def bybit_creds(username: str | None = None, name: str | None = None) -> dict[str, str | bool | None]:
+    """BYBIT credentials for `name` (exact label) or `username` (only if it
+    resolves to exactly one active row), or the sole active entry if both are
+    omitted and unambiguous. Returns {} if nothing matches unambiguously."""
+    row = _pick("BYBIT", username, name)
     if not row:
         return {}
     return dict(

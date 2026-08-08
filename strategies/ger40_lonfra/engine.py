@@ -77,7 +77,7 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
     if buffer > 0 and abs(e_price - stop0) < buffer:
         return None, False
     positions = [dict(entry=e_price, stop=stop0, status="open", exit=None,
-                      is_add=False, up=up, idx=start_idx)]
+                      is_add=False, up=up, idx=start_idx, tp=tp)]
     armed = False
     armed_price = np.nan   # the pullback swing extreme that armed the current add
     last_add = start_idx
@@ -148,7 +148,7 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
                         if buffer > 0 and abs(c - st) < buffer:
                             continue
                         positions.append(dict(entry=c, stop=st, status="open",
-                                              exit=None, is_add=True, up=up, idx=t))
+                                              exit=None, is_add=True, up=up, idx=t, tp=tp))
                         armed = False
                         last_add = t
     last_close = closes[-1]

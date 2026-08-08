@@ -9,9 +9,11 @@ research code. Each cycle:
      funding − taker cost) into a ledger,
   4. log a human-readable summary + append reports/paper_s009/ledger.csv.
 
-No orders are placed — this is the shadow stage that validates the live signal
-and funding economics before demo execution. A Bybit execution adapter plugs in
-later at the marked TODO in `run_once`.
+By default (--broker off) no orders are placed — this is the shadow stage that
+validates the live signal and funding economics before demo execution. Demo
+execution (`--broker dry` / `--broker execute`) reconciles the target book to
+real Bybit positions via `bot.bybit_exec.BybitExec` (see `reconcile_to_target`)
+— mainnet orders are refused unless `--allow-mainnet` is passed explicitly.
 
 Commands:
     python bot/s009_paper.py --once                 # one daily cycle (fetches data)
@@ -19,6 +21,13 @@ Commands:
     python bot/s009_paper.py --status               # current book + paper equity
     python bot/s009_paper.py --reconcile            # ledger vs a fresh backtest
     python bot/s009_paper.py --simulate 30          # replay last N days from local data (no network)
+
+Unattended scheduling: `--loop` below runs a long-lived foreground process —
+fine for a manual/attended test, but NOT the recommended way to run this
+unattended (see `run_loop`'s docstring for why). For an actual launchd-managed
+deployment use `scripts/s009_tick.py` + `deployment/com.algo.s009-paper.plist`
+(installed via `scripts/s009_tick_install.sh install`) instead — same daily
+cadence, no long-lived process for macOS to throttle.
 
 Deploy config (frozen champion + vol-target modifier): lb=7, short top-2 /
 long bottom-2, dollar-neutral, daily rebalance, taker 0.055%/side, vol-target 20%/yr.
@@ -47,15 +56,43 @@ STATE_DIR = REPO / "reports" / "paper_s009"
 STATE_FILE = STATE_DIR / "state.json"
 LEDGER_FILE = STATE_DIR / "ledger.csv"
 
-# Frozen deploy config: champion mechanism + vol-target risk control.
+# configs/accounts.yml BYBIT entry dedicated to S009 (added 2026-08-06, $50 seed).
+# MUST be passed explicitly to BybitExec(name=...): as of that date `username`
+# alone no longer resolves unambiguously in accounts.yml (a second BYBIT row,
+# "Bybit-tradebot1", shares the same username) — see bot/accounts_config.py's
+# module docstring for the incident this constant fixes.
+BYBIT_ACCOUNT_NAME = "Bybit-algo009"
+
+# Deployment-only universe trim: exclude the highest-priced coins whose Bybit
+# exchange minimum order size (BTC ~0.001, notional ~$60+; ETH ~0.01, notional
+# ~$15-25) can exceed a whole leg's target allocation on this account's small
+# equity (~$50-100, weight/leg ~0.25-0.35 typical) — see decisions-log.md
+# 2026-08-06 "аудит готовности" for the arithmetic and reconcile_to_target's
+# skip_min_qty log for the live symptom this prevents. This trims ONLY the
+# deploy/live universe, not FundingCarryConfig.universe's frozen research
+# default (DEFAULT_UNIVERSE, all 24 coins) — the validated backtest numbers
+# stay byte-for-byte reproducible; only the paper/live book excludes these two.
+# Revisit (re-include) once account equity comfortably clears BTC's min
+# notional at typical (non-vol-capped) leg weight, roughly equity >= $250-300.
+LOW_CAPITAL_EXCLUDED_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+DEPLOY_UNIVERSE = tuple(s for s in DEFAULT_UNIVERSE if s not in LOW_CAPITAL_EXCLUDED_SYMBOLS)
+
+# Frozen deploy config: champion mechanism + vol-target risk control, on the
+# capital-constrained deploy universe above.
 DEPLOY = FundingCarryConfig(
     signal_lookback_days=7, top_n=2, bottom_n=2, min_universe=4,
     taker_fee_per_side=0.00055, vol_target_annual=0.20,
+    universe=DEPLOY_UNIVERSE,
 )
 
 FUNDING_URL = "https://api.bybit.com/v5/market/funding/history"
 KLINE_URL = "https://api.bybit.com/v5/market/kline"
 REFRESH_LOOKBACK_DAYS = 45          # window pulled each refresh (covers lb7 + vol30 + buffer)
+
+POLL_MINUTES_DEFAULT = 20           # loop wake-up interval
+LOOP_SLEEP_CHUNK_SEC = 5            # sleep granularity so SIGTERM is honoured quickly
+
+_STOP = {"flag": False}             # set by signal handlers to end the loop
 
 
 # --------------------------------------------------------------------------
@@ -187,6 +224,18 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
         cur = float(positions.get(sym, 0.0))
         delta = tgt_qty - cur
         if abs(delta) < inst.min_qty:
+            # A wanted leg (w != 0) that rounds to less than the exchange's min
+            # order size is a real gap on a small account (e.g. BTC's ~$65+
+            # min notional can exceed this leg's whole target allocation at
+            # equity=$50) — surface it instead of silently dropping the leg,
+            # so a thin book isn't mistaken for "target == actual".
+            if w and abs(tgt_qty) < inst.min_qty:
+                min_notional = round(inst.min_qty * price, 2)
+                log.event("skip_min_qty", cycle=cid, symbol=sym, target_weight=w,
+                          target_notional=round(w * equity, 2), min_qty=inst.min_qty,
+                          min_notional=min_notional, price=price)
+                print(f"  SKIP {sym}: target notional ${w * equity:.2f} < exchange min "
+                      f"${min_notional:.2f} (min_qty={inst.min_qty}) — leg not opened")
             continue
         side = "Buy" if delta > 0 else "Sell"
         qty = round(_floor_step(delta, inst.qty_step), 8)
@@ -275,7 +324,7 @@ def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_formi
     plan = []
     if broker != "off" and target:
         from bot.bybit_exec import BybitExec
-        client = BybitExec(allow_mainnet=allow_mainnet)
+        client = BybitExec(name=BYBIT_ACCOUNT_NAME, allow_mainnet=allow_mainnet)
         broker_eq = client.wallet_equity()
         log.event("broker", cycle=cid, env=client.env, equity=round(broker_eq, 2), mode=broker)
         plan = reconcile_to_target(client, target, broker_eq, log, cid, execute=(broker == "execute"))
@@ -297,6 +346,67 @@ def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_formi
     print(f"  SHORT: {shorts}")
     print(f"  gross={sum(abs(v) for v in target.values()):.2f}  net={sum(target.values()):+.3f}  positions={len(target)}")
     print(f"logged → {LEDGER_FILE}")
+
+
+def _install_signal_handlers(log) -> None:
+    import signal
+    def _handler(signum, _frame):
+        _STOP["flag"] = True
+        log.info(f"signal {signum} received — stopping after current cycle")
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(s, _handler)
+        except Exception:
+            pass
+
+
+def _expected_last_closed_day() -> int:
+    """Last fully-closed UTC day: the daily candle for day D closes at 00:00 D+1,
+    so once we are inside day T the last closed day is T-1."""
+    return int(time.time() * 1000) // MS_PER_DAY - 1
+
+
+def run_loop(data_dir: Path, cfg: FundingCarryConfig, broker: str, allow_mainnet: bool,
+             poll_minutes: int = POLL_MINUTES_DEFAULT) -> None:
+    """Long-running daemon. Wakes every `poll_minutes`, and when a new UTC day has
+    closed since the last processed one, runs a cycle (fetch → book → optional
+    rebalance). Tolerant to laptop sleep: on wake it simply notices the missed day
+    and processes it (the ledger books every not-yet-seen day; the broker reconcile
+    is idempotent — drives positions to target, so a late run just rebalances once).
+    Survives per-cycle errors and exits cleanly on SIGINT/SIGTERM (launchd stop).
+
+    NOT recommended for unattended (launchd KeepAlive-style) production use: this
+    is exactly the "one process alive ~24h/day, sleeping in short chunks" shape
+    that S007's original scheduler used and that failed in production — a
+    long-lived bash sleep silently stopped waking for ~17h under macOS
+    App Nap / power-management throttling of an unsupervised background process
+    (decisions-log.md 2026-07-23). S007's fix was to remove the long-lived-process
+    premise entirely (a stateless launchd `StartCalendarInterval` tick instead of
+    a sleeping loop) — see `scripts/s007_tick.py`. `scripts/s009_tick.py` applies
+    the same fix here; use it (+ `deployment/com.algo.s009-paper.plist`) for any
+    unattended deployment. Keep `run_loop`/`--loop` for manual, attended,
+    foreground runs (e.g. testing on a terminal you're watching) where a stalled
+    process is immediately visible."""
+    log = StrategyLogger("S009", log_root=REPO / "reports" / "logs", console=True)
+    _install_signal_handlers(log)
+    log.info(f"S009 loop started: broker={broker} allow_mainnet={allow_mainnet} "
+             f"poll={poll_minutes}m data={data_dir}")
+    while not _STOP["flag"]:
+        try:
+            st = load_state()
+            exp = _expected_last_closed_day()
+            if st.get("last_day") is None or st["last_day"] < exp:
+                log.info(f"loop: closed day {exp} > last_processed {st.get('last_day')} — running cycle")
+                run_once(data_dir, cfg, do_fetch=True, broker=broker, allow_mainnet=allow_mainnet)
+            else:
+                log.debug(f"loop: up-to-date (last_day={st['last_day']}) — idle")
+        except Exception as exc:
+            log.error("loop cycle failed (retrying next poll)", exc=exc)
+        waited = 0
+        while waited < poll_minutes * 60 and not _STOP["flag"]:
+            time.sleep(LOOP_SLEEP_CHUNK_SEC)
+            waited += LOOP_SLEEP_CHUNK_SEC
+    log.info("S009 loop stopped cleanly.")
 
 
 def status() -> None:
@@ -349,6 +459,8 @@ def main() -> None:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--reconcile", action="store_true")
     ap.add_argument("--simulate", type=int, metavar="N", help="replay last N days from local data")
+    ap.add_argument("--loop", action="store_true", help="run as a daemon: process each new closed day")
+    ap.add_argument("--poll-minutes", type=int, default=POLL_MINUTES_DEFAULT, help="loop wake interval")
     ap.add_argument("--broker", choices=["off", "dry", "execute"], default="off",
                     help="off=shadow only; dry=compute+log intended demo orders; execute=place demo orders")
     ap.add_argument("--allow-mainnet", action="store_true", help="DANGER: permit real mainnet orders")
@@ -357,6 +469,9 @@ def main() -> None:
 
     if args.simulate is not None:
         simulate(args.data, DEPLOY, args.simulate)
+    elif args.loop:
+        run_loop(args.data, DEPLOY, broker=args.broker, allow_mainnet=args.allow_mainnet,
+                 poll_minutes=args.poll_minutes)
     elif args.status:
         status()
     elif args.reconcile:

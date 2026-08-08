@@ -16,8 +16,8 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from sqlalchemy import (Boolean, DateTime, Float, ForeignKey, Index, Integer,
-                        String, Text, UniqueConstraint)
+from sqlalchemy import (BigInteger, Boolean, DateTime, Float, ForeignKey, Index,
+                        Integer, String, Text, UniqueConstraint)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from webapp.db import Base
@@ -141,11 +141,33 @@ class Position(Base):
     sl: Mapped[float] = mapped_column(Float)
     tp: Mapped[float] = mapped_column(Float)
     is_add: Mapped[bool] = mapped_column(Boolean, default=False)
-    broker_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # BigInteger: cTrader's positionId is an int64 in the protocol, and a
+    # Postgres INTEGER would eventually overflow (SQLite does not care).
+    broker_position_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="open")     # open/closed
     reason: Mapped[str | None] = mapped_column(String(32), nullable=True)  # target/flat/...
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # --- broker truth, written ONLY by webapp/sync_positions.py -------------
+    # All nullable: a row the runner just opened has none of this until the
+    # first sync, and a broker that cannot report it (Bybit's net-position
+    # view has no per-position deal) leaves it null forever. Null therefore
+    # means "unknown", never "zero" -- UI aggregates must skip nulls rather
+    # than coerce them to 0, or an unsynced position would silently read as
+    # a break-even trade.
+    origin: Mapped[str] = mapped_column(String(16), default="bot")   # bot | adopted
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume_lots: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # money, in the account's deposit currency; cTrader reports the three
+    # components separately and `pnl` is their sum (commission and swap come
+    # through already signed), so a disputed number can be taken apart again.
+    gross_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    swap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    commission: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    broker_deal_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     account: Mapped["Account"] = relationship(back_populates="positions")
     strategy: Mapped["Strategy"] = relationship()

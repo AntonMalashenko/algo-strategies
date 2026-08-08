@@ -1,5 +1,10 @@
 {
   "permissions": {
-    "defaultMode": "auto"
+    "defaultMode": "auto",
+    "allow": [
+      "Bash(source .venv/bin/activate)",
+      "Bash(source /Users/Anton_Malashenko/Trading/algo/.venv/bin/activate)",
+      "Bash(launchctl list*)"
+    ]
   }
 }

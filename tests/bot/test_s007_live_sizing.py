@@ -8,25 +8,31 @@ from __future__ import annotations
 import sys
 import types
 
-import shutil
-
 import pandas as pd
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def _clean_position_log():
-    """bot.s007_paper.LOG is a module-level singleton writing to the real
-    reports/logs/S007/positions/ dir -- without this, a label reused across
-    tests (or a real day's leftover logs) would make label_was_closed() (Fix
-    1) see a stale 'close' from a PREVIOUS test/run and wrongly skip it in a
-    later one. Clear before/after so each test's log state is its own."""
+def _clean_position_log(monkeypatch, tmp_path):
+    """bot.s007_paper.LOG is a module-level singleton; unpatched, it writes to
+    the REAL reports/logs/S007/ directory. This used to be "cleaned" with
+    shutil.rmtree() on that real positions/ dir before/after each test --
+    which is exactly as destructive as it sounds: running this file while the
+    live launchd tick (com.anton.algo.s007bot) happened to be mid-cycle
+    deleted the production per-position history (everything before that day)
+    and made a live cycle throw FileNotFoundError trying to write into the
+    now-missing directory (found live 2026-08-06, see decisions-log.md; no
+    data was actually lost only because every position/order event is ALSO
+    duplicated into reports/logs/S007/events-<date>.jsonl, which this never
+    touched). Point LOG at a throwaway StrategyLogger under tmp_path instead
+    -- same "each test's log state is its own" guarantee (a label reused
+    across tests won't see a stale 'close' from a previous run), with zero
+    risk to anything real."""
     from bot import s007_paper
-    pos_dir = s007_paper.LOG.pos_dir
-    shutil.rmtree(pos_dir, ignore_errors=True)
-    pos_dir.mkdir(parents=True, exist_ok=True)
+    from utils.trade_logger import StrategyLogger
+    monkeypatch.setattr(s007_paper, "LOG", StrategyLogger("S007TEST", log_root=str(tmp_path),
+                                                           console=False))
     yield
-    shutil.rmtree(pos_dir, ignore_errors=True)
 
 
 class _FakeCTraderS007:
@@ -79,7 +85,7 @@ def test_live_sizes_new_positions_by_risk_not_fixed_lot(fake_broker, monkeypatch
         dict(label="S007:2024-05-10:1", side="buy", entry=18000.0, sl=17995.0,
              tp=18100.0, is_add=True),   # 5-pt stop -> still sizes UP above 0.01
     ]
-    monkeypatch.setattr(s007_paper, "plan_now", lambda m1: dict(
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
         in_window=True, day_done=False, flat=False, positions=fake_positions,
         direction="up", context={}))
 
@@ -119,7 +125,7 @@ def test_live_skips_reopening_a_label_the_log_already_closed(fake_broker, monkey
         dict(label=fresh_label, side="buy", entry=18000.0, sl=17995.0,
              tp=18100.0, is_add=True),
     ]
-    monkeypatch.setattr(s007_paper, "plan_now", lambda m1: dict(
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
         in_window=True, day_done=False, flat=False, positions=fake_positions,
         direction="up", context={}))
 
@@ -155,7 +161,7 @@ def test_live_backfills_close_and_skips_reopen_on_broker_side_stop_before_log_ca
     fake_positions = [
         dict(label=label, side="buy", entry=25388.2, sl=25318.2, tp=25543.4, is_add=False),
     ]
-    monkeypatch.setattr(s007_paper, "plan_now", lambda m1: dict(
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
         in_window=True, day_done=False, flat=False, positions=fake_positions,
         direction="up", context={}))
 
@@ -176,7 +182,7 @@ def test_live_uses_fixed_lot_when_flag_set(fake_broker, monkeypatch):
         dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=17950.0,
              tp=18100.0, is_add=False),
     ]
-    monkeypatch.setattr(s007_paper, "plan_now", lambda m1: dict(
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
         in_window=True, day_done=False, flat=False, positions=fake_positions,
         direction="up", context={}))
 

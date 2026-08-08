@@ -11,6 +11,13 @@ orders on **mainnet is refused** unless `allow_mainnet=True` is passed explicitl
 Keys come from configs/accounts.yml (BYBIT section, see bot/accounts_config.py)
 first, falling back to BYBIT_API_KEY/BYBIT_API_SECRET/BYBIT_TESTNET in the repo
 `.env` per field; never log secrets.
+
+Pass `name=` (the yml entry's own `name:` label) whenever more than one BYBIT
+row can exist for the same `username` — e.g. one person running a dedicated
+sub-account per strategy. `username` alone cannot disambiguate those (see
+bot/accounts_config.py's module docstring for the 2026-08-06 incident this
+guards against: omitting `name` here made a strategy silently fall back to
+unrelated `.env` mainnet keys instead of its own configured sub-account).
 """
 from __future__ import annotations
 
@@ -47,8 +54,8 @@ class BybitExec:
     def __init__(self, env: str | None = None, api_key: str | None = None,
                  api_secret: str | None = None, category: str = CATEGORY,
                  allow_mainnet: bool = False, timeout: int = 20,
-                 username: str | None = None):
-        yml = _accounts.bybit_creds(username)
+                 username: str | None = None, name: str | None = None):
+        yml = _accounts.bybit_creds(username, name)
         yml_testnet = yml.get("testnet")   # bool from accounts.yml, or None if unset/no entry
         yml_env = ("testnet" if yml_testnet else "mainnet") if yml_testnet is not None else None
         self.env = (env or os.getenv("BYBIT_ENV") or yml_env

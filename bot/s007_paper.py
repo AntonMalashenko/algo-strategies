@@ -218,6 +218,21 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                      risk_amount=risk_amount, use_fixed_lot=use_fixed_lot,
                      open_risk=open_risk, risk_cap=risk_cap)
 
+        # A "ghost": the engine entered AND resolved (stop/tp/daycap) this
+        # position within bars already elapsed by the time this cycle polled
+        # -- decide() only ever places broker orders for res["positions"]
+        # (status 'eod', still open as of "now"), so a ghost never becomes a
+        # real trade and would otherwise leave no trace anywhere. Logged once
+        # per label (label_was_ghosted guards against re-logging it every
+        # cycle for the rest of the day, since plan_now() keeps returning it).
+        for p in res.get("resolved", []):
+            lab = p["label"]
+            if logger.label_was_opened(lab) or logger.label_was_ghosted(lab):
+                continue
+            logger.position(lab, "ghost", cycle=cid, side=p["side"], entry=p["entry"],
+                            sl=p["sl"], exit=p["exit"], status=p["status"],
+                            is_add=p["is_add"], is_recovery=p["is_recovery"], r=p["r"])
+
         out = []
         if manual_stop or res["day_done"] or res["flat"] or not res["in_window"]:
             reason = ("manual_stop" if manual_stop else

@@ -1,0 +1,33 @@
+{% extends "base.html" %}{% block title %}Link strategy{% endblock %}
+{% block body %}
+<div class="card" style="max-width:560px">
+  <h2>Link a strategy to '{{ account.label or account.external_account_id }}'
+    <span class="badge">{{ account.broker }}</span></h2>
+  {% if not strategies %}
+    <p class="mut">No {{ account.broker }} strategies left to link (either none exist yet, or this
+      account already runs all of them).</p>
+    <a class="btn ghost" href="/">Back</a>
+  {% else %}
+  <form method="post" action="/accounts/{{ account.id }}/link-strategy">
+    <label>Strategy</label>
+    <select name="strategy_id" style="width:100%">
+      {% for s in strategies %}<option value="{{ s.id }}">{{ s.name }}{% if s.description %} -- {{ s.description }}{% endif %}</option>{% endfor %}
+    </select>
+    <label>Preset <span class="mut">(blank = strategy default)</span></label>
+    <input name="preset" style="width:100%">
+    <label>Symbol <span class="mut">(blank = auto-resolved by the runner)</span></label>
+    <input name="symbol" style="width:100%">
+    <div class="row" style="gap:16px">
+      <div><label>Risk % per position</label><input name="risk_pct" value="0.25" style="width:120px"></div>
+      <div><label>Fixed lot</label><input name="fixed_lot" value="0.01" style="width:120px"></div>
+    </div>
+    <label><input type="checkbox" name="use_fixed_lot" value="true" checked> Use fixed lot (uncheck to size by risk %)</label>
+    <label>Initial balance <span class="mut">(optional -- seed for a paper/shadow ledger)</span></label>
+    <input name="initial_balance" style="width:200px">
+    <label><input type="checkbox" name="enabled" value="true"> Start immediately</label>
+    <div style="margin-top:16px"><button>Link strategy</button>
+      <a class="btn ghost" href="/">Cancel</a></div>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

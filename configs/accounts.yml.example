@@ -9,7 +9,17 @@ CTRADER:
     initial_balance: 10000
 
 BYBIT:
+  # If you only ever run ONE Bybit account, `name:` is optional -- lookup by
+  # `username` (or by nothing at all) resolves fine when exactly one active
+  # row exists. As soon as you add a SECOND active row for the same
+  # `username` (e.g. a separate sub-account per strategy), `name:` becomes
+  # REQUIRED on every row and callers must pass it explicitly
+  # (BybitExec(name=...) / bybit_creds(name=...)) -- `username` alone can no
+  # longer tell the rows apart and resolves to {} (see
+  # bot/accounts_config.py's module docstring for why this fails closed
+  # instead of silently picking one).
   - username: username@gmail.com
+    name: "REPLACE_ME"  # e.g. "Bybit-algo009" -- required once you have >1 row
     API_KEY: "REPLACE_ME"
     API_SECRET: "REPLACE_ME"
     TESTNET: false      # true -> env=testnet, false -> env=mainnet (Bybit's separate
