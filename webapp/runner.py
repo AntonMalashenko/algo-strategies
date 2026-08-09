@@ -142,6 +142,16 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
     it. Used only to decide how much time is left for the end-of-cycle
     position sync; None means "not launched by the coordinator" and falls
     back to SYNC_BUDGET_S.
+
+    Short-circuits without opening a broker session at all once today's
+    cycle already reached day_done/filtered/manual_stop -- mirrors
+    scripts/s007_tick.py's loop_settled/loop_resumed guard, which this
+    DB-driven path never had: unlike that legacy tick, it used to open a
+    real cTrader/Twisted session on every single dispatcher tick for the
+    rest of the session window even after the day's target was already
+    reached. The marker is a plain `link.status` string ("settled:<local
+    date>") -- no separate state file/table needed, and a new day's first
+    tick naturally has a stale date and runs normally.
     """
     started = time.monotonic()
     account_strategy_id = link.id
@@ -152,6 +162,17 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
             f"account_strategy {account_strategy_id} is broker={acc.broker} -- "
             f"the S007 worker only drives CTRADER accounts")
     user = acc.user
+
+    # `datetime.now()` naive local, not UTC -- matches the session-day
+    # boundary S007 itself uses (bot/s007_config.py's TRADE_START/EXIT_END
+    # are local Kyiv time, same convention scripts/s007_tick.py's
+    # in_session() and utils/trade_logger.StrategyLogger's `ts` both use).
+    today_local = datetime.now().date().isoformat()
+    if (link.status or "").startswith(f"settled:{today_local}"):
+        print(f"[runner] account_strategy {account_strategy_id}: already settled today "
+              f"({link.status}) -- skipping, no broker session opened")
+        session.close()
+        return 0
 
     creds_row = acc.credentials
     creds = dict(client_id=creds_row.get("client_id"), client_secret=creds_row.get("client_secret"),
@@ -193,7 +214,11 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
         ok = False
     else:
         n_actions = len(result["actions"])
-        link.status = f"live: {n_actions} action(s)" if n_actions else "idle"
+        settled = bool(result.get("day_done") or result.get("filtered") or result.get("manual_stop"))
+        if settled:
+            link.status = f"settled:{today_local}"   # short-circuits every tick for the rest of today
+        else:
+            link.status = f"live: {n_actions} action(s)" if n_actions else "idle"
         link.last_error = None
         print(f"[runner] account_strategy {link.id}: {n_actions} action(s), "
               f"day_done={result.get('day_done')} in_window={result.get('in_window')}")

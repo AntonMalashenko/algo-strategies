@@ -15,8 +15,12 @@ not control except by flipping `AccountStrategy.enabled` in the DB — the runne
 own next cycle picks that up. So the UI going down never touches live trading, and
 a stuck/crashed runner never takes the dashboard down with it.
 
-Status: **UI + runner + position sync all in place** (dashboard, journal, per-link
-detail pages, DB-driven multi-account runner, broker position sync for cTrader).
+Status: **UI + runner + position sync + scheduling all in place** (dashboard,
+journal, per-link detail pages, DB-driven multi-account runner registered for both
+S007 and S009 — S009 shadow-only — broker position sync for cTrader, a generic
+Docker/Ofelia scheduler). Not yet done: S009 real/demo order execution through the
+DB-driven path (explicit future decision), cutover from the legacy single-account
+launchd S007 job to the Docker/Ofelia path.
 
 ## Pieces
 - `db.py` — SQLAlchemy engine/session. SQLite `data/app.db` by default (`APP_DB_URL`
@@ -37,7 +41,7 @@ detail pages, DB-driven multi-account runner, broker position sync for cTrader).
   `SHA256(APP_SECRET_KEY)`. Access only via `Account.credentials` (get/set property);
   never touch `credentials_enc` directly.
 - `security.py` — PBKDF2-HMAC-SHA256 password hashing for the multi-user login.
-- `runner.py` — `python -m webapp.runner --strategy S007` (or S009): a
+- `runner.py` — `python -m webapp.runner --strategy S007` (or `S009`): a
   coordinator+worker pair. The coordinator loads enabled `AccountStrategy` rows for
   that strategy and spawns **one worker subprocess per account** — required, not
   just convenient, because `CTraderAdapter` drives its session through a single
@@ -49,7 +53,33 @@ detail pages, DB-driven multi-account runner, broker position sync for cTrader).
   open/closed-dedup state `decide()` depends on still lives only in those files —
   not yet safe to drop), and updates `account_strategies.status`/`last_cycle_at`.
   After a cTrader cycle, the runner spends any leftover tick budget on
-  `sync_positions` in a subprocess (same one-reactor-per-process constraint).
+  `sync_positions` in a subprocess (same one-reactor-per-process constraint). The
+  S007↔S009 dispatch is a `STRATEGY_WORKERS = {"S007": _worker_s007, "S009":
+  _worker_s009}` registry, not a hardcoded check — adding a new strategy means
+  writing one worker function and registering it here, nothing else in this module
+  changes. **S009's worker is deliberately shadow-only** (`broker="off"` hardcoded,
+  not read from any config) — enabling real/demo orders through this DB-driven path
+  is a separate, explicit decision, not a side effect of registering it. Its
+  cross-cycle state (target book/equity/last-booked-day) lives in the `strategy_state`
+  DB table (`webapp/state_store.py::DBStateStore`, one row per
+  `account_strategy_id`) instead of a shared file, so several Bybit accounts can run
+  through this path without clobbering each other — `utils/strategy_state.py`
+  defines the same `.load()`/`.save(dict)` shape as a plain `FileStateStore`, which
+  is what `bot/s009_paper.py`'s original single-account CLI (`--once`/`--loop`) still
+  uses, unchanged.
+- **Scheduling** — *what* runs *when* lives in `deployment/schedule.yml` (cron
+  strings per strategy, plus arbitrary background `tasks`), read by
+  `scripts/scheduler_tick.py`, not in any per-strategy infra config. One static
+  Ofelia job (`docker-compose.yml`, image built from the repo-root `Dockerfile`)
+  invokes that dispatcher every minute; it decides which strategy/task is actually
+  due and subprocess-invokes `webapp.runner --strategy <name>` (or a task's
+  command) only then. Adding a strategy's cadence or a new background job is a
+  `schedule.yml` edit + code review — `docker-compose.yml` never needs to change
+  again. S007 runs 10:00–16:59 Kyiv weekdays (`bot/s007_config.py`'s
+  `TRADE_START`/`EXIT_END`); S009 runs once daily shortly after UTC midnight, not
+  every minute like S007 — its cycle has no cheap "already up to date" check before
+  hitting Bybit's public data API. See `docker-compose.yml`'s comments for
+  Podman-machine-specific socket/SELinux notes if reproducing this locally.
 - `sync_positions.py` — `python -m webapp.sync_positions --account-strategy-id N`.
   Refreshes `positions` from broker reality for **cTrader accounts only** (Bybit's
   API returns only `{symbol: net qty}` with no label/id, so its rows can't be
@@ -77,9 +107,12 @@ APP_DB_URL=sqlite:///data/app.db        # optional (default; resolved against re
 `webapp.*` command (`cli.py`, `app.py`, `runner.py`, `sync_positions.py` all read
 from `os.environ`, none of them call `python-dotenv`).
 
-Extra deps beyond `requirements.txt` (not yet added there — install manually):
-`pip install sqlalchemy alembic fastapi uvicorn jinja2 python-multipart itsdangerous
-pydantic cryptography`.
+Extra deps beyond `requirements.txt` (the research/dev stack — not yet updated for
+`webapp`/`bot`, install manually for a local venv): `pip install sqlalchemy alembic
+fastapi uvicorn jinja2 python-multipart itsdangerous pydantic cryptography`. The
+Docker image (`Dockerfile`) instead installs from `requirements-docker.txt`, the
+actual pinned runtime list for `bot/`+`webapp/`+`utils/` — keep that file in sync
+if you add a dependency, `requirements.txt` is not it.
 
 ## Quick start
 ```

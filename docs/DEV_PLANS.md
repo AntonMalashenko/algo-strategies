@@ -107,18 +107,29 @@ users, each with multiple broker accounts.
   row per unique `username`, password supplied at migration time
   (`accounts.yml` carries no password).
 
-### Status (2026-07-31)
+### Status (2026-08-08, updated — see note below)
+
+> Updated 2026-08-08: the two items below marked "Not started" / "Stale" in the
+> 2026-07-31 version of this section have since shipped — see commits `f20c6c1`
+> ("Multi-account infra: S009 live scheduler, position sync, Docker/Ofelia scaffold")
+> and `b0bcae1` ("Generic scheduler dispatcher + strategy registry, S009 goes
+> multi-account"). Corrected below in place rather than kept as a stale claim.
 
 - Done: DB schema (users/accounts/strategies/account_strategies/positions/
   logs) implemented and migrated via Alembic (`001_initial_schema`);
   `configs/accounts.yml` import script (`scripts/migrate_accounts_yml.py`)
   written.
-- Not started: `Dockerfile`/`docker-compose.yml`/Ofelia scheduler config;
-  the Loki logging driver setup (plan above, no code yet).
-- Stale, needs updating to the new multi-broker schema: `webapp/cli.py`,
-  `webapp/app.py`, `webapp/runner.py`, `webapp/README.md` (still reference
-  the old pre-multi-broker shape — `ctid_trader_account_id`, cTrader creds
-  on `User`, a single `Account.strategy`).
+- Done: `Dockerfile`/`docker-compose.yml`/Ofelia scheduler config
+  (`deployment/schedule.yml` + `scripts/scheduler_tick.py`, dispatched via
+  `webapp/runner.py`'s `STRATEGY_WORKERS` registry). The Loki logging driver
+  setup from the plan above was not part of this — not yet confirmed either
+  way, treat as still open if it matters.
+- Done: `webapp/cli.py`, `webapp/app.py`, `webapp/runner.py`, `webapp/README.md`
+  updated for the multi-broker schema (no remaining references to
+  `ctid_trader_account_id` / a single `Account.strategy` found as of
+  2026-08-08); not independently re-audited line-by-line, so treat as
+  "probably current" rather than fully verified.
 - Blocked: running `scripts/migrate_accounts_yml.py` against the real
   `configs/accounts.yml` needs a plaintext password for the new `User` row,
-  not yet supplied.
+  not yet supplied. (Unverified whether this is still blocking or was
+  resolved since — check before assuming either way.)

@@ -20,7 +20,22 @@ pull in the skill(s) that own the relevant code and conventions, follow them, ve
 deliver the answer in the agreed format. The point is consistency — no task in this repo is
 done "off the map."
 
-## The loop: start → apply → finish
+## The loop: orient → start → apply → finish
+
+**0. Orient — check what's already happening.** Before classifying anything, ground
+yourself in current project state so you don't redo, contradict, or miss live work from
+another session/chat. Docs across many sessions go stale fast (e.g. `docs/DEV_PLANS.md`
+said Docker/Ofelia scheduler config was "not started" for over a week after it had shipped
+and gone live — a session that trusted the doc without checking would have redesigned
+something that already existed). Concretely:
+- **Cowork / Claude Project session (Projects tool available):** read `claude/status.md`
+  first — it's the "read this first" dashboard (current state, priorities, doc map). Then
+  skim `claude/roadmap.md` for the specific track's open items if the task needs more detail.
+- **Repo-bound console session (no Projects tool):** read `docs/DEV_PLANS.md`, and tail the
+  relevant `.claude/change-log/<component>.jsonl` file(s) for anything touched recently by
+  another session. If a doc's claim looks stale against what the code actually does, verify
+  against the code/commit history before trusting it — don't propagate a stale claim into a
+  new plan.
 
 **1. Start — classify and route.** Read the request and match it to the skill catalog below.
 Most real tasks touch more than one skill (e.g. "add a rule and wire it into the bot" =

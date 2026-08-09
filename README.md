@@ -108,10 +108,10 @@ Run `--live` every minute during the trading session (schedule with cron —
 see `bot/S007_README.md` for the exact line). The bot is stateless: it rebuilds
 the day's state from recent M1 bars each cycle, so a missed/restarted minute is
 harmless. Current config (`bot/s007_config.py`): preset `WORKING_S007`
-(recommended champion — see `.claude/skills/strategy-modifiers/SKILL.md`),
-first-run sizing is a fixed lot (`FIXED_LOT`), not `RISK_PCT` yet — calibrate
-the symbol's tick value against the broker before switching to percent-risk
-sizing.
+(recommended champion — see `.claude/skills/strategy-modifiers/SKILL.md`).
+Sizing is percent-risk (`bot/risk.py`, 0.25% equal-dollar-risk per trade) since
+2026-07-21 — `USE_FIXED_LOT` now defaults to `False`; the fixed-lot path still
+exists as a fallback but is no longer the default.
 
 **Before leaving it unattended:** do one manually-watched `--live` cycle and
 confirm in the cTrader UI that the SL sits exactly at the 0.5 level, TP is at
