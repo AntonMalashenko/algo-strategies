@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Watchdog for the Podman-machine clock-freeze-after-sleep bug found
+         live 2026-08-10 (see scripts/podman_healthcheck.py's module
+         docstring for the full incident). Runs as a launchd job -- not
+         inside Docker -- specifically because launchd is the one layer
+         already proven to survive this Mac's sleep/wake cycles cleanly;
+         the whole point is to supervise the Docker/Podman layer from
+         OUTSIDE it, since that layer cannot supervise itself here. Every 5
+         minutes is frequent enough to catch a freeze quickly without being
+         so frequent that a `podman machine ssh` timeout/hiccup causes
+         needless restarts. -->
+    <key>Label</key>
+    <string>com.algo.podman-healthcheck</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Anton_Malashenko/Trading/algo/.venv/bin/python3</string>
+        <string>/Users/Anton_Malashenko/Trading/algo/scripts/podman_healthcheck.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/Anton_Malashenko/Trading/algo</string>
+
+    <!-- Every 5 minutes, StartCalendarInterval (not StartInterval) --
+         anchored to the real wall clock, same interval-drift reasoning as
+         every other tick plist in this repo (decisions-log.md
+         2026-07-23). -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Minute</key><integer>5</integer></dict>
+        <dict><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Minute</key><integer>35</integer></dict>
+        <dict><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Minute</key><integer>50</integer></dict>
+        <dict><key>Minute</key><integer>55</integer></dict>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Anton_Malashenko/Trading/algo/reports/logs/PodmanHealthcheck/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Anton_Malashenko/Trading/algo/reports/logs/PodmanHealthcheck/launchd.err.log</string>
+</dict>
+</plist>

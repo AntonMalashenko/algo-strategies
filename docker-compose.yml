@@ -89,5 +89,16 @@ services:
       # Multi-value fields need a JSON array (Ofelia label syntax, not compose's).
       ofelia.job-run.dispatch.volume: >-
         ["${PWD}/data:/app/data:rw", "${PWD}/reports:/app/reports:rw"]
+      # TZ here (not just on the ofelia service above) matters: this is the
+      # container that actually evaluates deployment/schedule.yml's cron
+      # strings via croniter against ITS OWN wall clock. Found live
+      # 2026-08-10 (S007's first real trading day on this path): without it,
+      # the container defaults to UTC, so "* 10-16 * * 1-5" (meant as Kyiv
+      # local hours, matching bot/s007_config.py's TRADE_START/EXIT_END) was
+      # silently evaluated as UTC 10-16 = Kyiv 13:00-19:59 -- S007 never
+      # dispatched during the actual 10:00-12:59 Kyiv part of its session at
+      # all, and would have kept firing 17:00-19:59 Kyiv, past its own
+      # session end, for no effect (the worker's own in_window check would
+      # just no-op there, but still a wasted/confusing extra dispatch).
       ofelia.job-run.dispatch.environment: >-
-        ["APP_SECRET_KEY=${APP_SECRET_KEY}", "APP_DB_URL=sqlite:////app/data/app.db"]
+        ["APP_SECRET_KEY=${APP_SECRET_KEY}", "APP_DB_URL=sqlite:////app/data/app.db", "TZ=Europe/Kyiv"]

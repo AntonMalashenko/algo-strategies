@@ -29,6 +29,7 @@ import datetime
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -44,6 +45,19 @@ DEFAULT_SCHEDULE_FILE = ROOT / "deployment" / "schedule.yml"
 # under this, so this is a backstop against a fully wedged subprocess, not
 # the normal-case ceiling.
 ITEM_TIMEOUT_SECONDS = 120
+
+# Found live 2026-08-10: Ofelia fires a fresh job-run container every minute
+# (docker-compose.yml's outer "0 * * * * *") regardless of whether the
+# PREVIOUS minute's scheduler_tick is still running -- normally a cycle
+# takes a few seconds, but under degraded conditions (that day: cTrader
+# session setup slowed to 55-118s after a Podman-machine restart) a strategy
+# ended up dispatched by two overlapping ticks at once. No duplicate order
+# resulted that time (the worker re-reads real broker state each cycle
+# rather than trusting its own prior intent), but nothing structural
+# prevented it. LOCK_DIR lives on the same bind-mounted, host-persistent
+# volume as the DB (data/, see docker-compose.yml's dispatch job volumes) so
+# a lock survives across the ephemeral per-tick containers that create it.
+LOCK_DIR = ROOT / "data" / ".scheduler_locks"
 
 
 def load_schedule(path: Path) -> dict:
@@ -61,11 +75,48 @@ def _due(schedule_expr: str, now: datetime.datetime) -> bool:
     return croniter.match(schedule_expr, now)
 
 
+def _lock_path(kind: str, name: str) -> Path:
+    return LOCK_DIR / f"{kind}-{name}.lock"
+
+
+def _acquire_lock(kind: str, name: str) -> bool:
+    """True if no other tick's dispatch of this same (kind, name) is still
+    in flight, and this call has now claimed it. A lock file older than
+    ITEM_TIMEOUT_SECONDS is treated as abandoned rather than blocking
+    forever: _run_item's own subprocess.run always releases it (successful
+    return, non-zero exit, or its own TimeoutExpired all hit the `finally`
+    below) within that ceiling, so a lock that outlives it can only mean the
+    process that held it was killed from outside (OOM, container hard-kill)
+    before reaching the `finally` -- same self-healing-over-blocking
+    philosophy as S009's own catch-up-on-next-run design, not a new one."""
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    path = _lock_path(kind, name)
+    if path.exists():
+        age = time.time() - path.stat().st_mtime
+        if age < ITEM_TIMEOUT_SECONDS:
+            print(f"[scheduler] {kind} {name!r}: previous run still in progress "
+                  f"({age:.0f}s old), skipping this tick")
+            return False
+        print(f"[scheduler] {kind} {name!r}: stale lock ({age:.0f}s old), stealing it")
+    path.write_text(str(time.time()))
+    return True
+
+
+def _release_lock(kind: str, name: str) -> None:
+    _lock_path(kind, name).unlink(missing_ok=True)
+
+
 def _run_item(kind: str, name: str, args: list[str]) -> None:
     """Run one strategy/task as an isolated subprocess. Never raises -- a
     failure here is that one item's problem, not the whole tick's; every
     outcome (ok, non-zero exit, timeout, failed to start) is logged and
-    swallowed so the loop keeps going to the next item."""
+    swallowed so the loop keeps going to the next item.
+
+    Guarded by a per-(kind, name) lock so a slow cycle (see LOCK_DIR's
+    comment) can never be dispatched twice concurrently by two overlapping
+    ticks."""
+    if not _acquire_lock(kind, name):
+        return
     try:
         proc = subprocess.run(args, cwd=str(ROOT), capture_output=True,
                                text=True, timeout=ITEM_TIMEOUT_SECONDS)
@@ -78,6 +129,8 @@ def _run_item(kind: str, name: str, args: list[str]) -> None:
         print(f"[scheduler] {kind} {name!r} TIMEOUT after {ITEM_TIMEOUT_SECONDS}s")
     except Exception as exc:                     # noqa: BLE001 -- see docstring
         print(f"[scheduler] {kind} {name!r} failed to start: {exc!r}")
+    finally:
+        _release_lock(kind, name)
 
 
 def tick(now: datetime.datetime | None = None, schedule_file: Path | None = None) -> None:

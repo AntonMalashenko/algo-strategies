@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -130,3 +131,67 @@ def test_run_item_bad_executable_does_not_raise(capsys):
     st._run_item("task", "missing", ["/no/such/binary/here"])
     out = capsys.readouterr().out
     assert "failed to start" in out
+
+
+# --- overlap guard (LOCK_DIR) -----------------------------------------------
+
+def test_run_item_releases_lock_after_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "LOCK_DIR", tmp_path)
+    st._run_item("task", "ok", [sys.executable, "-c", "pass"])
+    assert not st._lock_path("task", "ok").exists()
+
+
+def test_run_item_releases_lock_after_nonzero_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "LOCK_DIR", tmp_path)
+    st._run_item("task", "fails", [sys.executable, "-c", "import sys; sys.exit(3)"])
+    assert not st._lock_path("task", "fails").exists()
+
+
+def test_run_item_releases_lock_after_timeout(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(st, "LOCK_DIR", tmp_path)
+    monkeypatch.setattr(st, "ITEM_TIMEOUT_SECONDS", 0.05)
+    st._run_item("task", "hangs", [sys.executable, "-c", "import time; time.sleep(5)"])
+    assert not st._lock_path("task", "hangs").exists()
+
+
+def test_second_call_skips_while_a_fresh_lock_is_held(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(st, "LOCK_DIR", tmp_path)
+    st._acquire_lock("strategy", "S007")   # simulates a still-running previous tick
+    held_since = st._lock_path("strategy", "S007").stat().st_mtime
+
+    # A real, observable side effect if this ran: a marker file the command
+    # below would create. Its absence proves subprocess.run was never
+    # reached, not just that stdout claims so.
+    marker = tmp_path / "ran.marker"
+    st._run_item("strategy", "S007",
+                [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"])
+
+    assert not marker.exists()
+    assert "still in progress" in capsys.readouterr().out
+    # untouched by the skipped call -- _acquire_lock returned False before
+    # ever calling path.write_text() again
+    assert st._lock_path("strategy", "S007").stat().st_mtime == held_since
+
+
+def test_stale_lock_is_stolen_not_blocking(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(st, "LOCK_DIR", tmp_path)
+    monkeypatch.setattr(st, "ITEM_TIMEOUT_SECONDS", 120)
+    lock = st._lock_path("strategy", "S007")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("0")
+    old = time.time() - 999   # far older than ITEM_TIMEOUT_SECONDS
+    import os
+    os.utime(lock, (old, old))
+
+    st._run_item("strategy", "S007", [sys.executable, "-c", "pass"])
+
+    out = capsys.readouterr().out
+    assert "stale lock" in out
+    assert "ok" in out
+    assert not lock.exists()   # released after the (successful) run completed
+
+
+def test_two_different_items_do_not_share_a_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "LOCK_DIR", tmp_path)
+    assert st._acquire_lock("strategy", "S007") is True
+    assert st._acquire_lock("strategy", "S009") is True   # different name, independent lock

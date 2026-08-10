@@ -19,6 +19,7 @@ data/processed/*
 data/histdata/*
 data/fresh/*
 data/GER40/*
+data/.scheduler_locks/
 !data/**/.gitkeep
 reports/*
 !reports/.gitkeep
