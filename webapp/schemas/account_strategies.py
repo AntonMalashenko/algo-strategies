@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from webapp.schemas.enums import BrokerMode
+
 
 class AccountStrategyCreate(BaseModel):
     account_id: int
@@ -22,3 +24,4 @@ class AccountStrategyCreate(BaseModel):
     fixed_lot: float = Field(default=0.01, gt=0)
     use_fixed_lot: bool = True
     initial_balance: float | None = Field(default=None, ge=0)
+    broker_mode: BrokerMode = BrokerMode.OFF

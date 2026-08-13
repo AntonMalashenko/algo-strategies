@@ -30,16 +30,33 @@ SYMBOL_CANDIDATES = ["GER40", "DE40", "GERMANY40", "GER40.cash", "DE40.cash", "G
 
 # --- strategy preset (name from ger40_lonfra.config) ---
 # Options: BASELINE_S007 (frozen base, net +0.415R/day real-spread, all years
-# positive, maxDD -40R) / FILTERED_S007 / WORKING_S007 / WORKING_S007_V2
-# (see strategy_spec.md §9-10 / strategy-passport-S007.md).
+# positive, maxDD -40R) / FILTERED_S007 / WORKING_S007 / WORKING_S007_V2 /
+# WORKING_S007_LIQFLOOR (see strategy_spec.md §9-10 / strategy-passport-S007.md).
 #
-# WORKING_S007 = BASELINE_S007 + day-height filter + B-reversal->A. Recommended
+# WORKING_S007 = BASELINE_S007 + day-height filter + B-reversal->A. Was the
 # champion for raw profit (net +0.571R/day real-spread, +38% vs base, same
 # maxDD -40R, best worst-year +0.29R) — validated 2026-07-16, see
 # strategy-passport-S007.md §4c. Chosen for the first live demo run (decision
 # 2026-07-19, decisions-log.md): not on a hard-daily-limit prop account, so the
 # reversal's better average outweighs its slightly worse daily tail.
-PRESET = "WORKING_S007"
+#
+# PROMOTED 2026-08-12 -> WORKING_S007_LIQFLOOR (ALGODEV-21 fix): WORKING_S007's
+# tp_mode="liquidity" could pick a take-profit closer than the standard 100%-
+# range target, giving near-zero-R trades that resolve in 1-2 minutes -- too
+# fast for this bot's 1-minute poll to reliably catch (real example 2026-08-11,
+# see decisions-log.md). WORKING_S007_LIQFLOOR floors the liquidity-TP search at
+# range_tp, fixing that. Gate 1/Gate 2 backtest (backtest-log.md 2026-08-11/12,
+# both point-cost and bps-cost models) was MIXED, not a clean win: aggregate net
+# R/day is higher (+0.80->+0.85R bps vs +0.63R for WORKING_S007), but win-rate is
+# lower (60% vs 69%), maxDD is deeper (-47..-51R vs -39R), and 2023 is a much
+# weaker year under the fix even after removing the cost-model artifact (+18R vs
+# +43R for WORKING_S007) -- see backtest-log.md 2026-08-12 for the full per-year
+# table and the root-cause analysis (more pyramided adds accumulate before the
+# farther TP is reached, so a subsequent reversal hits more open positions at
+# once). Anton made an explicit, informed decision to promote anyway, accepting
+# that tradeoff (chat 2026-08-12) -- NOT an automatic backtest-passed promotion,
+# flag this context if revisiting the choice.
+PRESET = "WORKING_S007_LIQFLOOR"
 
 # --- sizing ---
 RISK_PCT = 0.25            # % of CURRENT balance risked per position, refetched every

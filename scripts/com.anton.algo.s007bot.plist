@@ -2,7 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- S007 live scheduler tick (scripts/s007_tick.py). launchd invokes it
+    <!-- DEPRECATED as the live path (2026-08-10) -- see scripts/s007_tick.py's
+         module docstring for the full explanation. Superseded by the
+         Docker/Ofelia dispatcher since the 2026-08-09 cutover; NOT installed
+         in ~/Library/LaunchAgents/ anymore. Manual break-glass fallback
+         only -- `docker compose down ofelia` FIRST, always, before ever
+         re-installing/loading this, since both paths independently manage
+         the same demo account (ctrader-47939312).
+
+         S007 live scheduler tick (scripts/s007_tick.py). launchd invokes it
          once a minute, around the clock. It is NOT a long running process:
          each invocation reads the clock, does at most one trading cycle,
          and exits. See scripts/s007_loop_install.sh for install and

@@ -39,9 +39,20 @@ def pick_stop(mode, t, entry, up, L, range_stop):
     return range_stop
 
 
-def liquidity_tp(up, entry, rh, rl, height, lv, L, t):
-    """Nearest liquidity proxy beyond the entry and beyond the broken boundary."""
+def liquidity_tp(up, entry, rh, rl, height, lv, L, t, use_floor=False):
+    """Nearest liquidity proxy beyond the entry and beyond the broken boundary.
+
+    use_floor (ALGODEV-21): when True, candidates are additionally required to
+    lie beyond range_tp (the standard 100%-range target), not just beyond the
+    broken boundary rh/rl. Without the floor, a liquidity level can sit just
+    past rh/rl but far short of range_tp, producing a near-zero-R trade that
+    resolves in 1-2 minutes -- too fast for the live bot's 1-minute poll to
+    reliably catch. With the floor, tp is range_tp unless liquidity extends
+    beyond it, matching the user's proposed rule: "if liquidity is below 100%
+    of the range, go to 100%; if above, go to liquidity."
+    """
     range_tp = (rh + height) if up else (rl - height)
+    floor = range_tp if use_floor else (rh if up else rl)
     cands = []
     if up:
         for key in ("asia_high", "prev_day_high"):
@@ -51,7 +62,7 @@ def liquidity_tp(up, entry, rh, rl, height, lv, L, t):
         sh = L["prev_sh"][t]
         if not np.isnan(sh) and sh > entry:
             cands.append(sh)
-        cands = [c for c in cands if c > rh]
+        cands = [c for c in cands if c > floor]
         return min(cands) if cands else range_tp
     else:
         for key in ("asia_low", "prev_day_low"):
@@ -61,7 +72,7 @@ def liquidity_tp(up, entry, rh, rl, height, lv, L, t):
         sl = L["prev_sl"][t]
         if not np.isnan(sl) and sl < entry:
             cands.append(sl)
-        cands = [c for c in cands if c < rl]
+        cands = [c for c in cands if c < floor]
         return max(cands) if cands else range_tp
 
 
@@ -77,7 +88,7 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
     if buffer > 0 and abs(e_price - stop0) < buffer:
         return None, False
     positions = [dict(entry=e_price, stop=stop0, status="open", exit=None,
-                      is_add=False, up=up, idx=start_idx, tp=tp)]
+                      is_add=False, up=up, idx=start_idx)]
     armed = False
     armed_price = np.nan   # the pullback swing extreme that armed the current add
     last_add = start_idx
@@ -148,7 +159,7 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
                         if buffer > 0 and abs(c - st) < buffer:
                             continue
                         positions.append(dict(entry=c, stop=st, status="open",
-                                              exit=None, is_add=True, up=up, idx=t, tp=tp))
+                                              exit=None, is_add=True, up=up, idx=t))
                         armed = False
                         last_add = t
     last_close = closes[-1]
@@ -182,7 +193,8 @@ def simulate_day(bars: pd.DataFrame, rh, rl, mid, height, lv, cfg: StrategyConfi
     if cfg.tp_mode == "range":
         tp = (rh if up else rl) if scenario == "A" else ((rh + height) if up else (rl - height))
     elif cfg.tp_mode == "liquidity":
-        tp = liquidity_tp(up, e_price, rh, rl, height, lv, L, e_idx)
+        tp = liquidity_tp(up, e_price, rh, rl, height, lv, L, e_idx,
+                          use_floor=cfg.liquidity_tp_floor)
     else:
         raise ValueError(f"unknown tp_mode {cfg.tp_mode!r}")
 
@@ -226,9 +238,15 @@ def simulate_day(bars: pd.DataFrame, rh, rl, mid, height, lv, cfg: StrategyConfi
                 positions.extend(leg2)
                 n_recovery = len(leg2)
 
-    cost_points = 2.0 * cfg.spread_per_side + cfg.commission_points
+    flat_cost_points = 2.0 * cfg.spread_per_side + cfg.commission_points  # 'points' model
     day_R = 0.0
     for p in positions:
+        # 'bps' model: cost scales with THIS position's own entry price, so a fixed
+        # relative broker cost doesn't get mis-applied as a fixed point cost across
+        # years where the index traded at very different absolute price levels
+        # (see cfg.cost_model docstring / ALGODEV-21 follow-up).
+        cost_points = (p["entry"] * (2.0 * cfg.spread_bps_per_side + cfg.commission_bps) / 10000.0
+                      if cfg.cost_model == "bps" else flat_cost_points)
         risk = abs(p["entry"] - p["stop"])
         pu = p["up"]
         if risk <= 0:

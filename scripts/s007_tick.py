@@ -2,6 +2,21 @@
 launchd (StartCalendarInterval, see scripts/com.anton.algo.s007bot.plist), NOT a
 long-running loop process.
 
+DEPRECATED as the live path (2026-08-10): superseded by the Docker/Ofelia
+dispatcher (webapp/runner.py's _worker_s007, scheduled via
+deployment/schedule.yml + scripts/scheduler_tick.py) since the 2026-08-09
+cutover. The launchd job this module depends on
+(com.anton.algo.s007bot.plist) is deliberately NOT installed in
+~/Library/LaunchAgents/ anymore -- both paths independently manage the SAME
+demo account (ctrader-47939312), so running both at once means two
+processes racing to open/close positions on it. This file is kept only as a
+manual break-glass fallback: `cp scripts/com.anton.algo.s007bot.plist
+~/Library/LaunchAgents/ && launchctl load ...`, and ONLY after first
+`docker compose down ofelia` (or otherwise confirming the Docker path is
+stopped) -- see docker-compose.yml's own warning. Do not re-install this
+plist as a "just in case" convenience; every extra place it can be loaded
+from is exactly the risk this deprecation removes.
+
 This replaces an earlier design (scripts/s007_loop.py, since removed) that
 kept one Python process alive ~24h/day, sleeping in short chunks between
 checks. Anton's point in review: don't keep a process alive for a near-full

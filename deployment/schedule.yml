@@ -40,4 +40,27 @@ strategies:
 # refresh, cleanup, ...). `command` is run as-is via subprocess (module path,
 # e.g. "python -m scripts.dump_today_m1"). Empty for now -- populate as
 # concrete needs come up, not speculatively.
-tasks: []
+tasks:
+  # ALGODEV-9: Deribit BTC+ETH option-board snapshot
+  # (scripts/fetch_deribit_snapshot.py, see docs/DERIBIT_OPTIONS_SNAPSHOT.md).
+  # Capture-now and watermark-driven (module docstring SS2/SS3.4): a missed
+  # day can never be backfilled, so this is scheduled once daily, not on a
+  # retry cadence -- a transient failure (exit 1) just leaves the watermark
+  # untouched and waits for tomorrow's run, same as the script's own retry
+  # story.
+  #
+  # Target: fire at/after 16:00 UTC (spec SS3.4 -- the reference weekly
+  # short-strangle construction's Friday-16:00-UTC entry, S012 candidate).
+  # This cron is a LOCAL hour, matching the file header above (evaluated
+  # against the container's Europe/Kyiv wall clock) -- picked for the
+  # CURRENT summer offset (EEST, UTC+3): 19:00 local = 16:00 UTC. Because
+  # it's the UTC *offset* that changes at the DST boundary, not the local
+  # clock, a fixed local hour drifts in UTC terms once DST ends: in winter
+  # (EET, UTC+2) this same "0 19 * * *" fires at 17:00 UTC instead of
+  # 16:00 -- one hour later, still same-day and still watermark-safe, but
+  # a real one-hour drift from the SS3.4 target that needs a manual edit
+  # here (or a different mechanism -- discuss with Anton) at each DST
+  # transition if the exact UTC hour ever needs to be tighter than this.
+  - name: deribit_snapshot
+    command: python -m scripts.fetch_deribit_snapshot
+    schedule: "0 19 * * *"

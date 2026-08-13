@@ -15,6 +15,10 @@ requests==2.32.3
 # cron strings against wall-clock time) ---
 croniter==6.2.4
 
+# --- Deribit option-board snapshot collector (scripts/fetch_deribit_snapshot.py,
+# ALGODEV-9): parquet output, per infra-scheduled-jobs-spec.md rev.2 SS3.3 ---
+pyarrow==24.0.0
+
 # --- webapp (FastAPI control panel + DB) ---
 fastapi==0.139.2
 starlette==1.3.1

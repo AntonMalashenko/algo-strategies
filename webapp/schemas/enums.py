@@ -28,6 +28,16 @@ class Strategy(str, Enum):
     S009 = "S009"
 
 
+class BrokerMode(str, Enum):
+    """AccountStrategy.broker_mode -- how a worker is allowed to touch the
+    broker for this one (account, strategy) link. Mirrors bot/s009_paper.py's
+    CLI `--broker {off,dry,execute}` choices so the DB-driven and single-
+    account CLI paths speak the same vocabulary."""
+    OFF = "off"
+    DRY = "dry"
+    EXECUTE = "execute"
+
+
 class LogLevel(str, Enum):
     INFO = "info"
     WARNING = "warning"

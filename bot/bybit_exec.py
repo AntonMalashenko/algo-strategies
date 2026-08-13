@@ -151,3 +151,28 @@ class BybitExec:
         body = {"category": self.category, "symbol": symbol, "side": side,
                 "orderType": "Market", "qty": str(qty)}
         return self._post("/v5/order/create", body)
+
+    def close_position(self, symbol: str, side: str) -> dict:
+        """Close an entire open position in one shot, without the caller computing
+        a quantity. Bybit v5: a Market order with qty="0" + reduceOnly=True +
+        closeOnTrigger=True closes the full position regardless of its exact size
+        (see https://bybit-exchange.github.io/docs/v5/order/create-order).
+
+        Use this for full exits instead of sizing a closing order from the local
+        position snapshot: computing "current qty" ourselves and rounding it via
+        `s009_paper._floor_step` proved unsafe (IEEE-754 float division can
+        under-round by exactly one qty_step, e.g. 24.2/0.1 == 241.99999999999997
+        -> 24.1, leaving a stuck dust remainder — the 2026-08-09 ATOM incident,
+        see decisions-log.md). Asking the exchange to close "everything" sidesteps
+        that class of bug entirely.
+
+        `side` is the CLOSING side — opposite of the held position ("Sell" to
+        close a long, "Buy" to close a short), same convention callers already
+        use for `place_market`.
+        """
+        if self.env == "mainnet" and not self.allow_mainnet:
+            raise PermissionError("Refusing to place a MAINNET order (allow_mainnet=False).")
+        body = {"category": self.category, "symbol": symbol, "side": side,
+                "orderType": "Market", "qty": "0",
+                "reduceOnly": True, "closeOnTrigger": True}
+        return self._post("/v5/order/create", body)

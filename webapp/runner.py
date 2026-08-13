@@ -5,14 +5,22 @@ Strategy.name to the worker function that knows how to run one cycle for
 one (account, strategy) row. Adding a new strategy here means writing that
 one worker function and registering it -- run_worker()/run_coordinator()
 themselves never need to change. S007 (_worker_s007, CTRADER) and S009
-(_worker_s009, BYBIT) are registered; S009's worker is deliberately
-shadow-only (broker="off") until enabling real orders through this
-DB-driven path is its own explicit decision. S009's per-account state
-(book/equity/last-booked-day) is DB-backed (webapp/state_store.py's
+(_worker_s009, BYBIT) are registered; S009's real-order gating is
+per-account_strategy-row (AccountStrategy.broker_mode, default "off" --
+see webapp/schemas/enums.py::BrokerMode and _worker_s009's own docstring),
+not a single hardcoded switch for the whole worker. S009's per-account
+state (book/equity/last-booked-day) is DB-backed (webapp/state_store.py's
 DBStateStore, the `strategy_state` table) instead of the single shared
-file bot/s009_paper.py's single-account CLI path still uses -- that is
-what made running several Bybit accounts through here safe: the old shared
-reports/paper_s009/state.json would have had them clobber each other.
+file bot/s009_paper.py's single-account CLI path used to rely on -- that
+is what made running several Bybit accounts through here safe: the old
+shared reports/paper_s009/state.json would have had them clobber each
+other. As of 2026-08-13 this DB-driven path is the ONLY scheduled path for
+S009: the legacy launchd job (com.algo.s009-paper -> scripts/s009_tick.py
+-> bot/s009_paper.py --broker execute --allow-mainnet) that used to drive
+Bybit-algo009's real mainnet orders directly has been decommissioned in
+favor of setting that one account_strategy row's broker_mode="execute"
+here -- see scripts/s009_tick.py's module docstring for the deprecation
+note and break-glass fallback.
 
 Two modes, same file:
 
@@ -246,16 +254,22 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
 
 
 def _worker_s009(link: AccountStrategy, session, budget_s: float | None) -> int:
-    """Run one S009/BYBIT shadow cycle for one (account, strategy) DB row.
+    """Run one S009/BYBIT cycle for one (account, strategy) DB row.
 
-    Deliberately `broker="off"` (shadow-only) here, always -- enabling real
-    demo/mainnet orders through this DB-driven path is a separate, explicit
-    decision to make later, not a side effect of registering S009. No
-    Position-table writes and no end-of-cycle sync: S009's "position" is a
-    target-book weight, not a broker position id, and
-    webapp/sync_positions.py is CTRADER-only by design (Bybit's positions()
-    has no per-position id to reconcile a Position row against -- see that
-    module's docstring).
+    `link.broker_mode` ("off"/"dry"/"execute", default "off" -- see
+    webapp/schemas/enums.py::BrokerMode) gates real order placement
+    PER LINK, not globally: flipping one account_strategy row to "execute"
+    (e.g. Bybit-algo009, migrated 2026-08-13 off its legacy launchd path,
+    scripts/s009_tick.py) never silently promotes a second S009 account
+    (Bybit-tradebot1 stays "off" unless its own row is flipped). `execute`
+    only reaches mainnet if the linked Account is ALSO `env == "mainnet"`
+    -- a testnet/demo account set to "execute" still cannot place a real
+    mainnet order, mirroring bot/bybit_exec.py::BybitExec's own
+    `allow_mainnet` guard. No Position-table writes and no end-of-cycle
+    sync: S009's "position" is a target-book weight, not a broker position
+    id, and webapp/sync_positions.py is CTRADER-only by design (Bybit's
+    positions() has no per-position id to reconcile a Position row against
+    -- see that module's docstring).
 
     Per-account state (book/equity/last-booked-day) lives in the
     `strategy_state` DB table via DBStateStore, keyed by this
@@ -274,20 +288,23 @@ def _worker_s009(link: AccountStrategy, session, budget_s: float | None) -> int:
             f"the S009 worker only drives BYBIT accounts")
     user = acc.user
 
+    broker_mode = link.broker_mode or "off"
+    allow_mainnet = broker_mode == "execute" and acc.env == "mainnet"
+
     creds_row = acc.credentials
     creds = dict(api_key=creds_row.get("api_key"), api_secret=creds_row.get("api_secret"))
     logger = StrategyLogger(f"S009-acct{acc.id}", log_root=str(ROOT / "reports" / "logs"))
     state = DBStateStore(link.id, session)
 
     print(f"[runner] S009 cycle starting: account_strategy={link.id} account={acc.id} "
-          f"({acc.label or acc.id}) user={user.username}")
+          f"({acc.label or acc.id}) user={user.username} broker_mode={broker_mode}")
     _log_event(session, LogKind.CYCLE_START, message="cycle start", user=user, account=acc,
               strategy=strat)
     session.commit()
 
     result = run_s009_cycle(
         account_key=acc.label or f"acct{acc.id}", creds=creds, cfg=DEPLOY, state=state,
-        logger=logger, broker="off", allow_mainnet=False)
+        logger=logger, broker=broker_mode, allow_mainnet=allow_mainnet)
 
     ok = True
     if result["error"]:
@@ -298,7 +315,8 @@ def _worker_s009(link: AccountStrategy, session, budget_s: float | None) -> int:
         print(f"[runner] account_strategy {link.id}: ERROR {result['error']}")
         ok = False
     else:
-        link.status = (f"shadow: {result['booked']} day(s) booked, "
+        mode_label = "shadow" if broker_mode == "off" else broker_mode
+        link.status = (f"{mode_label}: {result['booked']} day(s) booked, "
                        f"{len(result['target'])} target position(s)")
         link.last_error = None
         print(f"[runner] account_strategy {link.id}: booked={result['booked']} "

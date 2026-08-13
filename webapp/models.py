@@ -118,6 +118,15 @@ class AccountStrategy(Base):
     # (e.g. S009's reports/paper_s009/ledger.csv) -- NOT live balance, which
     # is always fetched fresh from the broker each cycle.
     initial_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # "off" (shadow, default) | "dry" (compute+log intended orders, no broker
+    # calls) | "execute" (place real orders) -- see webapp/schemas/enums.py's
+    # BrokerMode. Per-(account,strategy) so flipping ONE link to live never
+    # silently promotes a second account running the same strategy (e.g.
+    # S009 has two BYBIT accounts registered; only one is meant to trade for
+    # real). A worker further gates real orders on Account.env == "mainnet"
+    # (see webapp/runner.py::_worker_s009) -- broker_mode alone is not
+    # enough to reach mainnet on a demo/testnet account.
+    broker_mode: Mapped[str] = mapped_column(String(16), default="off")
 
     # runtime status (updated by the runner each cycle; UI reads it)
     status: Mapped[str] = mapped_column(String(32), default="idle")

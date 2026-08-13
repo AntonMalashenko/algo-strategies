@@ -15,12 +15,16 @@
 # the mounts/env below live on this one job, not on a per-strategy label.
 #
 # Cutover from the legacy single-account launchd job (com.anton.algo.s007bot)
-# to this path happened 2026-08-09: that job is unloaded
-# (`launchctl unload ~/Library/LaunchAgents/com.anton.algo.s007bot.plist`) --
-# this Ofelia job is now the ONLY thing driving S007 (demo account
-# ctrader-47939312). If you ever need to fall back, re-`launchctl load` that
-# plist AND `docker compose down` this service first -- never run both at
-# once, they would drive the same account independently. S009 is scheduled
+# to this path happened 2026-08-09; as of 2026-08-10 that job's plist is no
+# longer installed in ~/Library/LaunchAgents/ at all (previously just
+# unloaded, which still left it one `launchctl load` away from an accident --
+# see scripts/s007_tick.py's module docstring) -- this Ofelia job is now the
+# ONLY thing that can drive S007 (demo account ctrader-47939312). If you ever
+# need to fall back: `docker compose down ofelia` FIRST, then
+# `cp scripts/com.anton.algo.s007bot.plist ~/Library/LaunchAgents/ &&
+# launchctl load ~/Library/LaunchAgents/com.anton.algo.s007bot.plist` --
+# never run both at once, they would drive the same account independently.
+# S009 is scheduled
 # here too (deployment/schedule.yml) but stays shadow-only (broker="off"
 # hardcoded in webapp/runner.py's _worker_s009) -- no cutover decision
 # needed there, it was never live through any path.

@@ -54,6 +54,17 @@ class StrategyConfig:
     # 'liquidity'  : nearest liquidity proxy (asia / prior-day / prev swing)
     tp_mode: str = "liquidity"
 
+    # tp_mode="liquidity" only: floor the liquidity candidate search at the
+    # standard 100%-range target (range_tp) instead of just "beyond the broken
+    # boundary". Without this, liquidity_tp() can pick a level much closer than
+    # range_tp, producing near-zero-R trades that resolve in 1-2 minutes -- too
+    # fast for the live bot's 1-minute poll to reliably catch (see ALGODEV-21,
+    # real example 2026-08-11: tp picked 0.7pt from entry vs. range_tp 51.5pt
+    # away). ON: use range_tp as the floor -- a candidate nearer than range_tp
+    # is discarded, so tp is range_tp unless liquidity lies BEYOND it. Off by
+    # default (base untouched, ALGODEV-21 fix opt-in per strategy-modifiers).
+    liquidity_tp_floor: bool = False
+
     # --- session windows (Kyiv) ---
     fr_start: str = "09:00"          # Frankfurt (Xetra) range start
     fr_end: str = "09:59"            # Frankfurt range end
@@ -94,12 +105,31 @@ class StrategyConfig:
     #     with the reference scripts. <1.0 tames drawdown, per pyramid_findings. ---
     risk_per_add: float = 1.0
 
-    # --- costs (Gate 2). Applied per position in R space:
-    #     cost_points = 2*spread_per_side + commission_points (round-trip);
-    #     net_R = gross_R - cost_points / risk_points. Both 0.0 == gross (parity).
-    #     Small-risk positions are hit harder by fixed-point costs (realistic). ---
-    spread_per_side: float = 0.0     # points per side (round-trip = 2x)
-    commission_points: float = 0.0   # round-trip commission, in index points
+    # --- costs (Gate 2). Applied per position in R space, two selectable models:
+    #     'points' (legacy, default): cost_points = 2*spread_per_side + commission_points,
+    #       a FIXED number of index points for every position regardless of price level.
+    #     'bps': cost_points = entry_price * (2*spread_bps_per_side + commission_bps) / 10000,
+    #       i.e. cost scales with the position's own entry price.
+    #     net_R = gross_R - cost_points / risk_points either way. All 0.0 == gross (parity).
+    #     Small-risk positions are hit harder by cost (realistic in both models).
+    #
+    #     Why 'bps' exists (ALGODEV-21 follow-up, 2026-08-12): the real broker spread
+    #     (REAL_SPREAD_PER_SIDE=0.635pt in backtest/run_s007_*.py) was measured from
+    #     recent (2026) MT5 data, when GER40 traded around ~24-25k. Applied as a FIXED
+    #     point value across the whole 2023-2026 backtest window, it overstates cost in
+    #     the earlier years: GER40 traded around ~15.8k in 2023 (avg entry price), so the
+    #     same 1.27pt round-trip consumed ~5.8% of average risk in 2023 vs only ~3.2% in
+    #     2026 (see decisions-log.md 2026-08-12) -- a purely mechanical artifact of the
+    #     index's ~57% nominal price growth over the window, not a real difference in
+    #     year-to-year trading cost. 'bps' removes that artifact by keeping cost a
+    #     constant fraction of each trade's own entry price instead of a fixed point
+    #     amount, so year-over-year comparisons in this backtest aren't systematically
+    #     tilted toward the years when the index happened to be more expensive. ---
+    cost_model: str = "points"       # 'points' (legacy/default) or 'bps'
+    spread_per_side: float = 0.0     # points per side (round-trip = 2x); 'points' model
+    commission_points: float = 0.0   # round-trip commission, in index points; 'points' model
+    spread_bps_per_side: float = 0.0  # basis points of entry price, per side; 'bps' model
+    commission_bps: float = 0.0       # round-trip commission, in bps of entry price; 'bps' model
 
     # --- minimum risk guard (kills the near-zero-risk R-explosion artifact:
     #     an add whose entry sits ~on the common 0.5 stop yields absurd R).
@@ -152,6 +182,12 @@ WORKING_S007 = BASELINE_S007.with_(max_height=100.0, b_reversal_to_A=True)
 # expectancy for much lower drawdown (-40->-26R) and best worst-year (+0.35).
 # Preferred for prop sizing. (min_swing_points=10 instead maximizes expectancy.)
 WORKING_S007_V2 = WORKING_S007.with_(min_swing_frac=0.25)
+
+# ALGODEV-21 fix candidate: WORKING_S007 + liquidity TP floored at range_tp, so
+# tp_mode="liquidity" can no longer pick a target closer than the standard
+# 100%-range projection. Backtest (Gate 1/Gate 2) NOT YET RUN -- do not promote
+# to bot/s007_config.py::PRESET until validated. See decisions-log.md.
+WORKING_S007_LIQFLOOR = WORKING_S007.with_(liquidity_tp_floor=True)
 
 # --- Exact reproductions of the two reference result files (regression only) ---
 # pyramid_duka.csv  <- pyramid.py run(k=2,max=4, use_structure_stop=True), 2h, range TP

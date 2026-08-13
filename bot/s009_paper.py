@@ -1,8 +1,20 @@
 """S009 paper runner (shadow, no live orders) — funding-carry crowding-reversal.
 
-Runs once per day at ~00:00 UTC. Reuses the SAME engine as the backtest
-(`strategies.funding_carry`) so the live target book cannot drift from the
-research code. Each cycle:
+Meant to run once per closed UTC day, but the stateless tick that calls it
+(`scripts/s009_tick.py`, launchd `StartCalendarInterval`) fires whenever the
+machine happens to wake and check, not at a guaranteed ~00:00 UTC — in
+practice cycles have landed anywhere from a few minutes to ~11h after
+midnight, and some days ran with `--broker off` (no execution at all that
+day). The `net_ret` this module books into `ledger.csv` is still computed as
+an idealized close-to-close return as if the book WERE rebalanced exactly at
+00:00 UTC (see `_engine`/`strategies.funding_carry.run_backtest`) — it is a
+MODEL metric for validating the signal, not a forecast of real execution
+P&L. `BROKER_LEDGER_FILE`/`--reconcile-broker` below track the real $ side
+separately, over the actual (irregular) gaps between broker readings — see
+decisions-log.md "S009: paper vs real equity reconciliation" (2026-08-10).
+
+Reuses the SAME engine as the backtest (`strategies.funding_carry`) so the
+live target book cannot drift from the research code. Each cycle:
   1. (optional) refresh recent funding + daily prices from public Bybit,
   2. compute the frozen deploy config's target book for the day ahead,
   3. book-keep the just-closed day's paper P&L (price move + REAL accrued
@@ -19,7 +31,8 @@ Commands:
     python bot/s009_paper.py --once                 # one daily cycle (fetches data)
     python bot/s009_paper.py --once --no-fetch      # use local data as-is
     python bot/s009_paper.py --status               # current book + paper equity
-    python bot/s009_paper.py --reconcile            # ledger vs a fresh backtest
+    python bot/s009_paper.py --reconcile            # ledger vs a fresh backtest (theory vs theory)
+    python bot/s009_paper.py --reconcile-broker     # paper ledger vs real broker equity (theory vs $)
     python bot/s009_paper.py --simulate 30          # replay last N days from local data (no network)
 
 Unattended scheduling: `--loop` below runs a long-lived foreground process —
@@ -38,6 +51,7 @@ import argparse
 import math
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +69,22 @@ DATA_DIR = REPO / "data" / "raw" / "crypto_funding"
 STATE_DIR = REPO / "reports" / "paper_s009"
 STATE_FILE = STATE_DIR / "state.json"
 LEDGER_FILE = STATE_DIR / "ledger.csv"
+
+# Real-money counterpart to LEDGER_FILE (added 2026-08-10, see decisions-log.md
+# "S009: paper vs real equity reconciliation"). `ledger.csv`/`state.json::equity`
+# are a MODEL metric: net_ret is the engine's close-to-close return of a book
+# assumed rebalanced exactly at 00:00 UTC. Real cycles run whenever the
+# stateless tick happens to fire (see scripts/s009_tick.py) -- typically 4-11h
+# after midnight, sometimes not at all that day (broker=off) -- so a single
+# broker.equity() reading cannot be attributed to a calendar day the way a
+# ledger row can. BROKER_LEDGER_FILE instead logs one row per cycle where the
+# broker was actually queried, with the real elapsed wall-clock time since the
+# PREVIOUS reading (`hours_since_prev`) and the real $ return over exactly that
+# (irregular) window (`real_net_ret`) -- deliberately NOT forced into a
+# per-day shape. Comparing this series to `ledger.csv::net_ret` is how you
+# check paper vs. real; they are expected to diverge specifically on windows
+# where `hours_since_prev` is far from 24h or spans a broker=off day.
+BROKER_LEDGER_FILE = STATE_DIR / "broker_ledger.csv"
 
 # configs/accounts.yml BYBIT entry dedicated to S009 (added 2026-08-06, $50 seed).
 # MUST be passed explicitly to BybitExec(name=...): as of that date `username`
@@ -175,6 +205,29 @@ def append_ledger(row: dict, ledger_file: Path | None = None) -> None:
     pd.DataFrame([row]).to_csv(path, mode="a", header=hdr, index=False)
 
 
+def _last_broker_ledger_row(broker_ledger_file: Path | None = None) -> dict | None:
+    """Most recent row of BROKER_LEDGER_FILE, or None if it doesn't exist yet
+    (first-ever broker reading) / is empty. Used to compute `real_net_ret` and
+    `hours_since_prev` for the NEXT row without keeping a second copy of the
+    last-known broker equity anywhere else (the CSV itself is the source of
+    truth, same principle `append_ledger` already follows for the paper side)."""
+    path = broker_ledger_file if broker_ledger_file is not None else BROKER_LEDGER_FILE
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    if df.empty:
+        return None
+    return df.iloc[-1].to_dict()
+
+
+def append_broker_ledger(row: dict, broker_ledger_file: Path | None = None) -> None:
+    # Same late-binding-default reasoning as append_ledger() above.
+    path = broker_ledger_file if broker_ledger_file is not None else BROKER_LEDGER_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdr = not path.exists()
+    pd.DataFrame([row]).to_csv(path, mode="a", header=hdr, index=False)
+
+
 # --------------------------------------------------------------------------
 # Core: run engine on current panels, return per-day frame + weights + components
 # --------------------------------------------------------------------------
@@ -222,7 +275,21 @@ def _floor_step(x: float, step: float) -> float:
 def reconcile_to_target(client, target_book: dict, equity: float, log, cid, execute: bool) -> list[dict]:
     """Turn the target book (weights) into delta market orders vs current broker
     positions. dry (execute=False) logs the plan; execute places demo orders and
-    records the fill price + slippage vs the reference price."""
+    records the fill price + slippage vs the reference price.
+
+    A leg whose target weight is 0 but that still has an open position is a FULL
+    CLOSE, not a sized adjustment — it is routed through `client.close_position`
+    (Bybit's own qty=0 + reduceOnly + closeOnTrigger "close the whole position"
+    order) instead of computing a closing qty ourselves via `_floor_step`. Sizing
+    a full close locally is both unnecessary (the exchange already knows the
+    exact position size) and was proven unsafe: `_floor_step`'s naive
+    `floor(x / step) * step` can under-round by exactly one qty_step from
+    IEEE-754 float imprecision (e.g. 24.2/0.1 == 241.99999999999997 -> floors to
+    24.1, not 24.2) — on 2026-08-09 this left a stuck 0.1 ATOM dust position
+    after every reconcile "closed" 24.1 of a 24.2 position. See decisions-log.md
+    for the incident. Partial adjustments of a continuing leg (target weight
+    != 0) are unaffected and still go through the sized `place_market` path.
+    """
     positions = client.positions()
     plan: list[dict] = []
     for sym in sorted(set(target_book) | set(positions)):
@@ -235,8 +302,36 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
             continue
         if price <= 0:
             continue
-        tgt_qty = math.copysign(_floor_step(w * equity / price, inst.qty_step), w) if w else 0.0
         cur = float(positions.get(sym, 0.0))
+
+        if w == 0.0 and cur != 0.0:
+            side = "Sell" if cur > 0 else "Buy"
+            rec = {"symbol": sym, "side": side, "qty": "ALL", "ref_price": price,
+                   "target_qty": 0.0, "cur_qty": cur}
+            plan.append(rec)
+            if not execute:
+                log.order(f"S009:{sym}", "plan_close", cycle=cid,
+                          request={"side": side, "cur_qty": cur, "ref_price": price},
+                          result="dry-run")
+                continue
+            try:
+                res = client.close_position(sym, side)
+                oid = res.get("orderId")
+                fill = client.recent_fill_price(sym, oid) if oid else None
+                slip = ((fill - price) / price) if (fill and price) else None
+                log.order(f"S009:{sym}", "close_position", cycle=cid,
+                          request={"side": side, "cur_qty": cur, "ref_price": price},
+                          result={"orderId": oid, "fill": fill, "slippage": slip})
+                log.event("fill", cycle=cid, symbol=sym, side=side, qty=abs(cur),
+                          ref_price=price, fill=fill, slippage=slip)
+                rec["fill"] = fill
+                rec["slippage"] = slip
+            except Exception as exc:
+                log.order(f"S009:{sym}", "close_position", cycle=cid,
+                          request={"side": side, "cur_qty": cur, "ref_price": price}, error=exc)
+            continue
+
+        tgt_qty = math.copysign(_floor_step(w * equity / price, inst.qty_step), w) if w else 0.0
         delta = tgt_qty - cur
         if abs(delta) < inst.min_qty:
             # A wanted leg (w != 0) that rounds to less than the exchange's min
@@ -285,7 +380,8 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
                           state, logger: StrategyLogger, data_dir: Path = DATA_DIR,
                           do_fetch: bool = True, drop_forming: bool = True,
                           broker: str = "off", allow_mainnet: bool = False,
-                          ledger_file: Path | None = None) -> dict:
+                          ledger_file: Path | None = None,
+                          broker_ledger_file: Path | None = None) -> dict:
     """One S009 daily cycle for an arbitrary account, reusing the exact
     engine/book/ledger logic `run_once()` below uses for the single
     accounts.yml-configured account -- so a DB-registered multi-account run
@@ -310,6 +406,12 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
     `logger` already writes (StrategyLogger is per-account by construction,
     see the `logger` param). Only `run_once()`'s single-account CLI path
     passes its own LEDGER_FILE, unchanged from before this refactor.
+    `broker_ledger_file`: same per-account-collision reasoning as
+    `ledger_file`, but for the REAL-money series (see BROKER_LEDGER_FILE's
+    module-level docstring) -- `None` means "don't write it" (multi-account
+    caller relies on the `broker` events instead), `run_once()` passes its
+    own BROKER_LEDGER_FILE. Only written when `broker != "off"` (a broker
+    reading was actually taken this cycle).
 
     Never raises: catches any exception from the engine/state/broker steps
     and reports it as `error` instead, mirroring bot/s007_paper.py's
@@ -388,7 +490,29 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
                          else BybitExec(name=account_key, allow_mainnet=allow_mainnet))
                 broker_env = client.env
                 broker_equity = client.wallet_equity()
-                logger.event("broker", cycle=cid, env=client.env, equity=round(broker_equity, 2), mode=broker)
+
+                # Real-money series (see BROKER_LEDGER_FILE docstring): pair this
+                # reading with the PREVIOUS one to get a real $ return over the
+                # actual, irregular wall-clock gap between cycles -- never assume
+                # that gap is 24h, it routinely isn't (late tick, or a broker=off
+                # day with no reading at all in between).
+                now_ts = datetime.now(timezone.utc)
+                prev = _last_broker_ledger_row(broker_ledger_file)
+                real_net_ret = None
+                hours_since_prev = None
+                if prev is not None and float(prev["broker_equity"]) > 0:
+                    real_net_ret = broker_equity / float(prev["broker_equity"]) - 1.0
+                    hours_since_prev = (now_ts - pd.Timestamp(prev["ts"]).to_pydatetime()).total_seconds() / 3600.0
+                broker_row = {
+                    "ts": now_ts.isoformat(), "cycle": cid, "date": date,
+                    "broker_equity": round(broker_equity, 4),
+                    "hours_since_prev": round(hours_since_prev, 2) if hours_since_prev is not None else None,
+                    "real_net_ret": round(real_net_ret, 6) if real_net_ret is not None else None,
+                }
+                if broker_ledger_file is not None:
+                    append_broker_ledger(broker_row, broker_ledger_file)
+                logger.event("broker", cycle=cid, env=client.env, equity=round(broker_equity, 2), mode=broker,
+                             real_net_ret=broker_row["real_net_ret"], hours_since_prev=broker_row["hours_since_prev"])
                 broker_plan = reconcile_to_target(client, target, broker_equity, logger, cid,
                                                   execute=(broker == "execute"))
     except Exception as e:
@@ -416,7 +540,8 @@ def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_formi
     result = run_cycle_for_account(
         account_key=BYBIT_ACCOUNT_NAME, creds=None, cfg=cfg, state=_state_store, logger=log,
         data_dir=data_dir, do_fetch=do_fetch, drop_forming=drop_forming,
-        broker=broker, allow_mainnet=allow_mainnet, ledger_file=LEDGER_FILE)
+        broker=broker, allow_mainnet=allow_mainnet, ledger_file=LEDGER_FILE,
+        broker_ledger_file=BROKER_LEDGER_FILE)
 
     if result["error"]:
         print(f"ERROR: {result['error']}")
@@ -526,6 +651,67 @@ def reconcile(data_dir: Path, cfg: FundingCarryConfig) -> None:
     print(f"  max|Δ net_ret| = {md:.2e}  -> {'MATCH' if md < 1e-9 else 'DIVERGENCE (investigate fills/data)'}")
 
 
+def reconcile_broker() -> None:
+    """Compare the theoretical paper ledger (LEDGER_FILE::net_ret, one row per
+    UTC calendar day, close-to-close) against the real $ series read from the
+    account (BROKER_LEDGER_FILE::real_net_ret, one row per cycle that actually
+    queried the broker, over whatever irregular wall-clock gap separates it
+    from the previous reading).
+
+    This is NOT the same question `reconcile()` above answers -- that one
+    checks the ledger against a fresh re-run of the backtest (theory vs. the
+    same theory, catches drift/regressions in the engine itself). This checks
+    theory against real dollars, which is what actually tells you whether the
+    bot's paper equity is a usable forecast of real P&L. See decisions-log.md
+    "S009: paper vs real equity reconciliation" (2026-08-10) for the first
+    reconciliation run and its caveats (too few days for a verdict yet, one
+    broker=off day with no reading, two $5-min-order execution gaps).
+    """
+    if not BROKER_LEDGER_FILE.exists():
+        print("No broker ledger yet (bot has never run with --broker dry/execute)."); return
+    bl = pd.read_csv(BROKER_LEDGER_FILE)
+    led = pd.read_csv(LEDGER_FILE) if LEDGER_FILE.exists() else pd.DataFrame(columns=["date", "equity"])
+    led_equity_by_date = led.set_index("date")["equity"] if not led.empty else pd.Series(dtype=float)
+
+    def _equity_at(date):
+        # Model equity is DEFINED as 1.0 before any day has ever been booked
+        # (see _default_state()) -- so a broker reading taken before the
+        # ledger's first row (e.g. the very first cycle, which only seeds a
+        # target book and books zero days) still has a well-defined paper
+        # baseline to compare against, not just a missing lookup.
+        if date in led_equity_by_date.index:
+            return float(led_equity_by_date[date])
+        if not led_equity_by_date.empty and date < led_equity_by_date.index.min():
+            return 1.0
+        return None
+
+    # `paper_window_ret` is the SAME window `real_net_ret` spans -- cumulative
+    # model equity from the previous broker row's date to this one's, NOT a
+    # single day's net_ret. Comparing real_net_ret to one day's net_ret would
+    # silently misattribute it whenever hours_since_prev straddles more than
+    # one UTC day (routinely does, e.g. a broker=off day in between) or less
+    # than one -- this is the apples-to-apples version of that comparison.
+    print(f"Broker vs paper — {len(bl)} broker reading(s) in {BROKER_LEDGER_FILE.name}:")
+    print(f"{'ts':>26} {'date':>10} {'broker_eq':>10} {'hrs_gap':>8} {'real_ret':>10} {'paper_window_ret':>17}")
+    prev_date = None
+    for _, r in bl.iterrows():
+        paper_window = np.nan
+        eq_prev, eq_now = (_equity_at(prev_date) if prev_date is not None else None), _equity_at(r["date"])
+        if eq_prev is not None and eq_now is not None:
+            paper_window = eq_now / eq_prev - 1.0
+        real_s = f"{r['real_net_ret']:+.4%}" if pd.notna(r["real_net_ret"]) else "     n/a"
+        hrs_s = f"{r['hours_since_prev']:.1f}" if pd.notna(r["hours_since_prev"]) else "  n/a"
+        paper_s = f"{paper_window:+.4%}" if pd.notna(paper_window) else "n/a"
+        print(f"{r['ts']:>26} {str(r['date']):>10} {r['broker_equity']:>10.2f} {hrs_s:>8} {real_s:>10} {paper_s:>17}")
+        prev_date = r["date"]
+    print("\nNote: `real_net_ret` and `paper_window_ret` cover the SAME wall-clock window\n"
+          "(from the previous broker reading to this one, `hours_since_prev` actual hours --\n"
+          "not a clean UTC calendar day). A gap between them on a window close to 24h with no\n"
+          "broker=off day in between is the interesting case; a gap on a window far from 24h,\n"
+          "or one that swallowed a broker=off day, is largely explained by that alone -- see\n"
+          "the passport's execution-timing caveat before treating either as a bug.")
+
+
 def simulate(data_dir: Path, cfg: FundingCarryConfig, n: int) -> None:
     """Replay last n days from local data (no network) + no-look-ahead self-check."""
     close, funding, out, w, price_comp, fund_comp = _engine(data_dir, cfg)
@@ -554,6 +740,9 @@ def main() -> None:
     ap.add_argument("--no-fetch", action="store_true", help="skip Bybit refresh, use local data")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--reconcile", action="store_true")
+    ap.add_argument("--reconcile-broker", action="store_true",
+                    help="compare paper ledger.csv net_ret against real broker_ledger.csv "
+                         "real_net_ret (theory vs. actual dollars, see decisions-log.md 2026-08-10)")
     ap.add_argument("--simulate", type=int, metavar="N", help="replay last N days from local data")
     ap.add_argument("--loop", action="store_true", help="run as a daemon: process each new closed day")
     ap.add_argument("--poll-minutes", type=int, default=POLL_MINUTES_DEFAULT, help="loop wake interval")
@@ -572,6 +761,8 @@ def main() -> None:
         status()
     elif args.reconcile:
         reconcile(args.data, DEPLOY)
+    elif args.reconcile_broker:
+        reconcile_broker()
     elif args.once:
         run_once(args.data, DEPLOY, do_fetch=not args.no_fetch,
                  broker=args.broker, allow_mainnet=args.allow_mainnet)

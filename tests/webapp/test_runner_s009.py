@@ -5,10 +5,17 @@ _worker_s009 imports it locally at call time -- see webapp/runner.py's
 `from bot.s009_paper import run_cycle_for_account as run_s009_cycle` inside
 the function) so these tests exercise the DB plumbing (creds building,
 status/last_cycle_at updates, dispatch table) without touching Bybit or the
-funding-carry engine. The one thing every test here defends: broker="off",
-allow_mainnet=False must ALWAYS be what reaches run_cycle_for_account
-through this DB-driven path -- enabling real orders here is a separate,
-explicit decision, not a side effect of this refactor.
+funding-carry engine.
+
+Since 2026-08-13 (migration 004) real-order gating is per-link via
+AccountStrategy.broker_mode ("off"/"dry"/"execute", default "off"), not a
+single hardcoded switch for the whole worker -- see _worker_s009's own
+docstring. The things this file defends now: (1) the DEFAULT is still
+"off"/allow_mainnet=False when a link's broker_mode is left unset, so
+registering a new S009 account_strategy row never accidentally starts
+placing real orders; (2) "execute" only reaches allow_mainnet=True when the
+linked Account is ALSO env="mainnet" -- a testnet/demo account flipped to
+"execute" must not be able to trade mainnet.
 """
 from __future__ import annotations
 
@@ -79,10 +86,37 @@ def fake_run_cycle(monkeypatch):
     return fake
 
 
-def test_worker_s009_always_forces_shadow_only(session, s009_link, fake_run_cycle):
+def test_worker_s009_defaults_to_shadow_only(session, s009_link, fake_run_cycle):
+    assert s009_link.broker_mode == "off"                # model default, unset by the fixture
     runner._worker_s009(s009_link, session, None)
     assert len(fake_run_cycle.calls) == 1
     assert fake_run_cycle.calls[0]["broker"] == "off"
+    assert fake_run_cycle.calls[0]["allow_mainnet"] is False
+
+
+def test_worker_s009_execute_on_mainnet_account_reaches_allow_mainnet(session, s009_link, fake_run_cycle):
+    assert s009_link.account.env == "mainnet"             # s009_link fixture's own setup
+    s009_link.broker_mode = "execute"
+    session.commit()
+    runner._worker_s009(s009_link, session, None)
+    assert fake_run_cycle.calls[0]["broker"] == "execute"
+    assert fake_run_cycle.calls[0]["allow_mainnet"] is True
+
+
+def test_worker_s009_execute_on_non_mainnet_account_stays_gated(session, s009_link, fake_run_cycle):
+    s009_link.broker_mode = "execute"
+    s009_link.account.env = "testnet"
+    session.commit()
+    runner._worker_s009(s009_link, session, None)
+    assert fake_run_cycle.calls[0]["broker"] == "execute"
+    assert fake_run_cycle.calls[0]["allow_mainnet"] is False  # env gate, not just broker_mode
+
+
+def test_worker_s009_dry_mode_passes_through_without_allow_mainnet(session, s009_link, fake_run_cycle):
+    s009_link.broker_mode = "dry"
+    session.commit()
+    runner._worker_s009(s009_link, session, None)
+    assert fake_run_cycle.calls[0]["broker"] == "dry"
     assert fake_run_cycle.calls[0]["allow_mainnet"] is False
 
 

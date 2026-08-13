@@ -2,6 +2,27 @@
 periodically by launchd (StartCalendarInterval, see
 deployment/com.algo.s009-paper.plist), NOT a long-running loop process.
 
+DEPRECATED as the live path (2026-08-13): superseded by the Docker/Ofelia
+dispatcher (webapp/runner.py's _worker_s009, scheduled via
+deployment/schedule.yml + scripts/scheduler_tick.py). Real order placement
+for Bybit-algo009 (the account this launchd job used to drive directly with
+`--broker execute --allow-mainnet`) is now gated per-account_strategy-row via
+AccountStrategy.broker_mode="execute" on account_strategy id=3 (see
+webapp/schemas/enums.py::BrokerMode and _worker_s009's own docstring) --
+verified against the live account (equity fetch + computed rebalance plan
+matched the legacy path's own target book) before cutover. The launchd job
+this module depends on (com.algo.s009-paper.plist) is deliberately NOT
+installed in ~/Library/LaunchAgents/ anymore -- both paths independently
+manage the SAME real Bybit mainnet account, so running both at once means
+two processes racing to open/close/rebalance the same positions. This file
+is kept only as a manual break-glass fallback: `scripts/s009_tick_install.sh
+install`, and ONLY after first setting account_strategy id=3's broker_mode
+back to "off" or "dry" (or otherwise confirming the Docker path is stopped
+for this account) -- see deployment/com.algo.s009-paper.plist's own
+warning. Do not re-install this plist as a "just in case" convenience;
+every extra place it can be loaded from is exactly the risk this
+deprecation removes.
+
 Why this exists instead of `bot/s009_paper.py --loop`: that flag still works
 for manual/foreground testing, but it is the same architecture (one process
 alive for ~24h/day, sleeping in short chunks between checks) that S007's

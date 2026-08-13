@@ -2,7 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- S009 funding-carry live scheduler tick (scripts/s009_tick.py). launchd
+    <!-- DEPRECATED as the live path (2026-08-13) -- see scripts/s009_tick.py's
+         module docstring for the full explanation. Superseded by the
+         Docker/Ofelia dispatcher (webapp/runner.py's _worker_s009, gated
+         per-account_strategy-row via AccountStrategy.broker_mode, scheduled
+         via deployment/schedule.yml + scripts/scheduler_tick.py). NOT
+         installed in ~/Library/LaunchAgents/ anymore. Manual break-glass
+         fallback only -- before ever re-installing/loading this, first set
+         account_strategy id=3 (Bybit-algo009)'s broker_mode back to "off" or
+         "dry" (see webapp/schemas/enums.py::BrokerMode), since both paths
+         independently manage the SAME real Bybit mainnet account.
+
+         S009 funding-carry live scheduler tick (scripts/s009_tick.py). launchd
          invokes it once a wall-clock minute, around the clock (crypto trades
          24/7; there is no session window to gate on the way S007 has one).
          It is NOT a long-running process: each invocation reads S009's own
