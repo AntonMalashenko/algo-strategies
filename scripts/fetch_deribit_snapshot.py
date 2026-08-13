@@ -174,8 +174,14 @@ def fetch_book_summary(currency: str) -> pd.DataFrame:
 
 
 def fetch_instruments(currency: str) -> pd.DataFrame:
+    # "false", not False: requests serializes a Python bool to the query
+    # string as "False"/"True" (capital), but Deribit's API rejects anything
+    # other than lowercase "true"/"false" with a 400 (verified live
+    # 2026-08-13 -- this was the original bug that made every real
+    # invocation of this job fail despite the fully-mocked test suite
+    # passing).
     rows = _deribit_get("public/get_instruments",
-                        {"currency": currency, "kind": "option", "expired": False})
+                        {"currency": currency, "kind": "option", "expired": "false"})
     if not rows:
         return pd.DataFrame(columns=INSTRUMENT_FIELDS)
     try:
