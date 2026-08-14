@@ -191,14 +191,29 @@ def test_creds_are_passed_straight_to_bybitexec(tmp_path, fake_bybit):
         account_key="acct-a", creds={"api_key": "k", "api_secret": "s"}, cfg=s009.DEPLOY,
         state=_store(tmp_path), logger=_log(tmp_path), do_fetch=False, drop_forming=False,
         broker="dry", allow_mainnet=False)
-    assert fake_bybit.last_init_kwargs == {"api_key": "k", "api_secret": "s", "allow_mainnet": False}
+    assert fake_bybit.last_init_kwargs == {
+        "api_key": "k", "api_secret": "s", "env": None, "allow_mainnet": False}
 
 
 def test_no_creds_falls_back_to_accounts_yml_by_account_key(tmp_path, fake_bybit):
     s009.run_cycle_for_account(
         account_key="Bybit-algo009", creds=None, cfg=s009.DEPLOY, state=_store(tmp_path),
         logger=_log(tmp_path), do_fetch=False, drop_forming=False, broker="dry", allow_mainnet=False)
-    assert fake_bybit.last_init_kwargs == {"name": "Bybit-algo009", "allow_mainnet": False}
+    assert fake_bybit.last_init_kwargs == {"name": "Bybit-algo009", "env": None, "allow_mainnet": False}
+
+
+def test_env_is_passed_straight_to_bybitexec(tmp_path, fake_bybit):
+    """Found live 2026-08-13/14: run_cycle_for_account used to construct
+    BybitExec with no env at all, so it always fell back to the
+    BYBIT_TESTNET OS env var -- unset in the Ofelia dispatch container, so
+    every DB-driven cycle silently hit api-testnet.bybit.com with
+    mainnet-only credentials (401 Client Error: API key is invalid) for a
+    real-money mainnet account. env must reach BybitExec unchanged."""
+    s009.run_cycle_for_account(
+        account_key="acct-a", creds={"api_key": "k", "api_secret": "s"}, cfg=s009.DEPLOY,
+        state=_store(tmp_path), logger=_log(tmp_path), do_fetch=False, drop_forming=False,
+        broker="dry", allow_mainnet=False, env="mainnet")
+    assert fake_bybit.last_init_kwargs["env"] == "mainnet"
 
 
 def test_broker_off_never_touches_bybitexec(tmp_path, fake_bybit):

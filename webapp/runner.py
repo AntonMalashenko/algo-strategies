@@ -304,7 +304,7 @@ def _worker_s009(link: AccountStrategy, session, budget_s: float | None) -> int:
 
     result = run_s009_cycle(
         account_key=acc.label or f"acct{acc.id}", creds=creds, cfg=DEPLOY, state=state,
-        logger=logger, broker=broker_mode, allow_mainnet=allow_mainnet)
+        logger=logger, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env)
 
     ok = True
     if result["error"]:

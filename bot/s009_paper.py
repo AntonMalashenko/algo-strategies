@@ -380,6 +380,7 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
                           state, logger: StrategyLogger, data_dir: Path = DATA_DIR,
                           do_fetch: bool = True, drop_forming: bool = True,
                           broker: str = "off", allow_mainnet: bool = False,
+                          env: str | None = None,
                           ledger_file: Path | None = None,
                           broker_ledger_file: Path | None = None) -> dict:
     """One S009 daily cycle for an arbitrary account, reusing the exact
@@ -397,6 +398,15 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
     `creds`: {"api_key", "api_secret"} passed straight to BybitExec, or None
     to fall back to accounts.yml resolution via `account_key` as the yml
     `name:` (what `run_once()` below still does, unchanged).
+    `env`: "mainnet"/"testnet"/"demo", passed straight to BybitExec -- the
+    DB-driven caller (webapp/runner.py::_worker_s009) MUST pass its
+    Account.env here explicitly. Without it, BybitExec falls back to the
+    BYBIT_TESTNET env var (default "true"/testnet, see that class's own
+    docstring) -- found live 2026-08-13/14: the Ofelia dispatch container
+    never sets BYBIT_TESTNET, so every DB-driven cycle silently ran against
+    api-testnet.bybit.com with mainnet-only credentials (401 Client Error:
+    API key is invalid), for a real-money mainnet account, for ~17h before
+    anyone noticed -- None here (the old default) reproduces exactly that.
     `ledger_file`: append each booked day's row to this CSV, or write no
     ledger at all when `None` (the default). There is no per-account ledger
     file yet -- a bare filename passed in here would collide across
@@ -486,8 +496,8 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
             if broker != "off" and target:
                 from bot.bybit_exec import BybitExec
                 client = (BybitExec(api_key=creds.get("api_key"), api_secret=creds.get("api_secret"),
-                                    allow_mainnet=allow_mainnet) if creds
-                         else BybitExec(name=account_key, allow_mainnet=allow_mainnet))
+                                    env=env, allow_mainnet=allow_mainnet) if creds
+                         else BybitExec(name=account_key, env=env, allow_mainnet=allow_mainnet))
                 broker_env = client.env
                 broker_equity = client.wallet_equity()
 

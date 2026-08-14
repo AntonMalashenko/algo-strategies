@@ -120,6 +120,27 @@ def test_worker_s009_dry_mode_passes_through_without_allow_mainnet(session, s009
     assert fake_run_cycle.calls[0]["allow_mainnet"] is False
 
 
+def test_worker_s009_passes_account_env_to_run_cycle(session, s009_link, fake_run_cycle):
+    """Found live 2026-08-13/14: _worker_s009 computed allow_mainnet from
+    acc.env but never passed acc.env itself down to run_cycle_for_account,
+    so BybitExec always fell back to the BYBIT_TESTNET OS env var (unset in
+    the Ofelia dispatch container -> testnet) regardless of the account's
+    real, DB-configured env -- a mainnet account's real API key got a 401
+    against api-testnet.bybit.com for ~17h before anyone noticed. This is
+    the one assertion that would have caught it: allow_mainnet alone gates
+    ORDER PLACEMENT, not which base URL/credential namespace is used."""
+    assert s009_link.account.env == "mainnet"
+    runner._worker_s009(s009_link, session, None)
+    assert fake_run_cycle.calls[0]["env"] == "mainnet"
+
+
+def test_worker_s009_passes_non_mainnet_account_env_to_run_cycle(session, s009_link, fake_run_cycle):
+    s009_link.account.env = "testnet"
+    session.commit()
+    runner._worker_s009(s009_link, session, None)
+    assert fake_run_cycle.calls[0]["env"] == "testnet"
+
+
 def test_worker_s009_builds_creds_from_account_credentials(session, s009_link, fake_run_cycle):
     runner._worker_s009(s009_link, session, None)
     assert fake_run_cycle.calls[0]["creds"] == {"api_key": "k", "api_secret": "s"}

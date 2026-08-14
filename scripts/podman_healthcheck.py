@@ -29,6 +29,8 @@ Usage (manual, one-shot):
 """
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import time
@@ -72,6 +74,46 @@ def _vm_epoch() -> int | None:
         return None
 
 
+def _compose_env() -> dict:
+    """os.environ plus DOCKER_HOST pointed at whatever socket THIS machine
+    start actually bound to.
+
+    Found live 2026-08-13: `machine start` does not always bind the
+    standard /var/run/docker.sock -- if anything (even a since-exited
+    process) held that address at start time, podman logs "Another process
+    was listening on the default Docker API socket address" and silently
+    falls back to a per-start temp path instead
+    (.../T/podman/<machine>-api.sock). `podman compose` shells out to the
+    docker-compose binary, which only speaks to DOCKER_HOST or the default
+    socket -- with no DOCKER_HOST set it fails outright
+    ("Cannot connect to the Docker daemon") against that fallback path, so
+    the "bring ofelia back up" heal step was silently doing nothing on any
+    restart that hit the fallback. `machine inspect` reports the ACTUAL
+    bound path regardless of which case happened, so reading it fresh here
+    (rather than assuming the default) makes this correct either way."""
+    env = dict(os.environ)
+    try:
+        proc = subprocess.run([PODMAN, "machine", "inspect", MACHINE_NAME],
+                              capture_output=True, text=True, timeout=SSH_TIMEOUT_SECONDS)
+        info = json.loads(proc.stdout)[0]
+        sock_path = info["ConnectionInfo"]["PodmanSocket"]["Path"]
+        env["DOCKER_HOST"] = f"unix://{sock_path}"
+    except Exception as exc:
+        LOG.error("could not resolve the machine's forwarded socket path -- "
+                  "falling back to the default DOCKER_HOST", exc=exc)
+    return env
+
+
+def _ofelia_running() -> bool:
+    try:
+        proc = subprocess.run(
+            [PODMAN, "ps", "--filter", "name=algo-ofelia", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=SSH_TIMEOUT_SECONDS)
+        return bool(proc.stdout.strip())
+    except Exception:
+        return False
+
+
 def _heal(reason: str) -> None:
     """stop+start the machine, bring ofelia back up, verify. Shared by both
     failure modes below -- `machine start` on an already-stopped machine is a
@@ -87,22 +129,39 @@ def _heal(reason: str) -> None:
     tolerates."""
     LOG.error(reason, exc=RuntimeError(reason))
 
-    for args, timeout in (
-        ([PODMAN, "machine", "stop", MACHINE_NAME], MACHINE_STOP_TIMEOUT_SECONDS),
-        ([PODMAN, "machine", "start", MACHINE_NAME], MACHINE_START_TIMEOUT_SECONDS),
-        ([PODMAN, "compose", "up", "-d", "ofelia"], COMPOSE_TIMEOUT_SECONDS),
+    for args, timeout, env in (
+        ([PODMAN, "machine", "stop", MACHINE_NAME], MACHINE_STOP_TIMEOUT_SECONDS, None),
+        ([PODMAN, "machine", "start", MACHINE_NAME], MACHINE_START_TIMEOUT_SECONDS, None),
+        ([PODMAN, "compose", "up", "-d", "ofelia"], COMPOSE_TIMEOUT_SECONDS, _compose_env()),
     ):
         try:
-            subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout)
+            subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout,
+                           env=env)
         except Exception as exc:
             LOG.error(f"heal step {args!r} failed", exc=exc)
 
+    # Retry the compose step alone once with a freshly-resolved socket path --
+    # covers the case where `machine start` itself only settled (bound its
+    # real socket) after the first compose attempt had already raced past it.
+    ofelia_ok = _ofelia_running()
+    if not ofelia_ok:
+        try:
+            subprocess.run([PODMAN, "compose", "up", "-d", "ofelia"], cwd=str(ROOT),
+                           capture_output=True, text=True, timeout=COMPOSE_TIMEOUT_SECONDS,
+                           env=_compose_env())
+        except Exception as exc:
+            LOG.error("ofelia retry-start failed", exc=exc)
+        ofelia_ok = _ofelia_running()
+
     new_vm_epoch = _vm_epoch()
-    if new_vm_epoch is not None and abs(int(time.time()) - new_vm_epoch) <= DRIFT_THRESHOLD_SECONDS:
+    clock_ok = (new_vm_epoch is not None
+               and abs(int(time.time()) - new_vm_epoch) <= DRIFT_THRESHOLD_SECONDS)
+    if clock_ok and ofelia_ok:
         LOG.event("healed")
     else:
-        LOG.error("podman machine restart did not fix it -- needs manual attention",
-                  exc=RuntimeError(f"still unreachable or drifted after restart (new_vm_epoch={new_vm_epoch})"))
+        LOG.error("podman machine restart did not fully fix it -- needs manual attention",
+                  exc=RuntimeError(f"clock_ok={clock_ok} (new_vm_epoch={new_vm_epoch}) "
+                                   f"ofelia_ok={ofelia_ok}"))
 
 
 def check_and_heal() -> None:
