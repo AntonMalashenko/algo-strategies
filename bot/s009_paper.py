@@ -333,23 +333,31 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
 
         tgt_qty = math.copysign(_floor_step(w * equity / price, inst.qty_step), w) if w else 0.0
         delta = tgt_qty - cur
-        if abs(delta) < inst.min_qty:
+        # Two INDEPENDENT exchange floors, not one: min_qty is a unit-count
+        # minimum, min_notional (Bybit's own separate $5-ish floor) is a
+        # dollar-value minimum -- a delta can clear the first and still fail
+        # the second (e.g. TRXUSDT: min_qty=1 unit =~ $0.13, min_notional=$5).
+        # Checking min_qty alone let a doomed order reach Bybit and get
+        # rejected live (error 110094) on every cycle for the same legs.
+        delta_notional = abs(delta) * price
+        if abs(delta) < inst.min_qty or delta_notional < inst.min_notional:
             # A wanted leg (w != 0) that rounds to less than the exchange's min
-            # order size is a real gap on a small account (e.g. BTC's ~$65+
-            # min notional can exceed this leg's whole target allocation at
-            # equity=$50) — surface it instead of silently dropping the leg,
-            # so a thin book isn't mistaken for "target == actual".
-            if w and abs(tgt_qty) < inst.min_qty:
-                min_notional = round(inst.min_qty * price, 2)
+            # order size/value is a real gap on a small account (e.g. BTC's
+            # ~$65+ min notional can exceed this leg's whole target allocation
+            # at equity=$50) — surface it instead of silently dropping the
+            # leg, so a thin book isn't mistaken for "target == actual".
+            if w and (abs(tgt_qty) < inst.min_qty or abs(tgt_qty) * price < inst.min_notional):
+                min_notional = round(max(inst.min_qty * price, inst.min_notional), 2)
                 log.event("skip_min_qty", cycle=cid, symbol=sym, target_weight=w,
                           target_notional=round(w * equity, 2), min_qty=inst.min_qty,
                           min_notional=min_notional, price=price)
                 print(f"  SKIP {sym}: target notional ${w * equity:.2f} < exchange min "
-                      f"${min_notional:.2f} (min_qty={inst.min_qty}) — leg not opened")
+                      f"${min_notional:.2f} (min_qty={inst.min_qty}, min_notional={inst.min_notional}) "
+                      f"— leg not opened")
             continue
         side = "Buy" if delta > 0 else "Sell"
         qty = round(_floor_step(delta, inst.qty_step), 8)
-        if qty < inst.min_qty:
+        if qty < inst.min_qty or qty * price < inst.min_notional:
             continue
         rec = {"symbol": sym, "side": side, "qty": qty, "ref_price": price,
                "target_qty": tgt_qty, "cur_qty": cur}

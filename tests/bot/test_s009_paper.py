@@ -88,7 +88,8 @@ class _FakeBybitExec:
         return 100.0
 
     def instrument(self, sym):
-        return types.SimpleNamespace(symbol=sym, qty_step=0.01, min_qty=0.01, tick_size=0.01)
+        return types.SimpleNamespace(symbol=sym, qty_step=0.01, min_qty=0.01, tick_size=0.01,
+                                     min_notional=0.0)
 
     def place_market(self, sym, side, qty):
         return {"orderId": "abc123"}
@@ -273,3 +274,82 @@ def test_run_cycle_for_account_without_ledger_file_writes_no_csv(tmp_path):
         do_fetch=False, drop_forming=False, broker="off")   # no ledger_file -- the DB-driven default
 
     assert list(tmp_path.glob("*.csv")) == []
+
+
+# --- reconcile_to_target: exchange min-size guards ------------------------
+
+class _FakeReconcileClient:
+    """Minimal broker double for reconcile_to_target() itself, not the
+    whole cycle -- lets these tests set exact price/instrument numbers per
+    symbol instead of routing through the funding-carry engine fixtures."""
+
+    def __init__(self, positions, prices, instruments):
+        self._positions = positions
+        self._prices = prices
+        self._instruments = instruments
+        self.placed = []
+
+    def positions(self):
+        return dict(self._positions)
+
+    def ticker_price(self, sym):
+        return self._prices[sym]
+
+    def instrument(self, sym):
+        return self._instruments[sym]
+
+    def place_market(self, sym, side, qty):
+        self.placed.append((sym, side, qty))
+        return {"orderId": "abc123"}
+
+    def close_position(self, sym, side):
+        self.placed.append((sym, side, "ALL"))
+        return {"orderId": "abc123"}
+
+    def recent_fill_price(self, sym, oid):
+        return self._prices[sym]
+
+
+def _instr(qty_step, min_qty, min_notional=0.0):
+    return types.SimpleNamespace(qty_step=qty_step, min_qty=min_qty, tick_size=0.01,
+                                 min_notional=min_notional)
+
+
+def test_leg_clearing_min_qty_but_not_min_notional_is_skipped_not_submitted(tmp_path):
+    """Found live 2026-08-13/14: TRXUSDT (min_qty=1 unit =~ $0.13,
+    min_notional=$5) and NEARUSDT (min_qty=0.1 =~ $0.3, min_notional=$5)
+    kept getting a delta order SUBMITTED (it cleared min_qty easily) and
+    REJECTED by Bybit itself (110094: minimum order value 5USDT), recurring
+    across multiple days because the code only ever checked min_qty."""
+    client = _FakeReconcileClient(
+        positions={}, prices={"TRXUSDT": 0.13},
+        instruments={"TRXUSDT": _instr(qty_step=1.0, min_qty=1.0, min_notional=5.0)})
+    # target weight small enough that tgt_qty is a handful of units (well
+    # above min_qty=1) but worth well under $5 at $0.13/unit.
+    plan = s009.reconcile_to_target(client, {"TRXUSDT": 0.05}, equity=20.0,
+                                    log=_log(tmp_path), cid="c1", execute=True)
+    assert plan == []
+    assert client.placed == []
+
+
+def test_leg_clearing_both_floors_is_placed_normally(tmp_path):
+    client = _FakeReconcileClient(
+        positions={}, prices={"BTCUSDT": 60000.0},
+        instruments={"BTCUSDT": _instr(qty_step=0.001, min_qty=0.001, min_notional=5.0)})
+    plan = s009.reconcile_to_target(client, {"BTCUSDT": 0.3}, equity=1000.0,
+                                    log=_log(tmp_path), cid="c1", execute=True)
+    assert len(plan) == 1
+    assert client.placed and client.placed[0][0] == "BTCUSDT"
+
+
+def test_min_notional_defaulting_to_zero_falls_back_to_qty_only_check(tmp_path):
+    """A symbol/category Bybit doesn't report minNotionalValue for
+    (Instrument.min_notional defaults to 0.0) must behave exactly as before
+    this field existed -- the qty-only guard, not an always-fail notional
+    check."""
+    client = _FakeReconcileClient(
+        positions={}, prices={"BTCUSDT": 60000.0},
+        instruments={"BTCUSDT": _instr(qty_step=0.001, min_qty=0.001, min_notional=0.0)})
+    plan = s009.reconcile_to_target(client, {"BTCUSDT": 0.3}, equity=1000.0,
+                                    log=_log(tmp_path), cid="c1", execute=True)
+    assert len(plan) == 1

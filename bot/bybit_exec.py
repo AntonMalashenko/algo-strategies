@@ -48,6 +48,14 @@ class Instrument:
     qty_step: float
     min_qty: float
     tick_size: float
+    # Bybit's OWN separate floor, in USDT notional (qty * price) -- distinct
+    # from min_qty (a unit-count floor). A qty that clears min_qty can still
+    # be worth far less than this (e.g. TRXUSDT: min_qty=1 unit =~ $0.13 at
+    # ~$0.13/TRX, vs min_notional=$5) -- found live 2026-08-13/14: every
+    # such order was submitted anyway and rejected by Bybit itself (POST
+    # /v5/order/create error 110094: "Order does not meet minimum order
+    # value 5USDT"), recurring across multiple days for the same legs.
+    min_notional: float = 0.0
 
 
 class BybitExec:
@@ -130,7 +138,12 @@ class BybitExec:
         res = self._get("/v5/market/instruments-info", {"category": self.category, "symbol": symbol}, signed=False)
         it = res["list"][0]
         lot = it["lotSizeFilter"]; pf = it["priceFilter"]
-        return Instrument(symbol, float(lot["qtyStep"]), float(lot["minOrderQty"]), float(pf["tickSize"]))
+        # minNotionalValue: absent on some categories/symbols -- 0.0 means
+        # "no separate notional floor known", not "no floor" (reconcile_to_
+        # target's guard degrades to the qty-only check in that case, same
+        # as before this field existed).
+        return Instrument(symbol, float(lot["qtyStep"]), float(lot["minOrderQty"]), float(pf["tickSize"]),
+                          float(lot.get("minNotionalValue") or 0.0))
 
     def recent_fill_price(self, symbol: str, order_id: str) -> float | None:
         """Average execution price for an order id (for slippage measurement)."""
