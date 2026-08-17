@@ -111,7 +111,22 @@ class CTraderAdapter:
         req = ProtoOAAccountAuthReq()
         req.ctidTraderAccountId = self.account
         req.accessToken = self.token
-        return self.client.send(req)
+        d = self.client.send(req)
+
+        def check(resp):
+            # Same silent-success trap as _load_symbols' store() (see the
+            # comment there): an account-auth rejection (expired token,
+            # wrong account id, revoked access) comes back as a normal
+            # ProtoOAErrorRes, not an errback -- unchecked, every downstream
+            # call in this cycle then fails with a misleading "Trading
+            # account is not authorized" instead of the real reason.
+            msg = Protobuf.extract(resp)
+            if type(msg).__name__ == "ProtoOAErrorRes":
+                raise RuntimeError(f"account auth failed: {msg.errorCode}: "
+                                   f"{getattr(msg, 'description', '')}")
+            return resp
+        d.addCallback(check)
+        return d
 
     def _load_symbols(self):
         req = ProtoOASymbolsListReq()
@@ -120,6 +135,14 @@ class CTraderAdapter:
 
         def store(resp):
             msg = Protobuf.extract(resp)
+            # A ProtoOAErrorRes (e.g. account-auth expired, session limit,
+            # symbol list denied) has no `symbol` field -- accessing it
+            # crashed as an opaque AttributeError that hid the broker's own
+            # errorCode/description (found live 2026-08-17: every S007
+            # cycle failed this way from session start, with no way to tell
+            # what was actually wrong from the logged error).
+            if type(msg).__name__ == "ProtoOAErrorRes":
+                raise RuntimeError(f"{msg.errorCode}: {getattr(msg, 'description', '')}")
             self._symbols = {s.symbolName.upper(): s for s in msg.symbol}
             return msg
         d.addCallback(store)
