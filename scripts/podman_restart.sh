@@ -91,11 +91,18 @@ echo "=== 3/4: restarting the compose stack ==="
 "$PODMAN" compose up -d --force-recreate ofelia
 
 echo "=== 4/4: cleaning up leftover $WORKER_IMAGE containers (mandatory, always runs) ==="
+# NOTE: "status=dead" deliberately omitted -- found live 2026-08-21, this
+# podman build (podman-machine-default, libkrun) rejects it outright
+# ("unknown container state: dead: invalid argument") instead of just
+# matching zero containers, which aborted the whole script under set -e.
+# "created"/"exited" cover every case actually seen in practice; a
+# genuinely wedged "dead" container (rare -- host OOM-kills mid-run) will
+# just need `podman rm -f` by hand until/unless this podman version adds
+# support back.
 STALE_IDS="$("$PODMAN" ps -a \
   --filter "ancestor=$WORKER_IMAGE" \
   --filter "status=created" \
   --filter "status=exited" \
-  --filter "status=dead" \
   -q)"
 if [ -n "$STALE_IDS" ]; then
   echo "$STALE_IDS" | xargs "$PODMAN" rm -f
