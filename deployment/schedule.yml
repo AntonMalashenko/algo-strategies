@@ -19,22 +19,68 @@ strategies:
   # (TRADE_START/EXIT_END = "10:00"/"16:59", bot/s007_config.py:111).
   - name: S007
     schedule: "* 10-16 * * 1-5"
-  # S009 rebalances at most once a day (a new closed UTC day), but unlike
-  # S007's tick this one has NO cheap "already up to date, skip" check
+  # S009 rebalances at most once a day (a new closed UTC day). It has a
+  # cheap "already up to date, skip" check (added 2026-08-18, see
+  # decisions-log.md same date, bot/s009_paper.py::run_cycle_for_account)
   # before webapp/runner.py -> _worker_s009 -> run_cycle_for_account does a
   # real (public, unauthenticated) Bybit data refresh + full engine
-  # recompute -- every invocation, not just the first one that finds new
-  # data. Scheduling it every minute like S007 would hammer Bybit's public
-  # API 1440x/day for nothing, so this fires once daily instead, shortly
-  # after UTC midnight so the just-closed day's funding/kline data has had
-  # time to land. Self-healing if a run is missed or the data isn't ready
-  # yet: run_cycle_for_account books every day between last_day and the
-  # latest available one, not just "yesterday", so the next successful run
-  # catches up automatically -- no separate retry schedule needed.
-  # Still `broker="off"` hardcoded in _worker_s009 -- shadow-only, no
-  # orders, regardless of how often this fires.
+  # recompute -- so most invocations that find nothing new are a free,
+  # network-free no-op. That is what lets this fire every 15 minutes
+  # instead of once daily: a missed exact cron slot (Ofelia/container down
+  # at 00:05) used to strand the account un-rebalanced until the NEXT
+  # day's single slot or a manual run -- plain cron has no "catch up on a
+  # missed minute" behavior, unlike the old macOS launchd
+  # StartCalendarInterval design (scripts/s009_tick.py's module docstring).
+  # Self-healing once it DOES fire: run_cycle_for_account books every day
+  # between last_day and the latest available one, not just "yesterday",
+  # so it catches up on however many days were actually missed.
+  # `broker_mode` is a per-account_strategy DB row (see
+  # webapp/schemas/enums.py::BrokerMode, _worker_s009's own docstring), NOT
+  # a hardcoded default here -- Bybit-algo009's row has been "execute"
+  # since 2026-08-13, so this DOES place real mainnet orders; it is not
+  # shadow-only. Tune the 15-minute cadence in this one line if a faster
+  # or slower self-heal window is wanted -- no code change needed.
   - name: S009
-    schedule: "5 0 * * *"
+    schedule: "*/15 * * * *"
+  # S011 (RSI(2)-portfolio) rebalances at most once a day, like S009, but
+  # its "day" boundary is the cTrader broker's own D1 bar close across a
+  # MIXED universe (indices + FX + gold + 2 crypto CFDs, all on the same
+  # CTRADER account -- see bot/s011_paper.py's module docstring for the
+  # full "one fixed local-time cutover" reasoning and its documented
+  # deviation from the Yahoo-sourced backtest's per-instrument
+  # exchange-session boundaries). 22:05 (container-local, Europe/Kyiv --
+  # see the file header note above) is chosen to fire after essentially
+  # every included market's own session has closed for the day (European
+  # index sessions by ~17:30 UTC, NYSE/NASDAQ by ~21:00 UTC winter/~20:00
+  # UTC summer) -- crypto legs simply get no signal check on weekends,
+  # same as every other asset in this universe, which prints no weekend
+  # bars either.
+  #
+  # NOTE this comment previously said "still broker_mode='off' by default
+  # -- shadow-only" -- that went stale: AccountStrategy row for the
+  # ctrader-48354548 account has been broker_mode="execute" since
+  # 2026-08-19, i.e. this DOES place real orders. `broker_mode` is still a
+  # per-account_strategy DB row (see webapp/schemas/enums.py::BrokerMode),
+  # not a hardcoded default here -- do not assume shadow-only from this
+  # file alone.
+  #
+  # Like S009 (see that entry's comment above, and decisions-log.md
+  # 2026-08-18), a single once-daily cron slot has NO resilience to a
+  # missed minute -- and S011 was actually WORSE off than S009 was
+  # pre-fix, because run_cycle_for_account had no "already done today"
+  # state check at all (fixed 2026-08-21, see decisions-log.md same date,
+  # bot/s011_paper.py::_expected_last_closed_trading_date +
+  # run_cycle_for_account's up-to-date pre-check) -- confirmed in
+  # practice: the account went un-rebalanced all of 2026-08-20 (a normal
+  # weekday) after a missed 22:05 slot, and only caught up 2026-08-21 via
+  # a manual on-demand run, not the scheduler. Same fix, same shape as
+  # S009: a cheap, network-free up-to-date check (this one also skips
+  # importing the cTrader SDK module entirely on a no-op tick) lets this
+  # fire every 15 minutes on weekdays instead of once daily, so a missed
+  # exact-minute trigger self-heals within ~15 minutes instead of a full
+  # trading day.
+  - name: S011
+    schedule: "*/15 * * * 1-5"
 
 # Background jobs unrelated to any single (account, strategy) pair (data
 # refresh, cleanup, ...). `command` is run as-is via subprocess (module path,

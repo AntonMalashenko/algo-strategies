@@ -4,8 +4,9 @@ Strategy-agnostic dispatch: STRATEGY_WORKERS (bottom of this module) maps a
 Strategy.name to the worker function that knows how to run one cycle for
 one (account, strategy) row. Adding a new strategy here means writing that
 one worker function and registering it -- run_worker()/run_coordinator()
-themselves never need to change. S007 (_worker_s007, CTRADER) and S009
-(_worker_s009, BYBIT) are registered; S009's real-order gating is
+themselves never need to change. S007 (_worker_s007, CTRADER), S009
+(_worker_s009, BYBIT), and S011 (_worker_s011, CTRADER) are registered;
+S009's real-order gating is
 per-account_strategy-row (AccountStrategy.broker_mode, default "off" --
 see webapp/schemas/enums.py::BrokerMode and _worker_s009's own docstring),
 not a single hardcoded switch for the whole worker. S009's per-account
@@ -329,12 +330,99 @@ def _worker_s009(link: AccountStrategy, session, budget_s: float | None) -> int:
     return 0 if ok else 1
 
 
+def _worker_s011(link: AccountStrategy, session, budget_s: float | None) -> int:
+    """Run one S011/CTRADER cycle for one (account, strategy) DB row.
+
+    Closer to _worker_s009 than _worker_s007: once-a-day whole-portfolio
+    cycle, DB-backed per-link state (DBStateStore, same collision reasoning
+    as S009's `strategy_state` table use), broker_mode gated per-link. The
+    one thing that ISN'T S009-shaped: the broker is CTRADER, not BYBIT --
+    unlike the ticket's originally-flagged "S011 needs two brokers" concern,
+    Anton confirmed (2026-08-18) this account's cTrader broker also lists
+    the crypto legs (ETHUSD/SOLUSD or similar), so the whole 12-instrument
+    live-deploy universe (bot/s011_paper.py::DEPLOY_UNIVERSE) runs on ONE
+    CTRADER account -- no S011-CTRADER/S011-BYBIT split, no cross-broker
+    capital coordination to build.
+
+    No Position-table writes yet, deliberately: S011 opens/closes market
+    orders per-instrument via CTraderS011 (bot/ctrader_s011.py), which DOES
+    have a real per-instrument positionId (unlike S009's Bybit net-position
+    weight) -- webapp/sync_positions.py is already "CTRADER-only by design",
+    so wiring S011 into it is plausible future work, not done here (this
+    first cut mirrors S009's "book is a target, not a DB Position row" shape
+    for simplicity while the strategy is still shadow/paper-only; revisit
+    once broker_mode moves past "off").
+
+    `link.broker_mode` gates real orders per-link exactly like S009's own
+    gate (see that worker's docstring) -- `allow_mainnet=True` additionally
+    requires `Account.env == "live"` (cTrader's own real-money env value,
+    NOT Bybit's "mainnet" -- see bot/s011_paper.py::run_cycle_for_account's
+    own note on this naming mismatch).
+    """
+    from bot.s011_paper import run_cycle_for_account as run_s011_cycle, DEPLOY
+
+    account_strategy_id = link.id
+    acc = link.account
+    strat = link.strategy
+    if acc.broker != "CTRADER":
+        raise SystemExit(
+            f"account_strategy {account_strategy_id} is broker={acc.broker} -- "
+            f"the S011 worker only drives CTRADER accounts")
+    user = acc.user
+
+    broker_mode = link.broker_mode or "off"
+    allow_mainnet = broker_mode == "execute" and acc.env == "live"
+
+    creds_row = acc.credentials
+    creds = dict(client_id=creds_row.get("client_id"), client_secret=creds_row.get("client_secret"),
+                access_token=creds_row.get("access_token"),
+                account_id=int(acc.external_account_id) if acc.external_account_id else None,
+                host=acc.broker_host)
+    logger = StrategyLogger(f"S011-acct{acc.external_account_id or acc.id}",
+                            log_root=str(ROOT / "reports" / "logs"))
+    state = DBStateStore(link.id, session)
+
+    print(f"[runner] S011 cycle starting: account_strategy={link.id} account={acc.id} "
+          f"({acc.label or acc.id}) user={user.username} broker_mode={broker_mode}")
+    _log_event(session, LogKind.CYCLE_START, message="cycle start", user=user, account=acc,
+              strategy=strat)
+    session.commit()
+
+    result = run_s011_cycle(
+        account_key=acc.label or f"acct{acc.id}", creds=creds, cfg=DEPLOY, state=state,
+        logger=logger, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env)
+
+    ok = True
+    if result["error"]:
+        link.status = "error"
+        link.last_error = result["error"]
+        _log_event(session, LogKind.ERROR, level=LogLevel.ERROR, message=result["error"],
+                  user=user, account=acc, strategy=strat)
+        print(f"[runner] account_strategy {link.id}: ERROR {result['error']}")
+        ok = False
+    else:
+        mode_label = "shadow" if broker_mode == "off" else broker_mode
+        unresolved_note = f", {len(result['unresolved'])} unresolved" if result["unresolved"] else ""
+        link.status = (f"{mode_label}: {len(result['target'])} position(s){unresolved_note}")
+        link.last_error = None
+        print(f"[runner] account_strategy {link.id}: booked={result['booked']} "
+              f"target={len(result['target'])} equity={result['equity']} "
+              f"unresolved={result['unresolved']}")
+    link.last_cycle_at = datetime.now(timezone.utc)
+    _log_event(session, LogKind.CYCLE_END, message="cycle end", user=user, account=acc,
+              strategy=strat, payload=dict(booked=result["booked"], error=result["error"]))
+    session.commit()
+    session.close()
+    return 0 if ok else 1
+
+
 # Strategy.name -> worker(link, session, budget_s) -> exit code. The only
 # place a new strategy needs registering; run_worker()/run_coordinator()
 # never need to change for one to be added.
 STRATEGY_WORKERS = {
     "S007": _worker_s007,
     "S009": _worker_s009,
+    "S011": _worker_s011,
 }
 
 

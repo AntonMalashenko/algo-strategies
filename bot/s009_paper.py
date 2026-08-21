@@ -456,6 +456,27 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
     broker_plan: list = []
     error = None
     try:
+        # Cheap, network-free up-to-date check (added 2026-08-18, see
+        # decisions-log.md same date): a missed exact cron minute (Ofelia/
+        # container down at the scheduled slot) used to strand the account
+        # un-rebalanced until the NEXT day's single slot, or a manual run --
+        # cron has no "catch up on a missed minute" behavior the way the old
+        # macOS launchd StartCalendarInterval design did (see
+        # scripts/s009_tick.py's module docstring). Comparing the persisted
+        # last-booked day against the pure, network-free
+        # _expected_last_closed_day() lets deployment/schedule.yml tick this
+        # account frequently (self-healing within one tick interval instead
+        # of one calendar day) while keeping every no-op invocation free of
+        # Bybit calls -- only the first invocation after a new UTC day
+        # closes actually pays for refresh_data()/_engine().
+        prior_state = state.load() or {}
+        if do_fetch and prior_state.get("last_day") is not None \
+                and prior_state["last_day"] >= _expected_last_closed_day():
+            logger.cycle_end(cid, status=f"up-to-date (last_day={prior_state['last_day']})")
+            return dict(booked=0, target=prior_state.get("book", {}),
+                       equity=prior_state.get("equity"), broker_orders=0, error=None,
+                       date=None, latest_net_ret=None, broker_env=None,
+                       broker_equity=None, broker_plan=[])
         if do_fetch:
             refresh_data(cfg.universe, data_dir)
         close, funding, out, w, price_comp, fund_comp = _engine(data_dir, cfg)
