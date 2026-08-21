@@ -24,6 +24,88 @@ from webapp.db import Base
 from webapp.crypto import encrypt_secret, decrypt_secret
 
 
+class Asset(Base):
+    """Canonical instrument symbol used inside strategy code (GER40, XAUUSD,
+    BTCUSDT, ...) -- the name strategies/backtests reason about, independent
+    of what any given broker happens to call it. Broker-specific ticker
+    strings live in `BrokerAssetSymbol`, not here (ALGODEV-30/31: this table
+    replaces the previously-hardcoded `SYMBOL_CANDIDATES` guess-lists
+    scattered across bot/s0XX_config.py once a resolver is wired in).
+
+    Seeded (see webapp/cli.py's `seed-assets`) from every symbol actually
+    referenced by a strategy or backtest in this repo as of 2026-08-21 --
+    real, code-derived entries only, never invented. Several strategies
+    reference the SAME underlying instrument under different source-specific
+    names (e.g. fvg_mtf's OANDA-style `DAX30M` vs S007's live `GER40`, both
+    the German DAX) -- those collapse to one canonical row here, with the
+    alternate names recorded in `notes`, rather than one row per naming
+    variant."""
+    __tablename__ = "assets"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    asset_class: Mapped[str] = mapped_column(String(24), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Broker(Base):
+    """A specific broker/exchange/prop-firm entity (IC Markets, Bybit, FTMO,
+    ...) that an Account is actually held at -- distinct from Account.broker,
+    which names the PLATFORM (CTRADER/BYBIT) it connects through, since
+    several brokers can share a platform. `is_prop_firm` distinguishes a
+    prop-firm evaluation/funded account from a plain retail broker/exchange
+    rather than using a separate entity type -- both need the same
+    algo/API-trading policy fields, prop firms just also populate the
+    prop-specific ones.
+
+    Only IC Markets and Bybit are seeded here (migration 006) -- the real,
+    already-connected brokers behind the live S007/S009/S011 accounts
+    (`brokerName=icmarketssc` confirmed live via ProtoOATraderReq
+    2026-08-19/21), needed structurally to backfill Account.broker_id.
+    Deliberately NOT seeded with prop-firm policy data (daily loss cap, max
+    drawdown, profit split, evaluation type per FTMO/The5ers/etc.) -- that
+    needs real researched values from claude/prompt-prop-firm-symbol-mapping.md,
+    not fabricated here; add real broker rows via a future seed command once
+    that data is available (Anton's explicit call, 2026-08-21)."""
+    __tablename__ = "brokers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    is_prop_firm: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Comma-separated platform names this broker offers (CTRADER, MT5, ...).
+    platforms: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    algo_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Prop-specific policy fields -- nullable, meaningless for a plain
+    # retail broker (is_prop_firm=False leaves these null, not zero/fake).
+    daily_loss_cap_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_drawdown_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_split_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    evaluation_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    policy_source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    policy_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class BrokerAssetSymbol(Base):
+    """(broker, asset, platform) -> the actual ticker string that broker
+    uses on that platform (e.g. IC Markets/CTRADER's GER40 might be
+    "GER40.cash"). Starts empty by design -- filled in only as each broker
+    is actually connected to and a symbol verified against its real symbol
+    list (ProtoOASymbolsListReq or equivalent), never guessed ahead of time.
+    This is what ALGODEV-31's resolver will read once it exists; that
+    ticket stays blocked until at least one real verified row lands here."""
+    __tablename__ = "broker_asset_symbols"
+    __table_args__ = (UniqueConstraint("broker_id", "asset_id", "platform",
+                                       name="uq_broker_asset_platform"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    broker_id: Mapped[int] = mapped_column(ForeignKey("brokers.id"), nullable=False)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), nullable=False)
+    platform: Mapped[str] = mapped_column(String(16), nullable=False)
+    broker_symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -49,6 +131,23 @@ class Account(Base):
     # enforced at the DB level.
     broker: Mapped[str] = mapped_column(String(16), nullable=False)
     external_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Human-readable broker account number (cTrader calls this the "login",
+    # e.g. 10101224; for Bybit, unused for now). Purely cosmetic -- shown to
+    # the user so they can tell accounts apart at a glance in their own
+    # broker app. NEVER used for API auth/routing -- that's
+    # external_account_id (cTrader's ctidTraderAccountId), a wholly separate
+    # numbering space with no conversion formula between the two (confirmed
+    # live 2026-08-19: distinct ctids for the same account number, and vice
+    # versa is possible in principle).
+    broker_account_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The specific broker/prop-firm entity this account is held at (IC
+    # Markets, Bybit, FTMO, ...) -- distinct from the `broker` string above,
+    # which names the PLATFORM (CTRADER/BYBIT) an account connects through.
+    # Several brokers can share a platform (multiple prop firms all offer
+    # cTrader), so this FK is what actually identifies who holds the money
+    # and what their policy is (see the `brokers` table). NOT NULL: every
+    # account must be attributable to a real broker entity, no unknown case.
+    broker_id: Mapped[int] = mapped_column(ForeignKey("brokers.id"), nullable=False)
     env: Mapped[str] = mapped_column(String(16), nullable=False)
     label: Mapped[str] = mapped_column(String(64), default="")
     broker_host: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -61,6 +160,7 @@ class Account(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     user: Mapped["User"] = relationship(back_populates="accounts")
+    broker_entity: Mapped["Broker"] = relationship()
     # Which strategies this account runs + per-(account,strategy) config/status
     # -- NOT which strategy "the account is" (an account can run several at
     # once, e.g. S007 and a future S00X on the same cTrader account), so this

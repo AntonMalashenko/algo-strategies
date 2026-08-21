@@ -31,7 +31,7 @@ from sqlalchemy.pool import StaticPool
 import bot.s009_paper as s009_module
 import webapp.runner as runner
 from webapp.db import Base
-from webapp.models import Account, AccountStrategy, Strategy, User
+from webapp.models import Account, AccountStrategy, Broker, Strategy, User
 
 
 @pytest.fixture
@@ -58,9 +58,11 @@ def session(engine):
 @pytest.fixture
 def s009_link(session):
     u = User(username="t", password_hash="x", is_admin=True)
-    session.add(u)
+    broker = Broker(name="Bybit", platforms="BYBIT")
+    session.add_all([u, broker])
     session.flush()
-    acc = Account(user_id=u.id, broker="BYBIT", external_account_id="1", env="mainnet", label="Bybit-x")
+    acc = Account(user_id=u.id, broker="BYBIT", broker_id=broker.id,
+                  external_account_id="1", env="mainnet", label="Bybit-x")
     acc.credentials = {"api_key": "k", "api_secret": "s"}
     strat = Strategy(name="S009", broker="BYBIT")
     session.add_all([acc, strat])
@@ -186,9 +188,10 @@ def test_worker_s009_rejects_non_bybit_account(session, s009_link):
 # --- dispatch table --------------------------------------------------------
 
 def test_strategy_workers_registers_both_strategies():
-    assert set(runner.STRATEGY_WORKERS) == {"S007", "S009"}
+    assert set(runner.STRATEGY_WORKERS) == {"S007", "S009", "S011"}
     assert runner.STRATEGY_WORKERS["S009"] is runner._worker_s009
     assert runner.STRATEGY_WORKERS["S007"] is runner._worker_s007
+    assert runner.STRATEGY_WORKERS["S011"] is runner._worker_s011
 
 
 def test_run_worker_dispatches_s009_by_strategy_name(session, s009_link, fake_run_cycle, monkeypatch):
@@ -200,9 +203,11 @@ def test_run_worker_dispatches_s009_by_strategy_name(session, s009_link, fake_ru
 
 def test_run_worker_raises_for_unregistered_strategy(session, monkeypatch):
     u = User(username="t2", password_hash="x", is_admin=True)
-    session.add(u)
+    broker = Broker(name="IBKR", platforms="IBKR")
+    session.add_all([u, broker])
     session.flush()
-    acc = Account(user_id=u.id, broker="IBKR", external_account_id="2", env="live", label="ibkr")
+    acc = Account(user_id=u.id, broker="IBKR", broker_id=broker.id,
+                  external_account_id="2", env="live", label="ibkr")
     strat = Strategy(name="S099", broker="IBKR")
     session.add_all([acc, strat])
     session.flush()

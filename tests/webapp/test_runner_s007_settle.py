@@ -29,7 +29,7 @@ from sqlalchemy.pool import StaticPool
 
 import webapp.runner as runner
 from webapp.db import Base
-from webapp.models import Account, AccountStrategy, Strategy, User
+from webapp.models import Account, AccountStrategy, Broker, Strategy, User
 
 
 @pytest.fixture(autouse=True)
@@ -60,9 +60,10 @@ def session(engine):
 @pytest.fixture
 def s007_link(session):
     u = User(username="t", password_hash="x", is_admin=True)
-    session.add(u)
+    broker = Broker(name="IC Markets", platforms="CTRADER")
+    session.add_all([u, broker])
     session.flush()
-    acc = Account(user_id=u.id, broker="CTRADER", external_account_id="1",
+    acc = Account(user_id=u.id, broker="CTRADER", broker_id=broker.id, external_account_id="1",
                  env="demo", label="demo1")
     strat = Strategy(name="S007", broker="CTRADER")
     session.add_all([acc, strat])

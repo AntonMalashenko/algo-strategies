@@ -25,7 +25,7 @@ os.environ["APP_DB_URL"] = f"sqlite:///{TMP}/t.db"
 os.environ.setdefault("APP_SECRET_KEY", "test-only-not-a-real-key")
 
 from webapp.db import Base, engine, get_session          # noqa: E402
-from webapp.models import Account, Position, Strategy, User  # noqa: E402
+from webapp.models import Account, Broker, Position, Strategy, User  # noqa: E402
 from webapp.sync_positions import (                      # noqa: E402
     REASON_BROKER_CLOSED, _aggregate_deals, apply_snapshot)
 
@@ -49,10 +49,11 @@ def seed():
     Base.metadata.create_all(engine)
     s = get_session()
     u = User(username="t", password_hash="x", is_admin=True)
-    s.add(u)
+    broker = Broker(name="IC Markets", platforms="CTRADER")
+    s.add_all([u, broker])
     s.flush()
-    acc = Account(user_id=u.id, broker="CTRADER", external_account_id="111",
-                  env="demo", label="demo")
+    acc = Account(user_id=u.id, broker="CTRADER", broker_id=broker.id,
+                  external_account_id="111", env="demo", label="demo")
     s007 = Strategy(name="S007", broker="CTRADER")
     s009 = Strategy(name="S009", broker="BYBIT")
     s.add_all([acc, s007, s009])

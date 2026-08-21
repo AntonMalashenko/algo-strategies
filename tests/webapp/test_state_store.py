@@ -18,7 +18,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from webapp.db import Base
-from webapp.models import Account, AccountStrategy, Strategy, User
+from webapp.models import Account, AccountStrategy, Broker, Strategy, User
 from webapp.state_store import DBStateStore
 
 
@@ -34,10 +34,13 @@ def session():
 @pytest.fixture
 def two_links(session):
     u = User(username="t", password_hash="x", is_admin=True)
-    session.add(u)
+    broker = Broker(name="Bybit", platforms="BYBIT")
+    session.add_all([u, broker])
     session.flush()
-    acc_a = Account(user_id=u.id, broker="BYBIT", external_account_id="a", env="mainnet", label="a")
-    acc_b = Account(user_id=u.id, broker="BYBIT", external_account_id="b", env="mainnet", label="b")
+    acc_a = Account(user_id=u.id, broker="BYBIT", broker_id=broker.id,
+                    external_account_id="a", env="mainnet", label="a")
+    acc_b = Account(user_id=u.id, broker="BYBIT", broker_id=broker.id,
+                    external_account_id="b", env="mainnet", label="b")
     strat = Strategy(name="S009", broker="BYBIT")
     session.add_all([acc_a, acc_b, strat])
     session.flush()

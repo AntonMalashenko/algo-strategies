@@ -23,7 +23,7 @@ from pydantic import ValidationError
 from starlette.middleware.sessions import SessionMiddleware
 
 from webapp.db import SessionLocal
-from webapp.models import Account, AccountStrategy, LogEntry, Position, Strategy, User
+from webapp.models import Account, AccountStrategy, Broker as BrokerRow, LogEntry, Position, Strategy, User
 from webapp.schemas import (
     AccountCreate, AccountStrategyCreate, Broker, CREDENTIALS_BY_BROKER, ENV_BY_BROKER,
 )
@@ -161,7 +161,18 @@ def add_account(request: Request, broker: str = Form(...), env: str = Form(...),
     if dup:
         flash(request, "An account with this broker/id already exists", "err")
         return _redirect("/accounts/add")
-    acc = Account(user_id=payload.user_id, broker=payload.broker.value, env=payload.env.value,
+    # ALGODEV-30: Account.broker_id is NOT NULL. No broker-entity picker in
+    # this form yet (that's future UI work, not this schema ticket) --
+    # resolve the platform's one seeded broker row (IC Markets/CTRADER,
+    # Bybit/BYBIT). Errors loudly rather than guessing if that ever stops
+    # being a 1:1 mapping (a second broker on the same platform gets added).
+    broker_row = db.query(BrokerRow).filter_by(platforms=payload.broker.value).first()
+    if broker_row is None:
+        flash(request, f"No `brokers` row configured for platform {payload.broker.value} -- "
+                        f"run 'webapp.cli list-brokers' / seed one first", "err")
+        return _redirect("/accounts/add")
+    acc = Account(user_id=payload.user_id, broker=payload.broker.value, broker_id=broker_row.id,
+                  env=payload.env.value,
                   external_account_id=payload.external_account_id, label=payload.label,
                   broker_host=payload.broker_host)
     acc.credentials = payload.credentials   # encrypted by the model property setter

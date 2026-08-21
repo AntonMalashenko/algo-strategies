@@ -48,6 +48,7 @@ class AccountCreate(BaseModel):
     user_id: int
     broker: Broker
     external_account_id: str | None = None   # cTrader ctidTraderAccountId; unused for Bybit
+    broker_account_number: str | None = None   # human-readable broker account number, display-only
     env: Env
     label: str = ""
     broker_host: str | None = None

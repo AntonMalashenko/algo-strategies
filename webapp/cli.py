@@ -8,15 +8,19 @@ API request would -- this CLI is just another caller of that boundary.
     python -m webapp.cli create-user --username anton --password *** [--admin]
 
     # one row per broker credential set the user holds
-    python -m webapp.cli add-account --username anton --broker CTRADER --env demo \\
-        --external-account-id 47939312 --client-id ... --client-secret ... \\
-        --access-token ... [--label demo1] [--broker-host demo.ctraderapi.com]
-    python -m webapp.cli add-account --username anton --broker BYBIT --env testnet \\
-        --api-key ... --api-secret ...
+    python -m webapp.cli add-account --username anton --broker CTRADER --broker-id 1 \\
+        --env demo --external-account-id 47939312 --broker-account-number 10085917 \\
+        --client-id ... --client-secret ... --access-token ... \\
+        [--label demo1] [--broker-host demo.ctraderapi.com]
+    python -m webapp.cli add-account --username anton --broker BYBIT --broker-id 2 \\
+        --env testnet --api-key ... --api-secret ...
+    python -m webapp.cli list-brokers   # find the --broker-id to use above
 
     # one row per strategy definition (seed once)
     python -m webapp.cli add-strategy --name S007 --broker CTRADER \\
         [--description "..."] [--default-preset BASELINE_S007]
+    python -m webapp.cli add-strategy --name S011 --broker CTRADER \\
+        --description "RSI(2) portfolio" --default-preset PORTFOLIO_PROP_15PCT
 
     # link an account to a strategy it should run -- an account can run several
     python -m webapp.cli link-strategy --account-id 1 --strategy S007 \\
@@ -25,6 +29,10 @@ API request would -- this CLI is just another caller of that boundary.
     python -m webapp.cli enable  --account-strategy-id 1
     python -m webapp.cli disable --account-strategy-id 1
     python -m webapp.cli list
+
+    # ALGODEV-30: populate the assets table (idempotent -- safe to re-run,
+    # skips symbols already present)
+    python -m webapp.cli seed-assets
 """
 from __future__ import annotations
 
@@ -33,7 +41,7 @@ import argparse
 from pydantic import ValidationError
 
 from webapp.db import get_session, init_db
-from webapp.models import Account, AccountStrategy, Strategy, User
+from webapp.models import Account, AccountStrategy, Asset, Broker, Strategy, User
 from webapp.schemas import AccountCreate, StrategyCreate
 from webapp.security import hash_password
 
@@ -66,6 +74,107 @@ def _credentials_from_args(a) -> dict:
     raise SystemExit(f"unknown broker {a.broker!r}")
 
 
+# ALGODEV-30: every symbol actually referenced by a strategy or backtest in
+# this repo as of 2026-08-21 (code-derived via grep across bot/s0XX_*.py,
+# strategies/*.py, backtest/run_*.py, scripts/fetch_*.py -- nothing here is
+# invented). Several strategies reference the SAME underlying instrument
+# under a different source-specific name (fvg_mtf's OANDA-style "DAX30M" vs
+# S007's live "GER40", both the German DAX) -- those collapse to ONE
+# canonical row, with the alternate names recorded in `notes`, rather than
+# one row per naming variant. (symbol, asset_class, notes)
+SEED_ASSETS: list[tuple[str, str, str]] = [
+    # -- index CFD / equity index --
+    ("GER40", "index_cfd",
+     "German DAX. S007 live (bot/s007_config.py SYMBOL_CANDIDATES aliases: DE40, "
+     "GERMANY40, GER40.cash, DE40.cash, GER30). Also researched as DAX (Yahoo, "
+     "S011 backtest universe) and DAX30M (fvg_mtf, OANDA-style naming)."),
+    ("CAC40", "index_cfd",
+     "French CAC 40. S011 live deploy + research universe. Also FR40M (fvg_mtf)."),
+    ("DOW", "index_cfd", "US Dow Jones 30. S011 live deploy + research universe."),
+    ("ESTOXX50", "index_cfd",
+     "EuroStoxx 50. S011 live deploy + research universe. Also STOXX50M (fvg_mtf)."),
+    ("FTSE100", "index_cfd",
+     "UK FTSE 100. S011 live deploy + research universe. Also UK100M (fvg_mtf)."),
+    ("NASDAQ", "index_cfd",
+     "Nasdaq 100. S011 live deploy + research universe. Also NAS100M (fvg_mtf)."),
+    ("RUSSELL", "index_cfd",
+     "Russell 2000. S011 live deploy + research universe. Also US2000M (fvg_mtf)."),
+    ("SP500idx", "index_cfd",
+     "S&P 500 index. S011 live deploy + research universe. Also SPX500M (fvg_mtf)."),
+    ("SPY", "equity_etf",
+     "S&P 500 ETF proxy. S011 backtest-only (excluded from live deploy, "
+     "LIVE_DEPLOY_EXCLUDED_SYMBOLS). Also the single instrument for the standalone "
+     "double_seven/rsi2/connors_rsi/rsi4/multi_day/r3 setup backtests."),
+    # -- FX --
+    ("EURUSD", "fx", "S011, fx_carry, donchian, fvg_mtf default CLI symbol."),
+    ("EURGBP", "fx", "S011 live deploy + research universe."),
+    ("GBPUSD", "fx", "fx_carry, S011 research universe."),
+    ("AUDUSD", "fx", "fx_carry, S011 research universe."),
+    ("NZDUSD", "fx", "fx_carry only."),
+    ("USDJPY", "fx", "fx_carry, S011 research universe."),
+    ("USDCHF", "fx", "fx_carry, S011 research universe."),
+    ("USDCAD", "fx", "fx_carry, S011 research universe."),
+    ("USDNOK", "fx", "fx_carry only."),
+    ("USDSEK", "fx", "fx_carry only."),
+    ("AUDJPY", "fx", "S011 research universe."),
+    ("EURJPY", "fx", "S011 research universe."),
+    ("EURCHF", "fx", "S011 research universe."),
+    ("GBPJPY", "fx", "S011 research universe."),
+    # -- metal --
+    ("XAUUSD", "metal", "Gold. S011 live deploy + research universe."),
+    # -- crypto (S009 funding_carry DEFAULT_UNIVERSE, 24 coins) --
+    ("BTCUSDT", "crypto",
+     "S009 research universe (excluded from live deploy, LOW_CAPITAL_EXCLUDED_SYMBOLS). "
+     "Also S011 research, S008/crypto_mtf."),
+    ("ETHUSDT", "crypto",
+     "S009 research universe (excluded from live deploy). Also S011 live deploy, "
+     "S008/crypto_mtf."),
+    ("SOLUSDT", "crypto", "S009 live deploy. Also S011 live deploy + research universe."),
+    ("BNBUSDT", "crypto", "S009 live deploy. Also S011 research universe."),
+    ("XRPUSDT", "crypto", "S009 live deploy. Also S011 research universe."),
+    ("DOGEUSDT", "crypto", "S009 live deploy."),
+    ("ADAUSDT", "crypto", "S009 live deploy."),
+    ("AVAXUSDT", "crypto", "S009 live deploy."),
+    ("LINKUSDT", "crypto", "S009 live deploy."),
+    ("DOTUSDT", "crypto", "S009 live deploy."),
+    ("LTCUSDT", "crypto", "S009 live deploy."),
+    ("TRXUSDT", "crypto", "S009 live deploy."),
+    ("ATOMUSDT", "crypto", "S009 live deploy."),
+    ("NEARUSDT", "crypto", "S009 live deploy."),
+    ("APTUSDT", "crypto", "S009 live deploy."),
+    ("ARBUSDT", "crypto", "S009 live deploy."),
+    ("OPUSDT", "crypto", "S009 live deploy."),
+    ("FILUSDT", "crypto", "S009 live deploy."),
+    ("INJUSDT", "crypto", "S009 live deploy."),
+    ("SUIUSDT", "crypto", "S009 live deploy."),
+    ("UNIUSDT", "crypto", "S009 live deploy."),
+    ("AAVEUSDT", "crypto", "S009 live deploy."),
+    ("ETCUSDT", "crypto", "S009 live deploy."),
+    ("BCHUSDT", "crypto", "S009 live deploy."),
+]
+
+
+def cmd_seed_assets(a):
+    s = get_session()
+    existing = {row.symbol for row in s.query(Asset.symbol).all()}
+    added = 0
+    for symbol, asset_class, notes in SEED_ASSETS:
+        if symbol in existing:
+            continue
+        s.add(Asset(symbol=symbol, asset_class=asset_class, notes=notes))
+        added += 1
+    s.commit()
+    print(f"seed-assets: {added} added, {len(SEED_ASSETS) - added} already present "
+          f"(total in table: {len(existing) + added})")
+
+
+def cmd_list_brokers(a):
+    s = get_session()
+    for b in s.query(Broker).order_by(Broker.id).all():
+        print(f"broker {b.id} '{b.name}' is_prop_firm={b.is_prop_firm} "
+              f"platforms={b.platforms} status={b.status}")
+
+
 def cmd_init_db(a):
     init_db()
     print("db initialised (tables created if missing). For a fresh production DB, "
@@ -88,10 +197,20 @@ def cmd_create_user(a):
 def cmd_add_account(a):
     s = get_session()
     u = _user(s, a.username)
+    # ALGODEV-30: Account.broker_id is NOT NULL -- this just looks up an
+    # existing `brokers` row by id (a plain FK check), it is NOT the
+    # broker/asset symbol resolver (that's ALGODEV-31, separately scoped and
+    # still blocked on a real verified broker_asset_symbols row).
+    broker_row = s.get(Broker, a.broker_id)
+    if broker_row is None:
+        raise SystemExit(f"broker id {a.broker_id} not found -- see 'brokers' table "
+                          f"(seeded: IC Markets, Bybit)")
     try:
         payload = AccountCreate(
             user_id=u.id, broker=a.broker, env=a.env,
-            external_account_id=a.external_account_id, label=a.label or "",
+            external_account_id=a.external_account_id,
+            broker_account_number=a.broker_account_number,
+            label=a.label or "",
             broker_host=a.broker_host, credentials=_credentials_from_args(a),
         )
     except ValidationError as e:
@@ -102,13 +221,15 @@ def cmd_add_account(a):
     if dup:
         raise SystemExit("an account with this user/broker/external_account_id already exists")
     acc = Account(user_id=payload.user_id, broker=payload.broker.value, env=payload.env.value,
-                  external_account_id=payload.external_account_id, label=payload.label,
-                  broker_host=payload.broker_host)
+                  external_account_id=payload.external_account_id,
+                  broker_account_number=payload.broker_account_number, label=payload.label,
+                  broker_host=payload.broker_host, broker_id=broker_row.id)
     acc.credentials = payload.credentials   # encrypted by the model property setter
     s.add(acc)
     s.commit()
     print(f"account added for '{a.username}': id={acc.id} broker={acc.broker} "
-          f"env={acc.env} external_id={acc.external_account_id}")
+          f"env={acc.env} external_id={acc.external_account_id} "
+          f"broker_account_number={acc.broker_account_number}")
 
 
 def cmd_add_strategy(a):
@@ -167,7 +288,8 @@ def cmd_list(a):
         print(f"user {u.id} {u.username} admin={u.is_admin}")
         for acc in u.accounts:
             print(f"  account {acc.id} broker={acc.broker} env={acc.env} "
-                  f"external_id={acc.external_account_id} '{acc.label}'")
+                  f"external_id={acc.external_account_id} "
+                  f"account_number={acc.broker_account_number} '{acc.label}'")
             for link in acc.strategy_links:
                 print(f"    -> {link.strategy.name} enabled={link.enabled} "
                       f"preset={link.preset} risk={link.risk_pct} lot={link.fixed_lot} "
@@ -188,8 +310,14 @@ def main():
     p = sub.add_parser("add-account")
     p.add_argument("--username", required=True)
     p.add_argument("--broker", required=True, choices=["CTRADER", "BYBIT"])
+    p.add_argument("--broker-id", dest="broker_id", type=int, required=True,
+                   help="id of the row in `brokers` this account is actually held at "
+                        "(see 'webapp.cli list-brokers' or query the table directly)")
     p.add_argument("--env", required=True, choices=["demo", "live", "testnet", "mainnet"])
     p.add_argument("--external-account-id", dest="external_account_id", default=None)
+    p.add_argument("--broker-account-number", dest="broker_account_number", default=None,
+                   help="human-readable account number shown in the broker's own app "
+                        "(e.g. cTrader's login), display-only, distinct from --external-account-id")
     p.add_argument("--label", default="")
     p.add_argument("--broker-host", dest="broker_host", default=None)
     # CTRADER credential fields
@@ -201,7 +329,7 @@ def main():
     p.add_argument("--api-secret", dest="api_secret", default=None)
 
     p = sub.add_parser("add-strategy")
-    p.add_argument("--name", required=True, choices=["S007", "S009"])
+    p.add_argument("--name", required=True, choices=["S007", "S009", "S011"])
     p.add_argument("--broker", required=True, choices=["CTRADER", "BYBIT"])
     p.add_argument("--description", default=None)
     p.add_argument("--default-preset", dest="default_preset", default=None)
@@ -217,6 +345,9 @@ def main():
                    help="size from --risk instead of the fixed --lot")
     p.add_argument("--initial-balance", dest="initial_balance", type=float, default=None)
     p.add_argument("--enable", action="store_true")
+
+    sub.add_parser("seed-assets")
+    sub.add_parser("list-brokers")
 
     p = sub.add_parser("enable")
     p.add_argument("--account-strategy-id", dest="account_strategy_id", type=int, required=True)
@@ -235,6 +366,8 @@ def main():
         "enable": lambda a: cmd_enable(a, True),
         "disable": lambda a: cmd_enable(a, False),
         "list": cmd_list,
+        "seed-assets": cmd_seed_assets,
+        "list-brokers": cmd_list_brokers,
     }[a.cmd](a)
 
 
