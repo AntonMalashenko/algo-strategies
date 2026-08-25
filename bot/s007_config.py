@@ -26,7 +26,18 @@ def cred(name, default=None):
 # --- instrument ---
 # cTrader symbol name for the German index; brokers differ (GER40 / DE40 /
 # Germany 40 / GER40.cash). The bot resolves the first match from this list.
+# ALGODEV-31: this is now only the FALLBACK bot/symbol_resolver.py uses when
+# no verified webapp.models.BrokerAssetSymbol row exists yet for a given
+# (broker, asset, platform) -- see ASSET_SYMBOL/PLATFORM below and
+# webapp/runner.py::_worker_s007, which is where the fallback actually gets
+# used (a verified row currently exists for IC Markets: broker_symbol=DE40).
 SYMBOL_CANDIDATES = ["GER40", "DE40", "GERMANY40", "GER40.cash", "DE40.cash", "GER30"]
+
+# webapp.models.Asset.symbol / webapp.models.BrokerAssetSymbol.platform this
+# strategy trades -- the (broker_id, ASSET_SYMBOL, PLATFORM) key
+# bot/symbol_resolver.py::resolve_symbol() looks up.
+ASSET_SYMBOL = "GER40"
+PLATFORM = "CTRADER"
 
 # --- strategy preset (name from ger40_lonfra.config) ---
 # Options: BASELINE_S007 (frozen base, net +0.415R/day real-spread, all years

@@ -80,7 +80,9 @@ from webapp.db import get_session
 from webapp.models import Account, AccountStrategy, LogEntry, Position, Strategy, User
 from webapp.schemas import LogEntryCreate, LogKind, LogLevel
 
+from bot import s007_config as S007_C
 from bot.s007_paper import run_cycle_for_account as run_s007_cycle
+from bot.symbol_resolver import resolve_symbol
 from utils.trade_logger import StrategyLogger
 from webapp.state_store import DBStateStore
 
@@ -199,9 +201,19 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
               strategy=strat)
     session.commit()
 
+    # ALGODEV-31: prefer the verified broker_asset_symbols row for THIS
+    # account's actual broker over the hardcoded SYMBOL_CANDIDATES guess-list
+    # -- falls back to that list (logged) if no row is verified yet for this
+    # broker_id, so an account with no verified row still trades exactly as
+    # before this ticket.
+    symbol_candidates = resolve_symbol(
+        session=session, broker_id=acc.broker_id, asset_symbol=S007_C.ASSET_SYMBOL,
+        platform=S007_C.PLATFORM, fallback_candidates=S007_C.SYMBOL_CANDIDATES)
+
     result = run_s007_cycle(
         creds, preset=preset, risk_pct=link.risk_pct, fixed_lot=link.fixed_lot,
-        use_fixed_lot=link.use_fixed_lot, magic=strat.name, logger=logger)
+        use_fixed_lot=link.use_fixed_lot, magic=strat.name, logger=logger,
+        symbol_candidates=symbol_candidates)
 
     for a in result["actions"]:
         if a["kind"] == "open":

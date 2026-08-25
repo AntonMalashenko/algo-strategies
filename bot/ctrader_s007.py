@@ -460,6 +460,15 @@ class CTraderS007(CTraderAdapter):
     def run_live_cycle(self, symbol_candidates, history_days: int, decide):
         """One connect/auth/work/disconnect session for a full bot cycle.
 
+        `symbol_candidates`: ALGODEV-31: as of webapp/runner.py::_worker_s007,
+        this is normally bot/symbol_resolver.py::resolve_symbol()'s output --
+        a single verified ticker once a webapp.models.BrokerAssetSymbol row
+        exists for the account's broker, or bot/s007_config.py's
+        SYMBOL_CANDIDATES guess-list as a logged fallback otherwise. Either
+        way the matching below against THIS broker's actual live symbol list
+        is the real safety net (a symbol can be renamed/delisted after being
+        verified) and is deliberately unchanged by that ticket.
+
         Resolves the symbol, fetches the instrument's contract metadata (for
         risk sizing) and the account balance, gets M1 bars, lists open
         positions, then calls

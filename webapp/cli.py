@@ -33,6 +33,12 @@ API request would -- this CLI is just another caller of that boundary.
     # ALGODEV-30: populate the assets table (idempotent -- safe to re-run,
     # skips symbols already present)
     python -m webapp.cli seed-assets
+
+    # ALGODEV-31: record a symbol actually confirmed against a broker's own
+    # real symbol list -- never a guess (idempotent, upserts on
+    # broker_id+asset_id+platform)
+    python -m webapp.cli verify-symbol --broker-id 1 --asset GER40 --platform CTRADER \\
+        --broker-symbol DE40 --notes "live S007-acct47939312 cycle log, 2026-08-25"
 """
 from __future__ import annotations
 
@@ -40,8 +46,11 @@ import argparse
 
 from pydantic import ValidationError
 
+from datetime import datetime, timezone
+
 from webapp.db import get_session, init_db
-from webapp.models import Account, AccountStrategy, Asset, Broker, Strategy, User
+from webapp.models import (Account, AccountStrategy, Asset, Broker,
+                            BrokerAssetSymbol, Strategy, User)
 from webapp.schemas import AccountCreate, StrategyCreate
 from webapp.security import hash_password
 
@@ -173,6 +182,40 @@ def cmd_list_brokers(a):
     for b in s.query(Broker).order_by(Broker.id).all():
         print(f"broker {b.id} '{b.name}' is_prop_firm={b.is_prop_firm} "
               f"platforms={b.platforms} status={b.status}")
+
+
+def cmd_verify_symbol(a):
+    """Record a broker_asset_symbols row for a symbol actually confirmed
+    against that broker's own real symbol list (ProtoOASymbolsListReq or
+    equivalent) -- never a guess. --notes must say how it was verified
+    (e.g. a live cycle log line or timestamped API response) so the row
+    stays auditable. Idempotent on (broker_id, asset_id, platform): re-running
+    updates broker_symbol/verified_at/notes instead of duplicating the row."""
+    s = get_session()
+    broker_row = s.get(Broker, a.broker_id)
+    if broker_row is None:
+        raise SystemExit(f"broker id {a.broker_id} not found -- see 'list-brokers'")
+    asset_row = s.query(Asset).filter_by(symbol=a.asset).one_or_none()
+    if asset_row is None:
+        raise SystemExit(f"asset '{a.asset}' not found -- see 'seed-assets' / the assets table")
+    row = s.query(BrokerAssetSymbol).filter_by(
+        broker_id=broker_row.id, asset_id=asset_row.id, platform=a.platform).one_or_none()
+    verified_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    if row is None:
+        row = BrokerAssetSymbol(broker_id=broker_row.id, asset_id=asset_row.id,
+                                 platform=a.platform, broker_symbol=a.broker_symbol,
+                                 verified_at=verified_at, notes=a.notes)
+        s.add(row)
+        action = "added"
+    else:
+        row.broker_symbol = a.broker_symbol
+        row.verified_at = verified_at
+        row.notes = a.notes
+        action = "updated"
+    s.commit()
+    print(f"broker_asset_symbols {action}: id={row.id} broker='{broker_row.name}' "
+          f"asset='{asset_row.symbol}' platform={a.platform} broker_symbol='{a.broker_symbol}' "
+          f"verified_at={row.verified_at.isoformat()}")
 
 
 def cmd_init_db(a):
@@ -349,6 +392,15 @@ def main():
     sub.add_parser("seed-assets")
     sub.add_parser("list-brokers")
 
+    p = sub.add_parser("verify-symbol")
+    p.add_argument("--broker-id", dest="broker_id", type=int, required=True)
+    p.add_argument("--asset", required=True, help="Asset.symbol, e.g. GER40")
+    p.add_argument("--platform", required=True, choices=["CTRADER", "BYBIT"])
+    p.add_argument("--broker-symbol", dest="broker_symbol", required=True,
+                   help="the exact ticker string the broker's own API returns")
+    p.add_argument("--notes", required=True,
+                   help="how this was verified -- log line, timestamp, API response, etc.")
+
     p = sub.add_parser("enable")
     p.add_argument("--account-strategy-id", dest="account_strategy_id", type=int, required=True)
     p = sub.add_parser("disable")
@@ -368,6 +420,7 @@ def main():
         "list": cmd_list,
         "seed-assets": cmd_seed_assets,
         "list-brokers": cmd_list_brokers,
+        "verify-symbol": cmd_verify_symbol,
     }[a.cmd](a)
 
 
