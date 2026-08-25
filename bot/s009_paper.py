@@ -48,6 +48,7 @@ long bottom-2, dollar-neutral, daily rebalance, taker 0.055%/side, vol-target 20
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import sys
 import time
@@ -272,6 +273,29 @@ def _floor_step(x: float, step: float) -> float:
     return math.floor(abs(x) / step) * step
 
 
+def _verify_after_timeout(client, sym: str, qty_before: float, log, cid: str) -> None:
+    """ALGODEV-20: after a `close_position`/`place_market` call raises (most
+    commonly a network read timeout — the request may have reached Bybit and
+    been acted on despite the client never seeing a response), re-query the
+    broker's own position for this symbol instead of leaving the cycle
+    silent about what actually happened. An unresolved order outcome is
+    suspicious by default, not a silent success — same principle
+    bot/ctrader_s007.py::_check_response already applies to cTrader
+    (decisions-log.md 2026-07-21). Logs `verify_after_timeout` with the
+    real qty before/after so this is visible in events-<date>.jsonl even
+    when the retry itself also fails."""
+    try:
+        qty_after = float(client.positions().get(sym, 0.0))
+    except Exception as exc:
+        log.event("verify_after_timeout", cycle=cid, level=logging.WARNING, symbol=sym,
+                  qty_before=qty_before, verify_failed=True, verify_error=repr(exc)[:300])
+        return
+    status = "unchanged" if qty_after == qty_before else ("closed" if qty_after == 0.0 else "changed")
+    log.event("verify_after_timeout", cycle=cid,
+              level=logging.INFO if status == "closed" else logging.WARNING,
+              symbol=sym, qty_before=qty_before, qty_after=qty_after, status=status)
+
+
 def reconcile_to_target(client, target_book: dict, equity: float, log, cid, execute: bool) -> list[dict]:
     """Turn the target book (weights) into delta market orders vs current broker
     positions. dry (execute=False) logs the plan; execute places demo orders and
@@ -290,7 +314,17 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
     for the incident. Partial adjustments of a continuing leg (target weight
     != 0) are unaffected and still go through the sized `place_market` path.
     """
-    positions = client.positions()
+    try:
+        positions = client.positions()
+    except Exception as exc:
+        # ALGODEV-20: this gates the whole reconcile -- letting it propagate
+        # would abort the entire cycle via run_cycle_for_account's outer
+        # except, silently skipping every leg (the 2026-08-12 incident, just
+        # one call earlier). Report it explicitly instead and reconcile
+        # nothing this cycle; the next cycle retries against fresh state.
+        log.event("broker_sync_failed", cycle=cid, level=logging.ERROR, call="positions",
+                  error=repr(exc)[:300])
+        return []
     plan: list[dict] = []
     for sym in sorted(set(target_book) | set(positions)):
         w = float(target_book.get(sym, 0.0))
@@ -329,6 +363,7 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
             except Exception as exc:
                 log.order(f"S009:{sym}", "close_position", cycle=cid,
                           request={"side": side, "cur_qty": cur, "ref_price": price}, error=exc)
+                _verify_after_timeout(client, sym, cur, log, cid)
             continue
 
         tgt_qty = math.copysign(_floor_step(w * equity / price, inst.qty_step), w) if w else 0.0
@@ -381,6 +416,7 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
         except Exception as exc:
             log.order(f"S009:{sym}", "place_market", cycle=cid,
                       request={"side": side, "qty": qty, "ref_price": price}, error=exc)
+            _verify_after_timeout(client, sym, cur, log, cid)
     return plan
 
 
@@ -528,32 +564,49 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
                                     env=env, allow_mainnet=allow_mainnet) if creds
                          else BybitExec(name=account_key, env=env, allow_mainnet=allow_mainnet))
                 broker_env = client.env
-                broker_equity = client.wallet_equity()
+                try:
+                    broker_equity = client.wallet_equity()
+                except Exception as exc:
+                    # ALGODEV-20 (2026-08-12 incident): this call used to be
+                    # unguarded and gated the entire broker block -- a network
+                    # timeout here aborted reconcile_to_target entirely
+                    # (orders=0, no legs touched) while state.save() just above
+                    # had ALREADY persisted the day as booked with the NEW
+                    # target book, silently stranding the real account on the
+                    # OLD book until the next UTC day's tick. Report it
+                    # explicitly and skip the broker block this cycle instead
+                    # of falling through to the top-level `except` (which would
+                    # log the same failure but give no indication that paper
+                    # state was already committed out from under it).
+                    logger.event("broker_sync_failed", cycle=cid, level=logging.ERROR,
+                                call="wallet_equity", error=repr(exc)[:300])
+                    broker_equity = None
 
-                # Real-money series (see BROKER_LEDGER_FILE docstring): pair this
-                # reading with the PREVIOUS one to get a real $ return over the
-                # actual, irregular wall-clock gap between cycles -- never assume
-                # that gap is 24h, it routinely isn't (late tick, or a broker=off
-                # day with no reading at all in between).
-                now_ts = datetime.now(timezone.utc)
-                prev = _last_broker_ledger_row(broker_ledger_file)
-                real_net_ret = None
-                hours_since_prev = None
-                if prev is not None and float(prev["broker_equity"]) > 0:
-                    real_net_ret = broker_equity / float(prev["broker_equity"]) - 1.0
-                    hours_since_prev = (now_ts - pd.Timestamp(prev["ts"]).to_pydatetime()).total_seconds() / 3600.0
-                broker_row = {
-                    "ts": now_ts.isoformat(), "cycle": cid, "date": date,
-                    "broker_equity": round(broker_equity, 4),
-                    "hours_since_prev": round(hours_since_prev, 2) if hours_since_prev is not None else None,
-                    "real_net_ret": round(real_net_ret, 6) if real_net_ret is not None else None,
-                }
-                if broker_ledger_file is not None:
-                    append_broker_ledger(broker_row, broker_ledger_file)
-                logger.event("broker", cycle=cid, env=client.env, equity=round(broker_equity, 2), mode=broker,
-                             real_net_ret=broker_row["real_net_ret"], hours_since_prev=broker_row["hours_since_prev"])
-                broker_plan = reconcile_to_target(client, target, broker_equity, logger, cid,
-                                                  execute=(broker == "execute"))
+                if broker_equity is not None:
+                    # Real-money series (see BROKER_LEDGER_FILE docstring): pair this
+                    # reading with the PREVIOUS one to get a real $ return over the
+                    # actual, irregular wall-clock gap between cycles -- never assume
+                    # that gap is 24h, it routinely isn't (late tick, or a broker=off
+                    # day with no reading at all in between).
+                    now_ts = datetime.now(timezone.utc)
+                    prev = _last_broker_ledger_row(broker_ledger_file)
+                    real_net_ret = None
+                    hours_since_prev = None
+                    if prev is not None and float(prev["broker_equity"]) > 0:
+                        real_net_ret = broker_equity / float(prev["broker_equity"]) - 1.0
+                        hours_since_prev = (now_ts - pd.Timestamp(prev["ts"]).to_pydatetime()).total_seconds() / 3600.0
+                    broker_row = {
+                        "ts": now_ts.isoformat(), "cycle": cid, "date": date,
+                        "broker_equity": round(broker_equity, 4),
+                        "hours_since_prev": round(hours_since_prev, 2) if hours_since_prev is not None else None,
+                        "real_net_ret": round(real_net_ret, 6) if real_net_ret is not None else None,
+                    }
+                    if broker_ledger_file is not None:
+                        append_broker_ledger(broker_row, broker_ledger_file)
+                    logger.event("broker", cycle=cid, env=client.env, equity=round(broker_equity, 2), mode=broker,
+                                 real_net_ret=broker_row["real_net_ret"], hours_since_prev=broker_row["hours_since_prev"])
+                    broker_plan = reconcile_to_target(client, target, broker_equity, logger, cid,
+                                                      execute=(broker == "execute"))
     except Exception as e:
         logger.error("S009 cycle failed", exc=e, cycle=cid)
         error = repr(e)[:500]

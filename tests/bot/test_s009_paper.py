@@ -111,6 +111,12 @@ def _log(tmp_path, name="S009TEST"):
     return StrategyLogger(name, log_root=str(tmp_path), console=False)
 
 
+def _read_events(tmp_path, name="S009TEST"):
+    import json
+    path = tmp_path / name / f"events-{pd.Timestamp.now().date().isoformat()}.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
 def _store(tmp_path, name="state.json"):
     return FileStateStore(tmp_path / name, default_factory=lambda: {"last_day": None, "equity": 1.0, "book": {}})
 
@@ -353,3 +359,127 @@ def test_min_notional_defaulting_to_zero_falls_back_to_qty_only_check(tmp_path):
     plan = s009.reconcile_to_target(client, {"BTCUSDT": 0.3}, equity=1000.0,
                                     log=_log(tmp_path), cid="c1", execute=True)
     assert len(plan) == 1
+
+
+# --- ALGODEV-20: network timeout on an order call must not go unverified ---
+#
+# Real incidents: 2026-08-11 a `close_position` ReadTimeout on BNBUSDT left
+# the actual broker outcome unknown (the position had, in fact, closed --
+# but nothing in the logs could confirm that); 2026-08-12 a ReadTimeout on
+# `client.wallet_equity()` -- one call earlier, ungated -- aborted the whole
+# broker block while the paper state had already been committed as if the
+# new book were live, stranding the real account on the OLD book silently.
+
+class _FakeFailingOrderClient:
+    """positions_sequence: one dict per call to .positions() (popped in
+    order) -- lets a test give a different answer for the initial read vs.
+    the post-timeout verification read, exactly like a real close/open
+    landing at the broker between those two calls would."""
+
+    def __init__(self, positions_sequence, prices, instruments, fail_op):
+        self._queue = list(positions_sequence)
+        self._prices = prices
+        self._instruments = instruments
+        self._fail_op = fail_op
+
+    def positions(self):
+        return self._queue.pop(0)
+
+    def ticker_price(self, sym):
+        return self._prices[sym]
+
+    def instrument(self, sym):
+        return self._instruments[sym]
+
+    def close_position(self, sym, side):
+        if self._fail_op == "close_position":
+            raise TimeoutError("Read timed out")
+        return {"orderId": "abc123"}
+
+    def place_market(self, sym, side, qty):
+        if self._fail_op == "place_market":
+            raise TimeoutError("Read timed out")
+        return {"orderId": "abc123"}
+
+    def recent_fill_price(self, sym, oid):
+        return self._prices[sym]
+
+
+def test_close_position_timeout_verifies_and_logs_the_real_outcome(tmp_path):
+    """The order call itself times out, but a fresh positions() read shows
+    the leg is actually gone -- must be logged as status=closed, not left
+    silent (the 2026-08-11 BNBUSDT case, made verifiable)."""
+    client = _FakeFailingOrderClient(
+        positions_sequence=[{"ATOMUSDT": -24.2}, {}],
+        prices={"ATOMUSDT": 5.0},
+        instruments={"ATOMUSDT": _instr(qty_step=0.1, min_qty=0.1, min_notional=5.0)},
+        fail_op="close_position")
+    plan = s009.reconcile_to_target(client, {}, equity=100.0,
+                                    log=_log(tmp_path), cid="c1", execute=True)
+    assert plan and plan[0]["symbol"] == "ATOMUSDT"
+    verify = [e for e in _read_events(tmp_path) if e["kind"] == "verify_after_timeout"]
+    assert len(verify) == 1
+    assert verify[0]["status"] == "closed"
+    assert verify[0]["qty_before"] == -24.2
+    assert verify[0]["qty_after"] == 0.0
+
+
+def test_place_market_timeout_verifies_position_unchanged(tmp_path):
+    """The order call times out and the broker's own position for that
+    symbol never moved -- distinct from "closed", must be logged as
+    status=unchanged so a human/monitor can tell the difference."""
+    client = _FakeFailingOrderClient(
+        positions_sequence=[{}, {}],
+        prices={"BTCUSDT": 60000.0},
+        instruments={"BTCUSDT": _instr(qty_step=0.001, min_qty=0.001, min_notional=5.0)},
+        fail_op="place_market")
+    plan = s009.reconcile_to_target(client, {"BTCUSDT": 0.3}, equity=1000.0,
+                                    log=_log(tmp_path), cid="c1", execute=True)
+    assert plan  # the attempt is still recorded even though placement raised
+    verify = [e for e in _read_events(tmp_path) if e["kind"] == "verify_after_timeout"]
+    assert len(verify) == 1
+    assert verify[0]["status"] == "unchanged"
+    assert verify[0]["qty_before"] == 0.0
+    assert verify[0]["qty_after"] == 0.0
+
+
+def test_reconcile_positions_fetch_failure_is_reported_not_raised(tmp_path):
+    """A timeout on the very first client.positions() call inside
+    reconcile_to_target used to propagate straight out and abort the whole
+    cycle via run_cycle_for_account's top-level except (the 2026-08-12
+    incident, one call earlier than wallet_equity) -- it must instead be
+    reported as broker_sync_failed and reconcile nothing this cycle."""
+    def _raise():
+        raise TimeoutError("Read timed out")
+    client = types.SimpleNamespace(positions=_raise)
+    plan = s009.reconcile_to_target(client, {"BTCUSDT": 0.3}, equity=100.0,
+                                    log=_log(tmp_path), cid="c1", execute=True)
+    assert plan == []
+    sync_fail = [e for e in _read_events(tmp_path) if e["kind"] == "broker_sync_failed"]
+    assert len(sync_fail) == 1
+    assert sync_fail[0]["call"] == "positions"
+
+
+class _FakeBybitExecWalletFails(_FakeBybitExec):
+    def wallet_equity(self):
+        raise TimeoutError("Read timed out")
+
+
+def test_wallet_equity_timeout_skips_broker_block_without_failing_the_cycle(tmp_path, monkeypatch):
+    """The 2026-08-12 incident itself: client.wallet_equity() times out.
+    Must not abort the whole cycle (paper state above it is already
+    committed) and must not silently proceed with equity=None -- report
+    broker_sync_failed and skip reconcile_to_target this cycle."""
+    fake_mod = types.SimpleNamespace(BybitExec=_FakeBybitExecWalletFails)
+    monkeypatch.setitem(sys.modules, "bot.bybit_exec", fake_mod)
+    result = s009.run_cycle_for_account(
+        account_key="acct-a", creds={"api_key": "k", "api_secret": "s"}, cfg=s009.DEPLOY,
+        state=_store(tmp_path), logger=_log(tmp_path), do_fetch=False, drop_forming=False,
+        broker="dry", allow_mainnet=False)
+
+    assert result["error"] is None            # top-level except must not fire
+    assert result["broker_orders"] == 0
+    assert result["broker_equity"] is None
+    sync_fail = [e for e in _read_events(tmp_path) if e["kind"] == "broker_sync_failed"]
+    assert len(sync_fail) == 1
+    assert sync_fail[0]["call"] == "wallet_equity"
