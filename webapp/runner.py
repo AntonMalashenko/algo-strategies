@@ -30,11 +30,23 @@ Two modes, same file:
     Loads the strategy's enabled AccountStrategy rows from the DB and spawns
     one WORKER subprocess per account, in parallel, waiting up to --timeout
     seconds (default 55s, leaving headroom in a 60s scheduler tick) before
-    killing stragglers. Exits 0 as long as the tick itself could be planned
-    and run -- an individual account's cycle failing is recorded on that
-    account_strategy row (status='error', last_error=...), NOT surfaced as
-    the coordinator's own exit code, since one bad account must never look
-    like "the whole tick failed" to Ofelia/the scheduler.
+    killing stragglers. Each account's cycle runs in its own isolated
+    subprocess, so one account crashing or timing out never touches another
+    account's execution -- that isolation is unconditional, independent of
+    what's described next. An individual account's failure is always
+    recorded on that account_strategy row (status='error', last_error=...).
+    ALGODEV-33 (2026-08-28): the coordinator's OWN exit code used to be a
+    hardcoded 0 regardless of failures, specifically so scripts/
+    scheduler_tick.py's `_run_item` would print "ok" -- but that made a
+    SIGKILLed worker (a live-money cTrader/Bybit session killed mid-cycle)
+    indistinguishable in Ofelia's dispatch log from a totally clean tick;
+    the DB's last_error was the only trace. The exit code now reflects
+    whether any account failed (1 if so, 0 otherwise) purely so
+    `_run_item`'s existing `if proc.returncode != 0` branch fires and
+    prints the diagnostics (routed to stderr for the same reason) into a
+    log a human actually looks at -- it does NOT change the isolation
+    contract above, and scheduler_tick.py still moves on to the next
+    scheduled item either way.
 
   Worker (internal, spawned by the coordinator; --worker --account-strategy-id N):
     Runs exactly ONE S007 cycle for ONE (account, strategy) row, then exits.
@@ -488,8 +500,8 @@ def _sync_after_cycle(account_strategy_id: int, started: float,
 
 def run_coordinator(strategy_name: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> int:
     """One tick for `strategy_name` -- see module docstring for the subprocess
-    fan-out rationale and the "one bad account != tick failure" exit-code
-    contract."""
+    fan-out rationale, the per-account isolation guarantee, and the
+    ALGODEV-33 exit-code note."""
     session = get_session()
     strat = session.query(Strategy).filter_by(name=strategy_name).one_or_none()
     if strat is None:
@@ -523,17 +535,31 @@ def run_coordinator(strategy_name: str, timeout_s: float = DEFAULT_TIMEOUT_S) ->
             p.kill()
             p.wait()
             results[lid] = -9
-            print(f"[runner] account_strategy {lid}: TIMEOUT after {timeout_s:.0f}s, killed")
+            # ALGODEV-33: stderr, not stdout -- scripts/scheduler_tick.py's
+            # _run_item only ever surfaces proc.stderr, and only on a
+            # non-zero return code (see the `return` below). A killed
+            # worker's only trace used to be this print (on stdout, where
+            # nothing downstream ever looked) plus the DB `last_error` set
+            # below -- Ofelia's own dispatch log showed a plain "ok" for a
+            # tick that SIGKILLed a live-money worker mid-cycle (found live
+            # 2026-08-28, S011/account_strategy 4).
+            print(f"[runner] account_strategy {lid}: TIMEOUT after {timeout_s:.0f}s, killed",
+                  file=sys.stderr)
 
     ok = sum(1 for rc in results.values() if rc == 0)
-    print(f"[runner] {strategy_name}: {ok}/{len(link_ids)} account cycle(s) ok "
-          f"({', '.join(f'{lid}={rc}' for lid, rc in results.items())})")
+    summary = (f"[runner] {strategy_name}: {ok}/{len(link_ids)} account cycle(s) ok "
+              f"({', '.join(f'{lid}={rc}' for lid, rc in results.items())})")
+    failed = {lid: rc for lid, rc in results.items() if rc != 0}
+    # Same stderr reasoning as the TIMEOUT print above -- on a clean tick
+    # this line is harmless boilerplate nobody needs to see, but the one
+    # time it says "0/1 ok" it needs to actually reach a log a human looks
+    # at instead of an unread stdout pipe.
+    print(summary, file=sys.stderr if failed else sys.stdout)
 
     # A killed/crashed worker never got to write its own status (a clean
     # in-process failure already set status='error' inside run_worker) --
     # mark those here so the DB never shows a stale "idle"/last good status
     # after a timeout or hard crash.
-    failed = {lid: rc for lid, rc in results.items() if rc != 0}
     if failed:
         session = get_session()
         for lid, rc in failed.items():
@@ -543,7 +569,14 @@ def run_coordinator(strategy_name: str, timeout_s: float = DEFAULT_TIMEOUT_S) ->
                 link.last_error = f"worker exited rc={rc} (killed/crashed before self-reporting)"
         session.commit()
         session.close()
-    return 0
+    # ALGODEV-33: a non-zero code here does NOT mean "the tick failed" in
+    # scripts/scheduler_tick.py's sense -- every account already ran in its
+    # own isolated subprocess above, so one bad account never touched any
+    # other's execution (that isolation contract is unchanged). It exists
+    # solely so _run_item's existing `if proc.returncode != 0` branch fires
+    # and prints the stderr diagnostics above into Ofelia's dispatch log --
+    # a killed/crashed worker must never look identical to a clean tick.
+    return 1 if failed else 0
 
 
 def main():
