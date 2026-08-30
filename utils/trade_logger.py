@@ -67,6 +67,24 @@ class StrategyLogger:
         self.log = logging.getLogger(f"strategy.{strategy}")
         self.log.setLevel(level)
         self.log.propagate = False
+        # logging.getLogger() caches by name process-wide, and handlers stick to
+        # the FIRST log_root this strategy name was constructed with. Without the
+        # rebind below, a later StrategyLogger("S009", log_root=<tmp>) would keep
+        # writing its TEXT stream to the ORIGINAL file: in one pytest process,
+        # importing scripts/s009_tick.py (module-level StrategyLogger("S009") at
+        # collection time) pinned the handler to the real reports/logs/S009/S009.log,
+        # so isolated run_once() tests still leaked fake cycles (BTCUSDT/ETHUSDT,
+        # for_date=2024-10-05) into the LIVE production log on every full pytest
+        # run (observed 2026-08-08..28, see ALGODEV-24). JSONL streams were never
+        # affected — they use self.dir per instance, not the logging cache.
+        expected_logfile = str((self.dir / f"{strategy}.log").resolve())
+        stale = [h for h in self.log.handlers
+                 if isinstance(h, RotatingFileHandler)
+                 and str(Path(h.baseFilename).resolve()) != expected_logfile]
+        if stale:
+            for h in list(self.log.handlers):
+                self.log.removeHandler(h)
+                h.close()
         if not self.log.handlers:
             fmt = logging.Formatter(
                 "%(asctime)s | %(levelname)-7s | " + strategy + " | %(message)s",

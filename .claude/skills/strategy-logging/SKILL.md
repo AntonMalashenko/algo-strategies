@@ -48,6 +48,20 @@ acts). `cycle_start(**fields)` returns a `cid` like `20260717-192607-0001`; pass
 call in that cycle. That is what lets you reconstruct "in this one wake-up, the bot saw X
 and did Y and Z" — never omit it.
 
+## Text-handler rebinding on `log_root` change (2026-08-30)
+
+The JSONL streams are per-instance (each `StrategyLogger` writes under its own
+`log_root`), but the human-readable text log goes through Python's process-wide
+`logging.getLogger(f"strategy.{name}")` cache. Since 2026-08-30, constructing a
+`StrategyLogger` with the **same name but a different `log_root`** rebinds the file
+handler to the new location (previously the FIRST `log_root` owned the text stream
+forever — that pinning let pytest runs leak fake cycles into the live
+`reports/logs/S009/S009.log`, see ALGODEV-24). Same name + same root reuses the
+existing handler (no duplicates). Caveat: a module-level `StrategyLogger` in a script
+(e.g. `scripts/s009_tick.py`) still claims the name at import time, so tests should
+keep constructing their loggers with `log_root=tmp_path` explicitly — the rebind makes
+that isolation actually take effect.
+
 ## API (all thread-safe, each record flushed immediately)
 
 ```python
