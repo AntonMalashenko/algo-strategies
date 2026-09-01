@@ -77,6 +77,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -402,15 +403,57 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
             for a in deltas:
                 logger.position(f"S011:{a['asset']}", a["kind"], cycle=cid, notional=a["notional"])
 
-            equity = decided["cash"] + sum(decided["position_value"].values())
-            st.update({"last_date": date, "cash": decided["cash"], "equity": equity,
-                      "position_value": decided["position_value"],
-                      "prev_held": decided["held_today"]})
+            # ALGODEV-34: a delta whose broker action FAILED (broker="execute")
+            # must not be applied to prev_held/position_value/cash -- state has
+            # to track what actually happened at the broker, not what we
+            # intended. Before this fix, `decided["held_today"]`/
+            # `decided["position_value"]` (computed by _decide_target_book
+            # BEFORE any order was sent) got saved unconditionally, so a
+            # rejected open/close was recorded as if it had succeeded and
+            # never got a retry on any later cycle -- found live twice:
+            # ESTOXX50's close rejected 2026-08-27 (MARKET_CLOSED) stayed
+            # open at the broker for days while the bot believed it was
+            # flat, and DOW/RUSSELL's opens rejected 2026-09-01 00:00
+            # (MARKET_CLOSED, midnight tick) never retried despite the
+            # broker never actually holding them.
+            #
+            # Fix: recompute the SAME pure _decide_target_book, but with
+            # held_today reverted to prev_held for any asset whose broker
+            # action failed -- i.e. pretend that transition never happened,
+            # so cash/position_value stay internally consistent (no ad-hoc
+            # reversal arithmetic) and the NEXT cycle sees a real
+            # prev_held != held_today transition again and retries.
+            failed_assets = {r["action"].get("asset") for r in result["results"]
+                             if r.get("error") is not None}
+            if failed_assets:
+                prev_held = st.get("prev_held", {})
+                held_today_corrected = dict(decided["held_today"])
+                for a in failed_assets:
+                    held_today_corrected[a] = prev_held.get(a, 0)
+                deltas_final, cash_final, position_value_final = _decide_target_book(
+                    held_today_corrected, prev_held, st.get("cash", cfg.start_capital),
+                    st.get("position_value", {}), cfg)
+                held_today_final = held_today_corrected
+                for a in failed_assets:
+                    logger.event("action_failed_state_reverted", cycle=cid, asset=a,
+                                level=logging.WARNING,
+                                text=f"broker action for {a} failed -- prev_held/"
+                                     f"position_value NOT updated, will retry next cycle")
+            else:
+                deltas_final = deltas
+                cash_final = decided["cash"]
+                position_value_final = decided["position_value"]
+                held_today_final = decided["held_today"]
+
+            equity = cash_final + sum(position_value_final.values())
+            st.update({"last_date": date, "cash": cash_final, "equity": equity,
+                      "position_value": position_value_final,
+                      "prev_held": held_today_final})
             state.save(st)
-            append_ledger({"date": date, "cash": round(decided["cash"], 2), "equity": round(equity, 2),
-                          "n_positions": sum(1 for v in decided["position_value"].values() if v > 0),
-                          "n_actions": len(deltas)}, LEDGER_FILE)
-            target = {a: v for a, v in decided["position_value"].items() if v > 0}
+            append_ledger({"date": date, "cash": round(cash_final, 2), "equity": round(equity, 2),
+                          "n_positions": sum(1 for v in position_value_final.values() if v > 0),
+                          "n_actions": len(deltas_final)}, LEDGER_FILE)
+            target = {a: v for a, v in position_value_final.items() if v > 0}
             booked = True
 
             for r in result["results"]:
