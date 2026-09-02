@@ -510,6 +510,28 @@ class CTraderS007(CTraderAdapter):
                 # for any risk math; see decisions-log.md 2026-07-23.
                 money_per_point_per_lot = full_symbol.lotSize
 
+                # KNOWN GAP (documented, not fixed): unlike bot/s009_paper.py's
+                # drop_forming, nothing here excludes the most-recently-closed
+                # M1 bar even when the cycle queries it only seconds after it
+                # closed -- entry detection (strategies/ger40_lonfra/setups.py
+                # ::find_setup) trusts that bar's close at face value. Found
+                # live 2026-08-31 10:03 Kyiv: a B-down setup's live order used
+                # entry=26440.6 (from the bar closed 4s earlier) with
+                # tp=26442.6 -- cTrader rejected it (TRADING_BAD_STOPS: TP
+                # must be < entry on a SELL). The 10:05 cycle re-scanned with
+                # 2 more bars available and resolved the SAME setup as
+                # already-tp'd at entry=26469.1 -- a different bar than the
+                # one used 2 minutes earlier, consistent with that bar's
+                # close not having fully settled broker-side at query time.
+                # Even a perfect fix here likely wouldn't have caught this
+                # specific trade live: by 10:05 the whole move (entry->TP)
+                # had already happened within already-elapsed bars -- same
+                # "too fast for a 1-minute poll" class as the ghost-trade
+                # reasoning behind promoting WORKING_S007_LIQFLOOR (see that
+                # preset's own comment, decisions-log.md 2026-08-11/12). No
+                # code changed for this -- touching find_setup's bar window
+                # is a signal-engine behavior change and needs backtest
+                # validation (Gate 0/1) first, not a quick live patch.
                 m1 = yield self._get_m1_step(symbol, history_days)
                 positions = yield self._reconcile_step()
                 actions = decide(symbol, m1, positions, balance, money_per_point_per_lot)
