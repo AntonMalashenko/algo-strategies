@@ -138,7 +138,7 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                           use_fixed_lot: bool, magic: str, logger: StrategyLogger,
                           symbol_candidates=None, history_days: int | None = None,
                           daily_risk_cap_pct: float | None = None, fx_rate: float | None = None,
-                          stop_flag_active=None) -> dict:
+                          stop_flag_active=None, initial_balance: float | None = None) -> dict:
     """One S007 reconcile cycle for an arbitrary account, reusing the exact
     decide()/reconcile logic `live()` below uses for the single .env/
     accounts.yml-configured account -- so a DB-registered multi-account run
@@ -155,6 +155,15 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     account genuinely differs (none do yet). stop_flag_active defaults to
     "never stopped" (no per-account manual kill-switch file exists yet;
     the module-level STOP_FLAG below is single-account-only by design).
+
+    `initial_balance` (ALGODEV-37): the fixed number decide()'s $ risk cap
+    is computed against -- webapp/runner.py::_worker_s007 passes the DB's
+    AccountStrategy.initial_balance (never the broker's live balance) so
+    the cap is one stable value all day, not something that (before this)
+    got smaller as the day's losses reduced the broker-reported balance,
+    letting daily_risk_cap_pct silently mean less risk budget than
+    intended after a losing stretch. None (the live()/CLI default, no DB
+    row) falls back to the broker's live balance, unchanged from before.
 
     Returns dict(cycle_id, actions, error, day_done, in_window, filtered,
     manual_stop) -- actions is a list of dicts, each either
@@ -206,21 +215,35 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
             (p["volume"] / 100.0) * abs(p["price"] - p["stop_loss"]) * fx_rate
             for p in have.values() if p.get("price") and p.get("stop_loss")
         )
-        risk_cap = balance * daily_risk_cap_pct / 100.0
+        # ALGODEV-37: the $ cap is computed against `initial_balance` (the
+        # DB's AccountStrategy.initial_balance, threaded in from
+        # webapp/runner.py::_worker_s007 -- see run_cycle_for_account's own
+        # docstring), NOT the broker's live `balance`. Using live balance
+        # made the cap shrink right along with the day's losses (2% of an
+        # already-reduced balance is a smaller $ number), which is backwards
+        # for a budget that's supposed to bound the day's risk -- found live
+        # 2026-09-02 (Anton): after ~$312 of realized morning stop-outs,
+        # cumulative day risk (realized + still-open) had already passed 4%
+        # of the day's STARTING balance while the live-balance-based cap
+        # kept reporting room to add more. `initial_balance=None` (the
+        # live()/CLI default, no DB row) falls back to live `balance`,
+        # unchanged from before.
+        risk_cap = (initial_balance if initial_balance is not None else balance) \
+            * daily_risk_cap_pct / 100.0
 
         # ALGODEV-36: day-level position cap, count-based off config values
         # only -- floor(daily_risk_cap_pct / risk_pct), e.g. 2% / 0.5% = 4
         # positions/day, across BOTH legs (primary + any b_reversal_to_A
         # recovery leg) combined, since `have` already spans every open
-        # S007-labeled position regardless of direction. Replaces the old
-        # open_risk/new_risk/risk_cap $ gate below (kept only as informational
-        # logging now): that gate compared against the BROKER's live
-        # |current_price - stop| (not entry price, see the comment above), so
-        # it drifted with the market between checks -- combined with
-        # lots_for_risk's min-lot floor overshooting the nominal risk_amount
-        # on a wide-stop entry, it let 5 positions open on 2026-09-02 despite
-        # a 2%-cap/0.5%-per-position config a user would expect to cap at 4.
-        # A plain count against a config-derived number can't drift that way.
+        # S007-labeled position regardless of direction. A position must
+        # clear BOTH this count cap and the $ risk_cap check below to be
+        # placed -- this one exists because lots_for_risk's min-lot floor
+        # can overshoot the nominal risk_amount on a wide-stop entry (found
+        # live 2026-09-02: a floored position's real $ risk came out ~1.6x
+        # its nominal target), so a handful of $-on-target positions plus
+        # one floor-overshot one could still clear a purely $-based cap
+        # while exceeding what a user reading "2% cap / 0.5% per position"
+        # would expect to be at most 4 positions.
         max_positions_per_day = int(daily_risk_cap_pct / risk_pct + 1e-9) if risk_pct > 0 else 10**9
 
         logger.event("state", cycle=cid, symbol=symbol,
@@ -300,6 +323,20 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                 else:
                     lot = lots_for_risk(risk_amount, stop_distance,
                                         money_per_point_per_lot, min_lot=fixed_lot)
+                # ALGODEV-37: $ gate, alongside (not instead of) the count cap
+                # above -- catches a min-lot-floored position's real risk
+                # overshooting its nominal risk_amount (see max_positions_
+                # per_day's comment) even when the position COUNT is still
+                # under cap. new_risk/open_risk are both entry-price-based
+                # (lot*stop_distance*.../broker fill price, see open_risk's
+                # own comment above), never the broker's live mark -- no
+                # market-drift risk in this check.
+                new_risk = lot * stop_distance * money_per_point_per_lot
+                if open_risk + new_risk > risk_cap:
+                    logger.event("skip_risk_cap", cycle=cid, label=lab,
+                                 open_risk=open_risk, new_risk=new_risk, risk_cap=risk_cap)
+                    continue
+                open_risk += new_risk
                 placed_this_cycle += 1
                 logger.event("size", cycle=cid, label=lab, stop_distance=stop_distance,
                              risk_amount=risk_amount, money_per_point_per_lot=money_per_point_per_lot,

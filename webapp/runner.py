@@ -225,7 +225,7 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
     result = run_s007_cycle(
         creds, preset=preset, risk_pct=link.risk_pct, fixed_lot=link.fixed_lot,
         use_fixed_lot=link.use_fixed_lot, magic=strat.name, logger=logger,
-        symbol_candidates=symbol_candidates)
+        symbol_candidates=symbol_candidates, initial_balance=link.initial_balance)
 
     for a in result["actions"]:
         if a["kind"] == "open":

@@ -197,11 +197,15 @@ class _FakeCTraderS007WithOpenPositions(_FakeCTraderS007):
 
 def test_live_caps_positions_at_config_derived_count_not_dollar_risk(monkeypatch):
     """ALGODEV-36: max_positions_per_day = floor(daily_risk_cap_pct /
-    risk_pct), a plain count against config values -- NOT the old broker-
-    live-price $ gate. 2% cap / 0.5% per position = 4 max/day. 2 already
-    open (from a prior cycle) + 3 newly wanted this cycle -- only 2 of the
-    3 new ones may be placed (2+2=4), the 3rd must be skipped regardless of
-    its own stop distance/size."""
+    risk_pct), a plain count against config values, gates INDEPENDENTLY of
+    the (also-active, ALGODEV-37) $ risk_cap check. 2% cap / 0.5% per
+    position = 4 max/day. 2 already open (from a prior cycle) + 3 newly
+    wanted this cycle -- only 2 of the 3 new ones may be placed (2+2=4),
+    the 3rd must be skipped regardless of its own stop distance/size. Stop
+    distances here are deliberately tiny so the $ risk_cap check (also
+    active) never binds first -- this test isolates the COUNT cap; see
+    test_live_dollar_risk_cap_uses_initial_balance_not_live_balance below
+    for the $ gate itself."""
     from bot import s007_paper, s007_config as C
 
     monkeypatch.setattr(C, "USE_FIXED_LOT", True)   # sizing irrelevant to the cap itself
@@ -210,15 +214,15 @@ def test_live_caps_positions_at_config_derived_count_not_dollar_risk(monkeypatch
     monkeypatch.setattr(C, "DAILY_RISK_CAP_PCT", 2.0)   # -> max_positions_per_day = 4
 
     already_open = [
-        dict(label="S007:2024-05-10:0", position_id=1, volume=100, price=18000.0, stop_loss=17950.0),
-        dict(label="S007:2024-05-10:1", position_id=2, volume=100, price=18010.0, stop_loss=17950.0),
+        dict(label="S007:2024-05-10:0", position_id=1, volume=100, price=18000.0, stop_loss=17998.0),
+        dict(label="S007:2024-05-10:1", position_id=2, volume=100, price=18010.0, stop_loss=18008.0),
     ]
     fake_positions = [
-        dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=17950.0, tp=18100.0, is_add=False),
-        dict(label="S007:2024-05-10:1", side="buy", entry=18000.0, sl=17950.0, tp=18100.0, is_add=True),
-        dict(label="S007:2024-05-10:2", side="buy", entry=18010.0, sl=17960.0, tp=18100.0, is_add=True),
-        dict(label="S007:2024-05-10:3", side="buy", entry=18020.0, sl=17970.0, tp=18100.0, is_add=True),
-        dict(label="S007:2024-05-10:4", side="buy", entry=18030.0, sl=17980.0, tp=18100.0, is_add=True),
+        dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=17998.0, tp=18100.0, is_add=False),
+        dict(label="S007:2024-05-10:1", side="buy", entry=18000.0, sl=17998.0, tp=18100.0, is_add=True),
+        dict(label="S007:2024-05-10:2", side="buy", entry=18010.0, sl=18008.0, tp=18100.0, is_add=True),
+        dict(label="S007:2024-05-10:3", side="buy", entry=18020.0, sl=18018.0, tp=18100.0, is_add=True),
+        dict(label="S007:2024-05-10:4", side="buy", entry=18030.0, sl=18028.0, tp=18100.0, is_add=True),
     ]
     monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
         in_window=True, day_done=False, flat=False, positions=fake_positions,
@@ -238,6 +242,48 @@ def test_live_caps_positions_at_config_derived_count_not_dollar_risk(monkeypatch
     # wanted labels (:2/:3/:4), only 2 fit under the cap (2 open + 2 new = 4).
     assert placed_labels == {"S007:2024-05-10:2", "S007:2024-05-10:3"}
     assert "S007:2024-05-10:4" not in placed_labels
+
+
+def test_live_dollar_risk_cap_uses_initial_balance_not_live_balance(fake_broker, monkeypatch):
+    """ALGODEV-37: risk_cap = initial_balance * daily_risk_cap_pct / 100,
+    NOT the broker's live balance -- found live 2026-09-02 (Anton): using
+    live balance means the cap shrinks right along with the day's already-
+    realized losses (2% of an already-reduced balance is a smaller $
+    number), which is backwards for a budget meant to bound the day's risk.
+
+    _FakeCTraderS007 (fake_broker fixture) always hands decide() a live
+    balance of $10,000 -- passing initial_balance=$20,000 here must double
+    the $ cap to $400 (not $200), letting a 3rd $111-ish position through
+    that would be skipped under a live-balance-based $200 cap."""
+    from bot import s007_paper, s007_config as C
+
+    monkeypatch.setattr(C, "USE_FIXED_LOT", True)
+    monkeypatch.setattr(C, "FIXED_LOT", 0.01)
+    monkeypatch.setattr(C, "DAILY_RISK_CAP_PCT", 2.0)
+
+    # Each ~85pt-stop position at fixed_lot=0.01 risks ~$111 (0.01 * 85 *
+    # 130.61 with the fake broker's 114.3 * EUR_TO_USD_FX_RATE_APPROX) --
+    # three of them (~$333 total) fit under a $400 (initial_balance=20000)
+    # cap but not a $200 (live balance=10000) one.
+    fake_positions = [
+        dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=17915.0, tp=18200.0, is_add=False),
+        dict(label="S007:2024-05-10:1", side="buy", entry=18010.0, sl=17925.0, tp=18200.0, is_add=True),
+        dict(label="S007:2024-05-10:2", side="buy", entry=18020.0, sl=17935.0, tp=18200.0, is_add=True),
+    ]
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=fake_positions,
+        direction="up", context={}))
+
+    from bot import s007_config as C2
+    result = s007_paper.run_cycle_for_account(
+        None, preset=C2.PRESET, risk_pct=C2.RISK_PCT, fixed_lot=C2.FIXED_LOT,
+        use_fixed_lot=C2.USE_FIXED_LOT, magic=C2.MAGIC, logger=s007_paper.LOG,
+        initial_balance=20_000.0)
+
+    assert result["error"] is None
+    _, _, actions = fake_broker.last_decide_args
+    placed_labels = {a["label"] for a in actions}
+    assert placed_labels == {"S007:2024-05-10:0", "S007:2024-05-10:1", "S007:2024-05-10:2"}
 
 
 def test_live_uses_fixed_lot_when_flag_set(fake_broker, monkeypatch):
