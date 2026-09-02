@@ -472,7 +472,8 @@ class CTraderS007(CTraderAdapter):
         Resolves the symbol, fetches the instrument's contract metadata (for
         risk sizing) and the account balance, gets M1 bars, lists open
         positions, then calls
-          decide(symbol, m1, positions, balance, money_per_point_per_lot)
+          decide(symbol, m1, positions, balance, money_per_point_per_lot,
+                 closed_deals=...)
             -> list[action]
         (pure Python, no I/O -- balance and money_per_point_per_lot are
         fetched here, once per cycle, precisely so `decide` doesn't have to
@@ -534,7 +535,22 @@ class CTraderS007(CTraderAdapter):
                 # validation (Gate 0/1) first, not a quick live patch.
                 m1 = yield self._get_m1_step(symbol, history_days)
                 positions = yield self._reconcile_step()
-                actions = decide(symbol, m1, positions, balance, money_per_point_per_lot)
+                # Closing deals over the last 24h (one cheap read in the same
+                # session): the only place a position that opened AND closed
+                # between two reconcile snapshots still exists, with its real
+                # fill price. decide() matches them to its own opened-today
+                # labels by position_id for the day-level risk budget (see
+                # bot/s007_paper.py::decide, 2026-09-02 incident) -- a fetch
+                # failure must not kill the trading cycle, so fall back to []
+                # (decide then uses its own logged planned-entry risk).
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                try:
+                    closed_deals = yield self._deal_list_step(
+                        now_ms - 24 * 3600 * 1000, now_ms)
+                except Exception:
+                    closed_deals = []
+                actions = decide(symbol, m1, positions, balance, money_per_point_per_lot,
+                                 closed_deals=closed_deals)
 
                 results = []
                 for a in actions:

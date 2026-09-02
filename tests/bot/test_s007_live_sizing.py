@@ -286,6 +286,134 @@ def test_live_dollar_risk_cap_uses_initial_balance_not_live_balance(fake_broker,
     assert placed_labels == {"S007:2024-05-10:0", "S007:2024-05-10:1", "S007:2024-05-10:2"}
 
 
+def test_live_day_caps_survive_stop_out_waves(fake_broker, monkeypatch):
+    """2026-09-02 live incident: both day caps were computed from the broker's
+    open-positions snapshot, so every stop-out wave zeroed them and the next
+    wave got a fresh budget -- 8 positions / ~4% lost on a 2% cap day. The
+    count cap must run against every label OUR LOG opened today (closed or
+    not): 3 opened -> a 4th still places; the moment 4 have opened, a 5th is
+    skipped even with the broker snapshot completely empty."""
+    from bot import s007_paper, s007_config as C
+
+    monkeypatch.setattr(C, "USE_FIXED_LOT", True)
+    monkeypatch.setattr(C, "FIXED_LOT", 0.01)
+    monkeypatch.setattr(C, "RISK_PCT", 0.5)
+    monkeypatch.setattr(C, "DAILY_RISK_CAP_PCT", 2.0)   # -> max 4 positions/day
+
+    # Wave 1 + 2 already came and went: 3 positions opened and stopped out.
+    # broker_positions is [] (nothing open NOW) -- exactly the live shape.
+    for idx in (0, 19, 51):
+        lab = f"S007:2024-05-10:{idx}"
+        s007_paper.LOG.position(lab, "open", side="buy", entry=18000.0,
+                                sl=17998.0, tp=18100.0, is_add=False, volume_lots=0.01)
+        s007_paper.LOG.position(lab, "close", reason="stop")
+
+    def want(label):
+        return [dict(label=label, side="buy", entry=18010.0, sl=18008.0,
+                     tp=18100.0, is_add=True)]
+
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=want("S007:2024-05-10:63"),
+        direction="up", context={}))
+    s007_paper.live()
+    _, _, actions = fake_broker.last_decide_args
+    assert {a["label"] for a in actions} == {"S007:2024-05-10:63"}  # 4th of the day: allowed
+
+    # That placement was logged -> 4 opened today. A 5th must be refused even
+    # though the broker still shows nothing open.
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=want("S007:2024-05-10:80"),
+        direction="up", context={}))
+    s007_paper.live()
+    _, _, actions = fake_broker.last_decide_args
+    assert actions == []
+
+
+class _FakeCTraderS007WithDeals(_FakeCTraderS007):
+    """Hands decide() a caller-supplied closed-deals list (what the real
+    run_live_cycle fetches from the broker's deal history), with an empty
+    open-positions snapshot -- the sub-minute-lifetime case where deal
+    history is the only place a fill price still exists."""
+    closed_deals: list[dict] = []
+
+    def run_live_cycle(self, symbol_candidates, history_days, decide):
+        m1 = pd.DataFrame(
+            {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+            index=pd.to_datetime(["2024-05-10 10:05"]),
+        )
+        balance = 10_000.0
+        money_per_point_per_lot = 114.3
+        actions = decide("GER40", m1, [], balance, money_per_point_per_lot,
+                         closed_deals=self.closed_deals)
+        _FakeCTraderS007.last_decide_args = (balance, money_per_point_per_lot, actions)
+        results = [dict(action=a, result={"ok": True}, error=None) for a in actions]
+        return dict(symbol="GER40", m1=m1, positions=[], actions=actions,
+                    results=results, balance=balance,
+                    money_per_point_per_lot=money_per_point_per_lot)
+
+
+def test_live_dollar_budget_counts_slipped_fills_from_deal_history(monkeypatch):
+    """Slippage case: two closed positions were logged at a 50-pt planned
+    stop distance ($57.15 each at lot 0.01 / 114.3 $/pt) but actually FILLED
+    88 pt from the stop ($100.58 each) -- only the broker's deal history
+    still knows that, matched by the position_id logged at open. Real spent
+    today = $201.16 > the $200 cap, so a 3rd position (nominal $57.15, count
+    cap not binding at 3 < 4) must be skipped. Planned-entry math alone
+    ($114.30 spent) would have let it through -- that's the assertion."""
+    from bot import s007_paper, s007_config as C
+
+    monkeypatch.setattr(C, "USE_FIXED_LOT", True)
+    monkeypatch.setattr(C, "FIXED_LOT", 0.01)
+    monkeypatch.setattr(C, "RISK_PCT", 0.5)
+    monkeypatch.setattr(C, "DAILY_RISK_CAP_PCT", 2.0)   # -> $200 on a 10k balance
+
+    closed_deals = []
+    for idx, pid in ((0, 111), (19, 222)):
+        lab = f"S007:2024-05-10:{idx}"
+        s007_paper.LOG.position(lab, "open", side="buy", entry=18000.0,
+                                sl=17950.0, tp=18100.0, is_add=False,
+                                volume_lots=0.01, position_id=pid)
+        s007_paper.LOG.position(lab, "close", reason="stop")
+        closed_deals.append(dict(position_id=pid, entry_price=18038.0,  # 88 pt from sl
+                                 exit_price=17950.0, closed_volume=100, pnl=-100.58))
+
+    fake_positions = [
+        dict(label="S007:2024-05-10:51", side="buy", entry=18010.0, sl=17960.0,
+             tp=18100.0, is_add=True),
+    ]
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=fake_positions,
+        direction="up", context={}))
+
+    fake_cls = type("FakeWithDeals", (_FakeCTraderS007WithDeals,),
+                    {"closed_deals": closed_deals})
+    fake_mod = types.SimpleNamespace(CTraderS007=fake_cls)
+    monkeypatch.setitem(sys.modules, "bot.ctrader_s007", fake_mod)
+    _FakeCTraderS007.last_decide_args = None
+
+    result = s007_paper.run_cycle_for_account(
+        None, preset=C.PRESET, risk_pct=C.RISK_PCT, fixed_lot=C.FIXED_LOT,
+        use_fixed_lot=C.USE_FIXED_LOT, magic=C.MAGIC, logger=s007_paper.LOG,
+        fx_rate=1.0)
+
+    assert result["error"] is None
+    _, _, actions = fake_cls.last_decide_args
+    assert actions == []  # blocked by the real (slipped) $ spend, not planned
+
+    # Same setup, deal history unavailable (fetch failed / empty): planned-
+    # entry fallback gives $114.30 spent -> the 3rd position fits and places.
+    fake_cls2 = type("FakeNoDeals", (_FakeCTraderS007WithDeals,), {"closed_deals": []})
+    monkeypatch.setitem(sys.modules, "bot.ctrader_s007",
+                        types.SimpleNamespace(CTraderS007=fake_cls2))
+    result = s007_paper.run_cycle_for_account(
+        None, preset=C.PRESET, risk_pct=C.RISK_PCT, fixed_lot=C.FIXED_LOT,
+        use_fixed_lot=C.USE_FIXED_LOT, magic=C.MAGIC, logger=s007_paper.LOG,
+        fx_rate=1.0)
+    assert result["error"] is None
+    _, _, actions = fake_cls2.last_decide_args
+    assert {a["label"] for a in actions} == {"S007:2024-05-10:51"}
+
+
 def test_live_uses_fixed_lot_when_flag_set(fake_broker, monkeypatch):
     from bot import s007_paper, s007_config as C
 

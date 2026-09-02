@@ -23,17 +23,34 @@ broker to the desired position set:
 Two signals guard the live bot beyond per-position sizing:
 
 **Daily aggregate risk cap** (`DAILY_RISK_CAP_PCT` in `bot/s007_config.py`,
-default 2% of current balance). `RISK_PCT` sizes each new entry/add
-independently and does not look at what is already open — min-lot flooring
-can push the REAL summed risk well past `max_positions x RISK_PCT`. Every
-cycle, `decide()` (`bot/s007_paper.py`) sums the broker's own potential loss
-across all open S007 positions — `|price - stopLoss| x volume`, read straight
-from `ProtoOAReconcileReq`'s response (`CTraderS007._reconcile_step`), not our
-nominal risk_amount — into `open_risk`. A new entry/add is skipped, logged as
-a `skip_risk_cap` event (`open_risk`/`new_risk`/`risk_cap` fields), once
-`open_risk + its own potential loss` would exceed `risk_cap`. `open_risk` and
-`risk_cap` are also logged on every `state` event for visibility. This does
-not force-close anything already open — it only blocks new entries.
+default 2% of the day's starting balance — `AccountStrategy.initial_balance`
+when run via the webapp runner, live balance as a CLI fallback). `RISK_PCT`
+sizes each new entry/add independently and does not look at what is already
+open — min-lot flooring and fill slippage can push the REAL summed risk well
+past `max_positions x RISK_PCT`. Every cycle, `decide()` (`bot/s007_paper.py`)
+computes `spent_risk_today`, the whole day's budget consumption:
+
+- open positions: the broker's own potential loss, `|price - stopLoss| x
+  volume`, read straight from `ProtoOAReconcileReq`'s response
+  (`CTraderS007._reconcile_step`), not our nominal risk_amount;
+- positions already CLOSED today (from the strategy's own append-only
+  position log, `StrategyLogger.open_records`): their actual fill-price risk,
+  matched by `position_id` to the broker's last-24h closing deals
+  (`_deal_list_step`, fetched once per cycle in the same session), falling
+  back to the logged planned entry if no deal matches. Closed positions
+  keep counting — a stop-out must not refund its risk to the next wave
+  (2026-09-02 incident: 8 positions / ~4% lost on a 2% cap because both
+  caps were computed from open-right-now state only).
+
+A new entry/add is skipped, logged as a `skip_risk_cap` event
+(`spent_risk_today`/`new_risk`/`risk_cap` fields), once `spent_risk_today +
+its own potential loss` would exceed `risk_cap`. Independently, a config-only
+count cap `max_positions_per_day = floor(DAILY_RISK_CAP_PCT / RISK_PCT)`
+(e.g. 2% / 0.5% = 4) is checked against every label opened today
+(`skip_max_positions` event) as a backstop should the $ math ever go wrong.
+`spent_risk_today`, `opened_today`, `open_risk` and `risk_cap` are also
+logged on every `state` event for visibility. This does not force-close
+anything already open — it only blocks new entries.
 
 **Manual stop-for-today** (kill switch, e.g. news event or discretionary
 override):

@@ -81,14 +81,17 @@ def _install_fake_sdk(monkeypatch):
                  "ProtoOAGetTrendbarsReq", "ProtoOASymbolsListReq",
                  "ProtoOANewOrderReq", "ProtoOACancelOrderReq", "ProtoOAReconcileReq",
                  "ProtoOATraderReq", "ProtoOAGetAccountListByAccessTokenReq",
-                 "ProtoOAClosePositionReq", "ProtoOASymbolByIdReq"):
+                 "ProtoOAClosePositionReq", "ProtoOASymbolByIdReq",
+                 "ProtoOADealListReq"):
         setattr(fake_open_api_messages, name, type(name, (), {}))
     fake_open_api_messages.ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
     fake_open_api_messages.ProtoOAErrorRes = ProtoOAErrorRes
 
     fake_model_messages = types.ModuleType("ctrader_open_api.messages.OpenApiModelMessages_pb2")
-    for name in ("ProtoOAOrderType", "ProtoOATradeSide", "ProtoOATrendbarPeriod"):
-        setattr(fake_model_messages, name, types.SimpleNamespace(BUY=1, SELL=2, M1=1, M15=15))
+    for name in ("ProtoOAOrderType", "ProtoOATradeSide", "ProtoOATrendbarPeriod",
+                 "ProtoOADealStatus"):
+        setattr(fake_model_messages, name, types.SimpleNamespace(
+            BUY=1, SELL=2, M1=1, M15=15, FILLED=2, PARTIALLY_FILLED=3))
 
     modules = {
         "ctrader_open_api": fake_pkg,

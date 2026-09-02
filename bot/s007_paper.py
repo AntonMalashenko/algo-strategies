@@ -182,7 +182,8 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     actions_taken: list[dict] = []
     status_info: dict = {}
 
-    def decide(symbol, m1, broker_positions, balance, money_per_point_per_lot):
+    def decide(symbol, m1, broker_positions, balance, money_per_point_per_lot,
+               closed_deals=None):
         """Pure decision step (no I/O): plan_now() + diff against what the
         broker already has open, sized to equal dollar risk per position.
         Runs inside the single cTrader session (see CTraderS007.run_live_cycle)
@@ -215,6 +216,42 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
             (p["volume"] / 100.0) * abs(p["price"] - p["stop_loss"]) * fx_rate
             for p in have.values() if p.get("price") and p.get("stop_loss")
         )
+
+        # Day-scoped memory of every position opened TODAY, open or already
+        # closed alike -- from our own append-only position log, NOT the
+        # broker's open-positions snapshot. This is the 2026-09-02 fix: both
+        # day-level caps below used to be computed from `have` (open right
+        # now), so every stop-out wave erased its own spent risk and handed
+        # the next wave a fresh budget -- 8 positions / ~4% lost on a day
+        # whose cap read "2%". A closed position must keep counting against
+        # the day's budget until the day ends.
+        today = m1.index[-1].date().isoformat() if len(m1) else None
+        opened_today = logger.open_records(f"{magic}:{today}:") if today else {}
+        # Actual fill price for closed-today labels, from the broker's deal
+        # history (run_live_cycle fetches the last 24h of closing deals in the
+        # same session): a position that opened and died between two reconcile
+        # snapshots never appeared in `have`, so its slippage-adjusted risk
+        # exists nowhere else. Matched by position_id (logged at open, below).
+        # No deal match (fetch failed / closed same second) -> fall back to
+        # our logged planned entry: risk without slippage, still counted.
+        deal_entry = {}
+        for dl in (closed_deals or []):
+            pid = dl.get("position_id")
+            if pid is not None and pid not in deal_entry:
+                deal_entry[pid] = dl.get("entry_price")
+        closed_risk_today = 0.0
+        for lab_, rec in opened_today.items():
+            if lab_ in have:
+                continue  # still open -- already counted via open_risk above
+            lot_, sl_ = rec.get("volume_lots"), rec.get("sl")
+            entry_ = deal_entry.get(rec.get("position_id")) or rec.get("entry")
+            if not lot_ or sl_ is None or entry_ is None:
+                continue
+            closed_risk_today += (float(lot_) * abs(float(entry_) - float(sl_))
+                                  * money_per_point_per_lot)
+        spent_risk_today = open_risk + closed_risk_today
+        opened_today_count = len(set(opened_today) | set(have))
+
         # ALGODEV-37: the $ cap is computed against `initial_balance` (the
         # DB's AccountStrategy.initial_balance, threaded in from
         # webapp/runner.py::_worker_s007 -- see run_cycle_for_account's own
@@ -234,16 +271,15 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
         # ALGODEV-36: day-level position cap, count-based off config values
         # only -- floor(daily_risk_cap_pct / risk_pct), e.g. 2% / 0.5% = 4
         # positions/day, across BOTH legs (primary + any b_reversal_to_A
-        # recovery leg) combined, since `have` already spans every open
-        # S007-labeled position regardless of direction. A position must
-        # clear BOTH this count cap and the $ risk_cap check below to be
-        # placed -- this one exists because lots_for_risk's min-lot floor
-        # can overshoot the nominal risk_amount on a wide-stop entry (found
-        # live 2026-09-02: a floored position's real $ risk came out ~1.6x
-        # its nominal target), so a handful of $-on-target positions plus
-        # one floor-overshot one could still clear a purely $-based cap
-        # while exceeding what a user reading "2% cap / 0.5% per position"
-        # would expect to be at most 4 positions.
+        # recovery leg) combined. Counted against opened_today_count (every
+        # label OUR LOG opened today, closed or not, union the broker's live
+        # snapshot) -- counting `have` alone let each stop-out wave reset the
+        # count to zero on 2026-09-02. A position must clear BOTH this count
+        # cap and the $ budget check below to be placed -- this one exists
+        # because lots_for_risk's min-lot floor can overshoot the nominal
+        # risk_amount on a wide-stop entry (found live 2026-09-02: a floored
+        # position's real $ risk came out ~1.6x its nominal target), and as
+        # the config-only backstop should the $ math above ever go wrong.
         max_positions_per_day = int(daily_risk_cap_pct / risk_pct + 1e-9) if risk_pct > 0 else 10**9
 
         logger.event("state", cycle=cid, symbol=symbol,
@@ -254,7 +290,9 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                      n_desired=len(res["positions"]), balance=balance,
                      money_per_point_per_lot=money_per_point_per_lot,
                      risk_amount=risk_amount, use_fixed_lot=use_fixed_lot,
-                     open_risk=open_risk, risk_cap=risk_cap,
+                     open_risk=open_risk, closed_risk_today=closed_risk_today,
+                     spent_risk_today=spent_risk_today,
+                     opened_today=opened_today_count, risk_cap=risk_cap,
                      max_positions_per_day=max_positions_per_day)
 
         # A "ghost": the engine entered AND resolved (stop/tp/daycap) this
@@ -309,12 +347,13 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                     logger.event("skip_reopen", cycle=cid, label=lab,
                                  reason="already_closed_today_per_position_log")
                     continue
-                if len(have) + placed_this_cycle >= max_positions_per_day:
-                    # Today's position count (already-open + placed so far
-                    # this cycle) already at the config-derived cap -- skip,
-                    # don't open. See max_positions_per_day's own comment.
+                if opened_today_count + placed_this_cycle >= max_positions_per_day:
+                    # Today's position count (everything opened today per our
+                    # own log + placed so far this cycle) already at the
+                    # config-derived cap -- skip, don't open. See
+                    # max_positions_per_day's own comment.
                     logger.event("skip_max_positions", cycle=cid, label=lab,
-                                 positions_open=len(have) + placed_this_cycle,
+                                 opened_today=opened_today_count + placed_this_cycle,
                                  max_positions_per_day=max_positions_per_day)
                     continue
                 stop_distance = abs(o["entry"] - o["sl"])
@@ -323,20 +362,21 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                 else:
                     lot = lots_for_risk(risk_amount, stop_distance,
                                         money_per_point_per_lot, min_lot=fixed_lot)
-                # ALGODEV-37: $ gate, alongside (not instead of) the count cap
-                # above -- catches a min-lot-floored position's real risk
-                # overshooting its nominal risk_amount (see max_positions_
-                # per_day's comment) even when the position COUNT is still
-                # under cap. new_risk/open_risk are both entry-price-based
-                # (lot*stop_distance*.../broker fill price, see open_risk's
-                # own comment above), never the broker's live mark -- no
-                # market-drift risk in this check.
+                # ALGODEV-37 + 2026-09-02 fix: $ gate, alongside (not instead
+                # of) the count cap above. spent_risk_today is the whole
+                # day's budget consumption -- open positions (broker fill
+                # price) PLUS everything already closed today (deal-history
+                # fill, or our logged entry as fallback) -- so a wave of
+                # stop-outs no longer refunds its own risk to the next wave,
+                # and a slippage-inflated fill keeps counting at its real
+                # size after it closes.
                 new_risk = lot * stop_distance * money_per_point_per_lot
-                if open_risk + new_risk > risk_cap:
+                if spent_risk_today + new_risk > risk_cap:
                     logger.event("skip_risk_cap", cycle=cid, label=lab,
-                                 open_risk=open_risk, new_risk=new_risk, risk_cap=risk_cap)
+                                 spent_risk_today=spent_risk_today,
+                                 new_risk=new_risk, risk_cap=risk_cap)
                     continue
-                open_risk += new_risk
+                spent_risk_today += new_risk
                 placed_this_cycle += 1
                 logger.event("size", cycle=cid, label=lab, stop_distance=stop_distance,
                              risk_amount=risk_amount, money_per_point_per_lot=money_per_point_per_lot,
@@ -373,8 +413,19 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                     logger.order(lab, "place_market", cycle=cid, request=req, error=err)
                     continue
                 logger.order(lab, "place_market", cycle=cid, request=req, result=res_)
+                # position_id from the broker's ORDER_ACCEPTED response, so a
+                # later cycle can match this label to a closing deal in the
+                # broker's deal history even if the position never survived
+                # long enough to appear in a reconcile snapshot (see
+                # spent_risk_today above). None if the response shape ever
+                # changes -- the risk math then falls back to planned entry.
+                try:
+                    pid = int(res_.position.positionId) or None
+                except Exception:
+                    pid = None
                 logger.position(lab, "open", cycle=cid, side=a["side"], entry=a["entry"],
-                                sl=a["sl"], tp=a["tp"], is_add=a["is_add"], volume_lots=a["volume_lots"])
+                                sl=a["sl"], tp=a["tp"], is_add=a["is_add"],
+                                volume_lots=a["volume_lots"], position_id=pid)
                 actions_taken.append(dict(kind="open", label=lab, side=a["side"], entry=a["entry"],
                                           sl=a["sl"], tp=a["tp"], is_add=a["is_add"],
                                           volume_lots=a["volume_lots"]))

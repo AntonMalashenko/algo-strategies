@@ -216,6 +216,39 @@ class StrategyLogger:
         """
         return self._label_has_action(label, "ghost")
 
+    def open_records(self, label_prefix: str) -> dict:
+        """{label: first 'open' record} for every label starting with
+        `label_prefix` that this strategy's position log ever opened.
+
+        The append-only positions/ directory is the strategy's own durable
+        memory of "what was opened", independent of whether the broker still
+        reports the position: a broker reconcile only lists positions open
+        RIGHT NOW, so anything already stopped/TP'd vanishes from it -- which
+        is exactly how S007's day-level risk caps double-counted their budget
+        on 2026-09-02 (every stop-out wave reset the 'open positions' the caps
+        were computed from; see bot/s007_paper.py::decide). Callers pass a
+        day-scoped prefix (e.g. "S007:2026-09-02:") to get the full set of
+        positions opened TODAY, open or closed alike, plus each one's open
+        fields (side/entry/sl/volume_lots/position_id/...) for risk math.
+        """
+        out: dict = {}
+        safe_prefix = _safe(label_prefix)
+        for path in sorted(self.pos_dir.glob(f"{safe_prefix}*.jsonl")):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    label = rec.get("label", "")
+                    if (rec.get("action") == "open" and label not in out
+                            and str(label).startswith(label_prefix)):
+                        out[label] = rec
+        return out
+
     def order(self, label: str, op: str, cycle: str | None = None,
               request: dict | None = None, result=None, error=None) -> None:
         """Log a broker order attempt with its request and result/error, per-position."""
