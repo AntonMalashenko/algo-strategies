@@ -39,7 +39,7 @@ def pick_stop(mode, t, entry, up, L, range_stop):
     return range_stop
 
 
-def liquidity_tp(up, entry, rh, rl, height, lv, L, t, use_floor=False):
+def liquidity_tp(up, entry, rh, rl, height, lv, L, t, use_floor=False, ceiling_points=None):
     """Nearest liquidity proxy beyond the entry and beyond the broken boundary.
 
     use_floor (ALGODEV-21): when True, candidates are additionally required to
@@ -50,6 +50,18 @@ def liquidity_tp(up, entry, rh, rl, height, lv, L, t, use_floor=False):
     reliably catch. With the floor, tp is range_tp unless liquidity extends
     beyond it, matching the user's proposed rule: "if liquidity is below 100%
     of the range, go to 100%; if above, go to liquidity."
+
+    ceiling_points (ALGODEV-35, ADDED but UNTESTED as of this writing -- see
+    backtest/run_s007_liqceiling.py): when set, clamps a liquidity target
+    that lies beyond range_tp to range_tp + ceiling_points, instead of
+    letting it sit arbitrarily far away. The floor above stops the target
+    from being nearer than 100% of the range; this stops it from being
+    unrealistically farther -- a target the session's remaining bars are
+    unlikely to ever reach behaves less like this strategy's intended
+    same-day momentum trade and more like an unintentional multi-day swing
+    target that (since S007 flattens at exit_end regardless) usually just
+    resolves 'eod' at whatever the day's close happens to be, making the
+    far-away number close to decorative. None (default) = uncapped.
     """
     range_tp = (rh + height) if up else (rl - height)
     floor = range_tp if use_floor else (rh if up else rl)
@@ -63,7 +75,10 @@ def liquidity_tp(up, entry, rh, rl, height, lv, L, t, use_floor=False):
         if not np.isnan(sh) and sh > entry:
             cands.append(sh)
         cands = [c for c in cands if c > floor]
-        return min(cands) if cands else range_tp
+        tp = min(cands) if cands else range_tp
+        if ceiling_points is not None:
+            tp = min(tp, range_tp + ceiling_points)
+        return tp
     else:
         for key in ("asia_low", "prev_day_low"):
             v = lv.get(key, np.nan)
@@ -73,16 +88,21 @@ def liquidity_tp(up, entry, rh, rl, height, lv, L, t, use_floor=False):
         if not np.isnan(sl) and sl < entry:
             cands.append(sl)
         cands = [c for c in cands if c < floor]
-        return max(cands) if cands else range_tp
+        tp = max(cands) if cands else range_tp
+        if ceiling_points is not None:
+            tp = max(tp, range_tp - ceiling_points)
+        return tp
 
 
 def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop, cfg,
-                  buffer, swing_buffer=0.0, add_cut_idx=None):
+                  buffer, swing_buffer=0.0, add_cut_idx=None, max_pos_override=None):
     """Run one entry + its pyramiding leg from start_idx. Returns (positions, reached)
     or (None, False) if the first entry fails the min-risk guard. Each position
     stores its own direction ('up') so mixed-direction days aggregate correctly.
     An add is validated only if the broken swing is >= swing_buffer (meaningful
-    CHoCH, not a micro-swing) and t <= add_cut_idx (add-time window)."""
+    CHoCH, not a micro-swing) and t <= add_cut_idx (add-time window).
+    max_pos_override caps this leg's total position count (used to apply
+    cfg.max_recovery_positions to the recovery leg only)."""
     n = len(closes)
     stop0 = pick_stop(cfg.stop_mode, start_idx, e_price, up, L, range_stop)
     if buffer > 0 and abs(e_price - stop0) < buffer:
@@ -94,6 +114,8 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
     last_add = start_idx
     reached = False
     eff_max = 10**9 if (cfg.unlimited_adds or cfg.daily_loss_cap_R is not None) else cfg.max_positions
+    if max_pos_override is not None:
+        eff_max = max_pos_override
 
     def _agg_R(mark):
         """Aggregate day P&L in R (realized closed + open marked to `mark`)."""
@@ -194,7 +216,8 @@ def simulate_day(bars: pd.DataFrame, rh, rl, mid, height, lv, cfg: StrategyConfi
         tp = (rh if up else rl) if scenario == "A" else ((rh + height) if up else (rl - height))
     elif cfg.tp_mode == "liquidity":
         tp = liquidity_tp(up, e_price, rh, rl, height, lv, L, e_idx,
-                          use_floor=cfg.liquidity_tp_floor)
+                          use_floor=cfg.liquidity_tp_floor,
+                          ceiling_points=cfg.liquidity_tp_ceiling_points)
     else:
         raise ValueError(f"unknown tp_mode {cfg.tp_mode!r}")
 
@@ -231,7 +254,8 @@ def simulate_day(bars: pd.DataFrame, rh, rl, mid, height, lv, cfg: StrategyConfi
             range_stop_A = rl if up_A else rh             # origin boundary (A-style)
             leg2, _ = _simulate_leg(highs, lows, closes, L, rev_idx, mid, up_A,
                                     tp_A, range_stop_A, cfg, buffer,
-                                    swing_buffer=swing_buffer, add_cut_idx=add_cut_idx)
+                                    swing_buffer=swing_buffer, add_cut_idx=add_cut_idx,
+                                    max_pos_override=cfg.max_recovery_positions)
             if leg2 is not None:
                 for p in leg2:
                     p["is_recovery"] = True
