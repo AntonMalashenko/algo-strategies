@@ -208,6 +208,21 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
         )
         risk_cap = balance * daily_risk_cap_pct / 100.0
 
+        # ALGODEV-36: day-level position cap, count-based off config values
+        # only -- floor(daily_risk_cap_pct / risk_pct), e.g. 2% / 0.5% = 4
+        # positions/day, across BOTH legs (primary + any b_reversal_to_A
+        # recovery leg) combined, since `have` already spans every open
+        # S007-labeled position regardless of direction. Replaces the old
+        # open_risk/new_risk/risk_cap $ gate below (kept only as informational
+        # logging now): that gate compared against the BROKER's live
+        # |current_price - stop| (not entry price, see the comment above), so
+        # it drifted with the market between checks -- combined with
+        # lots_for_risk's min-lot floor overshooting the nominal risk_amount
+        # on a wide-stop entry, it let 5 positions open on 2026-09-02 despite
+        # a 2%-cap/0.5%-per-position config a user would expect to cap at 4.
+        # A plain count against a config-derived number can't drift that way.
+        max_positions_per_day = int(daily_risk_cap_pct / risk_pct + 1e-9) if risk_pct > 0 else 10**9
+
         logger.event("state", cycle=cid, symbol=symbol,
                      last_bar=str(m1.index[-1]) if len(m1) else None,
                      in_window=res["in_window"], day_done=res["day_done"], flat=res["flat"],
@@ -216,7 +231,8 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                      n_desired=len(res["positions"]), balance=balance,
                      money_per_point_per_lot=money_per_point_per_lot,
                      risk_amount=risk_amount, use_fixed_lot=use_fixed_lot,
-                     open_risk=open_risk, risk_cap=risk_cap)
+                     open_risk=open_risk, risk_cap=risk_cap,
+                     max_positions_per_day=max_positions_per_day)
 
         # A "ghost": the engine entered AND resolved (stop/tp/daycap) this
         # position within bars already elapsed by the time this cycle polled
@@ -243,6 +259,7 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                                 position_id=p["position_id"], volume=p["volume"]))
         else:
             want = {p["label"]: p for p in res["positions"]}
+            placed_this_cycle = 0
             for lab, o in want.items():       # open new entries/adds (server-side SL/TP)
                 if lab in have:
                     continue
@@ -269,20 +286,21 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                     logger.event("skip_reopen", cycle=cid, label=lab,
                                  reason="already_closed_today_per_position_log")
                     continue
+                if len(have) + placed_this_cycle >= max_positions_per_day:
+                    # Today's position count (already-open + placed so far
+                    # this cycle) already at the config-derived cap -- skip,
+                    # don't open. See max_positions_per_day's own comment.
+                    logger.event("skip_max_positions", cycle=cid, label=lab,
+                                 positions_open=len(have) + placed_this_cycle,
+                                 max_positions_per_day=max_positions_per_day)
+                    continue
                 stop_distance = abs(o["entry"] - o["sl"])
                 if use_fixed_lot:
                     lot = fixed_lot
                 else:
                     lot = lots_for_risk(risk_amount, stop_distance,
                                         money_per_point_per_lot, min_lot=fixed_lot)
-                new_risk = lot * stop_distance * money_per_point_per_lot
-                if open_risk + new_risk > risk_cap:
-                    # Would push today's summed potential loss (already-open +
-                    # this one) past DAILY_RISK_CAP_PCT -- skip, don't open.
-                    logger.event("skip_risk_cap", cycle=cid, label=lab,
-                                 open_risk=open_risk, new_risk=new_risk, risk_cap=risk_cap)
-                    continue
-                open_risk += new_risk
+                placed_this_cycle += 1
                 logger.event("size", cycle=cid, label=lab, stop_distance=stop_distance,
                              risk_amount=risk_amount, money_per_point_per_lot=money_per_point_per_lot,
                              lot=lot)

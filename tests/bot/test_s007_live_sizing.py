@@ -172,6 +172,74 @@ def test_live_backfills_close_and_skips_reopen_on_broker_side_stop_before_log_ca
     assert s007_paper.LOG.label_was_closed(label) is True  # backfilled by decide()
 
 
+class _FakeCTraderS007WithOpenPositions(_FakeCTraderS007):
+    """Same contract as _FakeCTraderS007, but run_live_cycle hands decide()
+    a caller-supplied list of already-open broker positions instead of []
+    -- needed to test the day-level position cap, which counts already-open
+    positions (`have`) against the config-derived max, not just what a
+    single cycle wants to newly place."""
+    broker_positions: list[dict] = []
+
+    def run_live_cycle(self, symbol_candidates, history_days, decide):
+        m1 = pd.DataFrame(
+            {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+            index=pd.to_datetime(["2024-05-10 10:05"]),
+        )
+        balance = 10_000.0
+        money_per_point_per_lot = 114.3
+        actions = decide("GER40", m1, self.broker_positions, balance, money_per_point_per_lot)
+        _FakeCTraderS007.last_decide_args = (balance, money_per_point_per_lot, actions)
+        results = [dict(action=a, result={"ok": True}, error=None) for a in actions]
+        return dict(symbol="GER40", m1=m1, positions=self.broker_positions, actions=actions,
+                    results=results, balance=balance,
+                    money_per_point_per_lot=money_per_point_per_lot)
+
+
+def test_live_caps_positions_at_config_derived_count_not_dollar_risk(monkeypatch):
+    """ALGODEV-36: max_positions_per_day = floor(daily_risk_cap_pct /
+    risk_pct), a plain count against config values -- NOT the old broker-
+    live-price $ gate. 2% cap / 0.5% per position = 4 max/day. 2 already
+    open (from a prior cycle) + 3 newly wanted this cycle -- only 2 of the
+    3 new ones may be placed (2+2=4), the 3rd must be skipped regardless of
+    its own stop distance/size."""
+    from bot import s007_paper, s007_config as C
+
+    monkeypatch.setattr(C, "USE_FIXED_LOT", True)   # sizing irrelevant to the cap itself
+    monkeypatch.setattr(C, "FIXED_LOT", 0.01)
+    monkeypatch.setattr(C, "RISK_PCT", 0.5)
+    monkeypatch.setattr(C, "DAILY_RISK_CAP_PCT", 2.0)   # -> max_positions_per_day = 4
+
+    already_open = [
+        dict(label="S007:2024-05-10:0", position_id=1, volume=100, price=18000.0, stop_loss=17950.0),
+        dict(label="S007:2024-05-10:1", position_id=2, volume=100, price=18010.0, stop_loss=17950.0),
+    ]
+    fake_positions = [
+        dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=17950.0, tp=18100.0, is_add=False),
+        dict(label="S007:2024-05-10:1", side="buy", entry=18000.0, sl=17950.0, tp=18100.0, is_add=True),
+        dict(label="S007:2024-05-10:2", side="buy", entry=18010.0, sl=17960.0, tp=18100.0, is_add=True),
+        dict(label="S007:2024-05-10:3", side="buy", entry=18020.0, sl=17970.0, tp=18100.0, is_add=True),
+        dict(label="S007:2024-05-10:4", side="buy", entry=18030.0, sl=17980.0, tp=18100.0, is_add=True),
+    ]
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=fake_positions,
+        direction="up", context={}))
+
+    fake_cls = type("FakeWithOpen", (_FakeCTraderS007WithOpenPositions,),
+                    {"broker_positions": already_open})
+    fake_mod = types.SimpleNamespace(CTraderS007=fake_cls)
+    monkeypatch.setitem(sys.modules, "bot.ctrader_s007", fake_mod)
+    _FakeCTraderS007.last_decide_args = None
+
+    s007_paper.live()
+
+    _, _, actions = fake_cls.last_decide_args
+    placed_labels = {a["label"] for a in actions}
+    # labels :0/:1 are already open (have) -- not re-placed; of the 3 NEW
+    # wanted labels (:2/:3/:4), only 2 fit under the cap (2 open + 2 new = 4).
+    assert placed_labels == {"S007:2024-05-10:2", "S007:2024-05-10:3"}
+    assert "S007:2024-05-10:4" not in placed_labels
+
+
 def test_live_uses_fixed_lot_when_flag_set(fake_broker, monkeypatch):
     from bot import s007_paper, s007_config as C
 
