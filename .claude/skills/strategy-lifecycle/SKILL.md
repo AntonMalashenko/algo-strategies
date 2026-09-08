@@ -20,17 +20,23 @@ Strategies here live on **two tracks that must stay in sync**:
 
 1. **Code — in the repo** (`strategies/`, `backtest/`). The runnable engine, presets, and
    backtest scripts. English only (see `AGENTS.md`).
-2. **Research narrative — in the AlgoTrading Claude Project** (the `claude/*.md` docs, read
-   and written with the `Projects` tool — `project_read` / `project_search` /
-   `project_write`, *not* the local filesystem). Status, rules, results, decisions, honest
-   caveats. Russian is fine here; this is the maintainer-facing story.
+2. **Research narrative — in Confluence** (Algo → Strategies, one page per strategy +
+   the index; see the `confluence-docs` skill for the tree and access). Status, rules,
+   results, decisions, honest caveats. Russian is fine here; this is the
+   maintainer-facing story. The older **AlgoTrading Claude Project** `claude/*.md` docs
+   (registry, passports, logs — read/written with the `Projects` tool when available)
+   are the legacy track: keep them in sync when reachable, but new documentation lands
+   in Confluence per the maintainer's 2026-09-02 directive.
 
 A strategy that has code but no registry row, or a passport but no reproducible backtest,
 is only half-done. When you change one track, update the other in the same task.
 
 ## Where each thing lives
 
-Project docs (`Projects` tool):
+The role names below (registry, passport, spec, backtest/experiments/decisions logs) are
+the information architecture; their **current home is Confluence** (the *Strategies* index
+page = the registry; a strategy's page = its passport/spec/logs). The Claude Project
+`claude/*.md` files listed here are the legacy copies of the same roles (`Projects` tool):
 
 - `strategies-registry.md` — **single source of truth for status.** One row per strategy:
   `ID | name | market | timeframe | type | status | best result | file | updated`, plus a
@@ -53,7 +59,10 @@ Repo (filesystem / device):
   `fx_carry.py`), or a package `strategies/<pkg>/` when the engine grows (see
   `ger40_lonfra/` for S007 — `config/data/structure/setups/engine`).
 - `backtest/run_<name>.py` and any `walkforward` / `gate2_costs` / `prop_sim` scripts.
-- `docs/EXPERIMENTS.md`, `docs/STRATEGY_S004.md` — in-repo technical docs where kept.
+- `docs/` — technical docs only (data schemas, engineering plans). Strategy
+  research narratives were moved to Confluence (Algo → Strategies; see the
+  `confluence-docs` skill for the page tree and access) on 2026-08-30; the
+  remaining stubs there point at their pages.
 
 ## Status lifecycle
 
@@ -75,17 +84,10 @@ tunables and variants:
 - **A frozen `@dataclass` config is the single source of truth** for every tunable
   (`StrategyConfig` in `ger40_lonfra/config.py`). The engine is a pure state machine that
   reads the config — no magic numbers in the engine.
-- **Variants are presets, built with `.with_(...)`**, never forks of the engine. The chosen
-  frozen baseline is one named preset (`BASELINE_S007`); every experiment is another
-  (`FILTERED_S007`, `WORKING_S007`, ...). "Base untouched" is literal: a new rule is a new
-  default-off flag, and the baseline preset does not set it.
-- **Off-by-default experimental flags carry their verdict in the code comment.** When a rule
-  is tested and rejected, keep the flag but document *why* it lost, with numbers and date
-  (see `skip_A_entry_reaches_boundary`: "TESTED 2026-07-16 and REJECTED ... cuts expectancy
-  +0.53→+0.41R"). This stops the same idea from being re-litigated.
-- **Regression presets pin exact reproductions** of any prior reference result
-  (`REF_*`, guard-free) so a refactor can be proven byte-for-byte identical (S007 engine
-  reproduces `pyramid_duka.csv` to |diff| ≈ 1e-14).
+- **Variants are presets, built with `.with_(...)`**, never forks of the engine; the frozen
+  baseline preset (`BASELINE_S007`) is never edited. The full modifier discipline —
+  default-off flags, verdict-in-comment for rejected rules, `REF_*` regression presets —
+  is owned by the `strategy-modifiers` skill; follow it for any variant work.
 - **No look-ahead, ever**, and prove it (slice off the future, assert max|Δ| = 0). R-based
   accounting: one position = 1R, a day/trade sums R.
 
@@ -116,27 +118,26 @@ untouched until a promotion decision (done for S004 and S005).
 
 ## Adding a new strategy — checklist
 
-1. `project_read` `strategies-registry.md`; pick the next `SXXX`; add a row with status
-   `idea`/`prototype` and a one-line description, and a description block below. `project_write` it back.
+1. Read the Confluence *Strategies* index (see `confluence-docs`); pick the next `SXXX`;
+   add its row/bullet there and create the strategy's subpage. Cross-check ID collisions
+   against Jira (`ALGODEV-*`) and, if reachable, the legacy `strategies-registry.md`.
 2. Formalize the rules (a `strategy-spec` / passport draft) if the idea comes from a video
    or discretionary source — separate the mechanical, testable rules from the parts that
    are "feel" and say which you dropped and why.
 3. Write the code in the repo: `strategies/<name>.py` (or a package), config block up top,
    `backtest/run_<name>.py`. English, per `AGENTS.md`.
-4. Run the gates in order; log each meaningful run in `backtest-log.md` and each
-   design/data choice as an `E#` in `experiments-log.md`.
+4. Run the gates in order; log each meaningful run and each design/data choice (`E#`) in
+   the backtest/experiments sections of the strategy's docs.
 5. Update the registry row's status + best result, and the passport, as evidence lands.
-   Record maintainer decisions in `decisions-log.md` with the date.
+   Record maintainer decisions with the date.
 6. Keep the honest caveats section current — single instrument, single source, short
    sample, smooth equity, martingale profile, etc. Under-claiming is the house style.
 
 ## Modifying / testing a variant of an existing strategy
 
-Add a default-off config flag + a named preset; **never edit the baseline preset or the
-engine's default behavior**. Backtest the variant against the baseline on equal footing
-(same gates, same costs). If it wins, name it (`WORKING_S007`) and note it in the passport;
-if it loses, bake the verdict into the flag's comment and move on. When the maintainer says
-"base untouched" (база не трогаем), this is the mechanism that honors it.
+Owned by the `strategy-modifiers` skill — default-off flag + named `.with_()` preset,
+baseline never edited, verdict (win or lose) recorded with numbers and date. Backtest any
+variant against the baseline on equal footing: same gates, same real costs.
 
 ## Conventions that apply throughout
 

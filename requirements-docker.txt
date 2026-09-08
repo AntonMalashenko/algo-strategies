@@ -15,6 +15,11 @@ requests==2.32.3
 # cron strings against wall-clock time) ---
 croniter==6.2.4
 
+# --- shared Redis client (utils/redis_client.py: per-tick market-data cache
+# + distributed locks / shared state -- see the `redis` service in
+# docker-compose.yml and docs/DEV_PLANS.md) ---
+redis==5.2.1
+
 # --- Deribit option-board snapshot collector (scripts/fetch_deribit_snapshot.py,
 # ALGODEV-9): parquet output, per infra-scheduled-jobs-spec.md rev.2 SS3.3 ---
 pyarrow==24.0.0

@@ -100,7 +100,7 @@ GREEKS_REQUEST_SLEEP_SECONDS = 0.1
 
 # Deribit's daily snapshot window per spec SS3.4: 16:00 UTC covers the
 # Friday-16:00-UTC entry of the reference weekly short-strangle construction
-# this feeds (S012 candidate). A run is "for today" if it happens at or
+# this feeds (S013 candidate). A run is "for today" if it happens at or
 # after this UTC hour; a run earlier in the day is still today's window
 # but hasn't opened yet is not a case this script special-cases -- it is
 # watermark-driven (SS2), not clock-gated: an early manual run just captures

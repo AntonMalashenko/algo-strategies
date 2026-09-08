@@ -82,7 +82,7 @@ def _install_fake_sdk(monkeypatch):
                  "ProtoOANewOrderReq", "ProtoOACancelOrderReq", "ProtoOAReconcileReq",
                  "ProtoOATraderReq", "ProtoOAGetAccountListByAccessTokenReq",
                  "ProtoOAClosePositionReq", "ProtoOASymbolByIdReq",
-                 "ProtoOADealListReq"):
+                 "ProtoOADealListReq", "ProtoOAAmendPositionSLTPReq"):
         setattr(fake_open_api_messages, name, type(name, (), {}))
     fake_open_api_messages.ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
     fake_open_api_messages.ProtoOAErrorRes = ProtoOAErrorRes

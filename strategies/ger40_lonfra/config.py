@@ -55,6 +55,59 @@ class StrategyConfig:
     # 'prev_fvg'   : behind last opposite 1M FVG zone (wider)
     stop_mode: str = "mid_range"
 
+    # move a position's own stop to its own entry (breakeven) once price has
+    # moved cfg.breakeven_at_r * that position's OWN risk (|entry-stop0| at
+    # creation) in its favor. None (default) = OFF, base untouched -- BE was
+    # explicitly excluded from S007's design from the start (strategy-passport
+    # S007 sec 2, 2026-07-16 decision: "BE net; davlenie ubrano"). Applied
+    # per-position (primary entry AND every add each use their own entry/risk),
+    # so once armed, positions in the same leg can end up with DIFFERENT stop
+    # prices -- this breaks the "one common stop_mode=mid_range stop for the
+    # whole leg" property that is core to S007's documented edge (strategy-
+    # spec-S007.md sec 4: "ODIN OBSHCHIY stop"). Checked AFTER the existing
+    # stop/tp test within a bar (same conservative "stop before target"
+    # convention the rest of this engine uses), so a bar that hits the
+    # ORIGINAL stop before reaching the BE trigger still stops out at the
+    # original level -- the move only affects FUTURE bars. R-normalization
+    # always uses the position's risk0 (the risk at creation), never the
+    # possibly-moved current stop, so a position that reaches breakeven and
+    # later hits TP still scores its full R relative to its original risk,
+    # not a corrupted near-zero denominator.
+    #
+    # TESTED 2026-09-02 (Anton, "БУ после 1R") and REJECTED at breakeven_at_r
+    # =1.0, the value asked for -- backtest/run_s007_breakeven.py, Dukascopy
+    # 2023-06-26..2026-08-11, real spread 0.635/side:
+    #   BASELINE_S007:            net +0.4488 -> +0.4317 R/day (-3.8%), maxDD
+    #                              -41.2 -> -32.7R, worst-year +21.1 -> +33.5
+    #   WORKING_S007_LIQFLOOR
+    #   (current live preset):    net +0.8008 -> +0.6808 R/day (-15.0%),
+    #                              maxDD -50.9 -> -49.4R, worst-year
+    #                              +4.9 -> +28.2
+    # Costs expectancy on both bases, worse on the live preset specifically
+    # (it pyramids harder, so BE clips more of the run that IS the edge --
+    # strategy-spec-S007.md sec 10.1: "profit -- v doborah"). Consistent with
+    # every previously-tested per-position/individual-stop variant losing to
+    # the common stop (sec 11: "vse huzhe obshchego stopa"), since arming BE
+    # is exactly a partial move toward individual per-position stops.
+    # Robustness sweep (0.5/1.0/1.5/2.0 R) shows a real, non-monotonic
+    # trade-off, not just noise around 1R: 0.5R is worse still (-25.5% on the
+    # live preset); by 1.5-2.0R the expectancy hit shrinks and even turns
+    # slightly positive on BASELINE_S007 (+1.8%/+2.9%) while staying negative
+    # on the live preset (-2.0%/+3.0% -- 2.0R is a rare near-breakeven/better
+    # case). worst-year improves at EVERY tested level on both bases (BE
+    # protects exactly the B-double-failure tail already described in
+    # max_recovery_positions' comment above) while maxDD is roughly flat to
+    # slightly better. Net verdict at r=1.0 (what was asked): REJECTED -- a
+    # real expectancy cost on the config that matters (the live preset), not
+    # a lucky/unlucky single number. NOT closed off entirely: the worst-year/
+    # tail-risk improvement at every level, and near-breakeven expectancy at
+    # 1.5-2.0R on BASELINE_S007, could be worth a dedicated prop-sizing
+    # follow-up (stacked with WORKING_S007_PROP's max_recovery_positions cap,
+    # which targets the same double-failure tail from the add-count side
+    # instead of the stop side) -- not done in this pass. See
+    # experiments-log.md S007 E4, backtest-log.md 2026-09-02.
+    breakeven_at_r: float | None = None
+
     # --- take profit ---
     # 'range'      : fixed 100% of range (B) / opposite boundary (A)
     # 'liquidity'  : nearest liquidity proxy (asia / prior-day / prev swing)
@@ -300,6 +353,70 @@ WORKING_S007_NEWSSAFE = WORKING_S007_LIQFLOOR.with_(exit_end=NEWS_SAFE_EXIT_END)
 # -- this preset does not fix the max-total-drawdown constraint, only the
 # daily one. NOT promoted to any bot config; candidate pending Anton's call.
 WORKING_S007_PROP = WORKING_S007_NEWSSAFE.with_(max_recovery_positions=2)
+
+# 8-slot prop variant (2026-09-02, Anton, "maximally prop scheme"): doubles the
+# pyramiding cap from 4 to 8 (max_positions=8 -- the prior k x max_positions
+# robustness sweep only went up to max=5, strategy-spec-S007.md sec 10.1).
+# Paired with HALF the per-position risk (0.25% instead of 0.5%) in
+# backtest/run_s007_propscheme.py, so the two configs (this vs
+# WORKING_S007_NEWSSAFE @ 0.5%/R) intend the SAME per-day risk budget split
+# into finer slices -- NOT more risk.
+#
+# TESTED 2026-09-02 (backtest/run_s007_propscheme.py, Dukascopy 2023-06-26..
+# 2026-08-11, real spread 0.635/side) and ACCEPTED -- raising the cap changes
+# real trading behaviour, not just sizing math: avg positions/day jumps
+# 4.31->7.42 (the 4-slot cap was silently truncating real CHoCH-driven adds
+# on strongly trending days), and gross expectancy at HALVED risk still more
+# than doubles: net R/day (no BE) 4-slot@0.5% +0.8665 vs 8-slot@0.25% +1.9733
+# (per-R; %-of-account terms are what matters for sizing and are compared via
+# Gate 3 below), maxDD -53.5R -> -35.8R, worst day -9.03R -> -17.81R (in R,
+# but at half the %/R the %-of-account worst day is ~unchanged: -4.52% vs
+# -4.45%, no-BE). So finer granularity is closer to a free structural
+# improvement than a trade-off on the raw-R axis.
+#
+# Gate 3 (prop survivability, block-bootstrap Monte Carlo, N=4000 paths,
+# cashout +9% / daily limit -3% / total DD -10%, execution-friction modelled
+# as FILL_PROB=0.75 per position -- Anton's own "3 of 4" / "6 of 8" numbers,
+# both exactly 75%, emulated by simply dropping ~25% of realized positions at
+# random rather than new engine fill mechanics, per Anton's explicit
+# instruction): 8-slot@0.25% beats 4-slot@0.5% at EVERY breakeven level:
+#   no BE:    4-slot cashout 62.5% (daily-bust 35.7%) -> 8-slot cashout 86.9% (daily-bust 13.1%)
+#   BU@0.5R:  4-slot cashout 92.8% (daily-bust  3.8%) -> 8-slot cashout 100.0% (daily-bust 0.0%)
+#   BU@1.0R:  4-slot cashout 73.8%                    -> 8-slot cashout 96.9%
+#   BU@1.5R:  4-slot cashout 69.5%                    -> 8-slot cashout 93.1%
+#   BU@2.0R:  4-slot cashout 66.8%                    -> 8-slot cashout 90.6%
+# BU@0.5R is the best breakeven level for BOTH schemes on this Gate-3 axis --
+# the OPPOSITE of the raw-expectancy verdict (breakeven_at_r comment above:
+# REJECTED for net R at r=1.0, worse at 0.5R specifically on raw R). BU
+# trades expectancy for tail protection; Gate 3 cares about the tail, not the
+# average, so the two verdicts are not in conflict -- see experiments-log.md
+# S007 E5 for the full reconciliation. 8-slot@0.25%+BU@0.5R's worst
+# historical day (ALL positions filling, no MC dropout) is -2.70% of
+# account -- structurally never breaches the -3% daily limit in this sample,
+# hence its 0.0% daily-bust rate; this is a property of the specific
+# historical worst day, not a guarantee about days not yet seen.
+# CAVEATS: FILL_PROB=0.75 is Anton's own estimate, not independently
+# measured; the daily-limit check is EOD-close only (no intraday marking, so
+# real breach risk is understated, same caveat as WORKING_S007_NEWSSAFE
+# above); max_positions=8 is real historical backtested behaviour but still
+# only ~1 dataset/~3 years, same single-instrument/single-vendor caveats as
+# the rest of S007. NOT yet promoted to any bot config -- candidate pending
+# Anton's call, same status as WORKING_S007_PROP.
+WORKING_S007_NEWSSAFE_MAX8 = WORKING_S007_NEWSSAFE.with_(max_positions=8)
+
+# The full "maximally prop" scheme (ALGODEV-37): the MAX8 preset above PLUS
+# breakeven at 0.5R -- the exact winning combo from the Gate-3 table in
+# WORKING_S007_NEWSSAFE_MAX8's comment (8-slot@0.25% + BU@0.5R: 100.0%
+# cashout / 0.0% daily-bust / worst historical day -2.70% of account,
+# backtest/run_s007_propscheme.py, 2026-09-02). The harness built this combo
+# ad hoc via .with_(breakeven_at_r=be); this preset names it so the live bot
+# config (bot/s007_config.py::PRESET) can reference it directly. All caveats
+# from the MAX8 comment apply unchanged (FILL_PROB=0.75 unmeasured -- since
+# cross-checked at ~0.735 realized fill rate on live demo logs 2026-08-06..
+# 31, see decisions-log.md 2026-09-02; EOD-only daily-limit check; single
+# instrument/vendor). Requires live breakeven-amend support in the bot
+# (bot/ctrader_s007.py + bot/s007_paper.py, ALGODEV-37) before promotion.
+WORKING_S007_NEWSSAFE_MAX8_BE05 = WORKING_S007_NEWSSAFE_MAX8.with_(breakeven_at_r=0.5)
 
 # --- Exact reproductions of the two reference result files (regression only) ---
 # pyramid_duka.csv  <- pyramid.py run(k=2,max=4, use_structure_stop=True), 2h, range TP

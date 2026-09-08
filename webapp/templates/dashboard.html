@@ -15,6 +15,12 @@
     <span class="badge">{{ a.broker }}</span>
     <span class="badge {{ 'live' if a.env in ('live','mainnet') else '' }}">{{ a.env }}</span>
     {% if a.external_account_id %}<small class="mono">{{ a.external_account_id }}</small>{% endif %}
+    <form method="post" action="/accounts/{{ a.id }}/save" class="row" style="gap:4px">
+      <small class="mut">deposited</small>
+      <input type="number" step="0.01" min="0" name="initial_balance" value="{{ a.initial_balance or '' }}"
+             style="width:90px" placeholder="—">
+      <button class="ghost">Save</button>
+    </form>
     <span class="sp" style="flex:1"></span>
     <a class="btn ghost" href="/accounts/{{ a.id }}/link-strategy">+ Link strategy</a>
     <form method="post" action="/accounts/{{ a.id }}/delete"

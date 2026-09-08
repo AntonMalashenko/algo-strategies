@@ -51,6 +51,56 @@ def test_simulate_leg_stores_its_own_tp_on_primary_and_add_positions():
     assert down_positions[0]["tp"] == 90.0
 
 
+def test_stop0_survives_breakeven_move_unlike_stop():
+    """ALGODEV-40: p["stop0"] is the position's real stop as of creation,
+    stored once and never mutated afterward -- unlike p["stop"], which the
+    breakeven block collapses to p["entry"] once armed. bot/s007_signals.py
+    reads stop0 (not a risk0-based re-derivation) to get the correct
+    pre-breakeven stop for a fresh live placement."""
+    n = 20
+    highs = np.full(n, 100.0)   # risk0=0.5 (entry 99.5, stop 99.0); trig=99.75 <= 100 -> fires
+    lows = np.full(n, 99.2)     # stays above the 99.0 stop -- no premature same-bar stop-out
+    closes = np.full(n, 99.5)
+    cfg = StrategyConfig(stop_mode="mid_range", do_pyramid=False, breakeven_at_r=0.5)
+    L = structure_levels(highs, lows, cfg.k)
+
+    positions, _ = _simulate_leg(highs, lows, closes, L, 0, 99.5, True,
+                                 105.0, 99.0, cfg, buffer=0)
+    p = positions[0]
+    assert p["be_moved"] is True
+    assert p["stop"] == p["entry"] == 99.5      # collapsed by breakeven
+    assert p["stop0"] == 99.0                   # real creation-time stop, unmutated
+
+
+def test_stop0_can_sit_on_the_far_side_of_entry_under_mid_range():
+    """ALGODEV-40, found live 2026-09-07: under stop_mode="mid_range" every
+    position in a leg -- primary AND every pyramided add (both go through
+    the SAME pick_stop() call, see _simulate_leg's add branch above) --
+    shares ONE common stop (range_stop) regardless of that position's own
+    entry price. A pyramided add entered on a pullback below range_stop has
+    its (correct) shared stop ABOVE its own entry -- reproduced here via a
+    primary entry with the same geometry, since pick_stop()'s behavior is
+    identical for both. stop0 must reflect that real value exactly, not a
+    direction-based mirror of risk0 (which would silently place it BELOW
+    entry instead, on the wrong side -- exactly what caused two live adds
+    to lose money on trades the validated engine says should have won)."""
+    n = 5
+    highs = np.full(n, 100.0)
+    lows = np.full(n, 99.0)
+    closes = np.full(n, 99.5)
+    cfg = StrategyConfig(stop_mode="mid_range", do_pyramid=False)
+    L = structure_levels(highs, lows, cfg.k)
+
+    # entry (99.2) is BELOW the shared range_stop (99.5) for a long --
+    # exactly the geometry that broke live: stop sits above entry.
+    up_positions, _ = _simulate_leg(highs, lows, closes, L, 0, 99.2, True,
+                                    105.0, 99.5, cfg, buffer=0)
+    p = up_positions[0]
+    assert p["stop"] == 99.5
+    assert p["stop0"] == 99.5           # real shared stop, above entry
+    assert p["stop0"] != p["entry"] - p["risk0"]  # NOT the risk0-mirrored (wrong-side) guess
+
+
 def test_b_reversal_recovery_leg_carries_its_own_target_not_the_primary_legs():
     """End-to-end through simulate_day(): a failed B breakout that reverses
     to mid and flips into an A-style trade in the OPPOSITE direction must

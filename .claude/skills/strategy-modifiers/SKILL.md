@@ -80,8 +80,9 @@ treatment on their preset (why it's recommended, at what sizing).
 ## 4. Keep the documentation in sync — same task, not "later"
 
 A modifier isn't done when the backtest prints a number; it's done when the docs reflect it.
-The docs live in the AlgoTrading Claude **Project** (use the `Projects` tool —
-`project_read` / `project_write` — not the local filesystem):
+The docs live in **Confluence** (the Strategies index + the strategy's page — see
+`confluence-docs`); the Claude Project `claude/*.md` copies below are the legacy track,
+synced when reachable (`Projects` tool). The roles to update either way:
 
 - `strategies-registry.md` — update the strategy's **best result** cell and `updated` date;
   the registry is the single source of truth for status and headline result.
@@ -136,7 +137,6 @@ Keep that set **explicitly ranked and labeled** so it never gets buried:
 
 ## Conventions
 
-In-code artifacts (identifiers, comments, docstrings, commit messages, in-repo docs) are
-**English**; chat with the maintainer is Russian (`AGENTS.md`). Archive, don't delete —
-rejected modifiers stay as documented off-by-default flags, not removed code. Prefer honest,
-quantified, dated claims over optimistic summaries.
+Language policy and archive-don't-delete are shared project rules (`AGENTS.md`,
+`strategy-lifecycle`): rejected modifiers stay as documented off-by-default flags, not
+removed code. Prefer honest, quantified, dated claims over optimistic summaries.

@@ -9,6 +9,7 @@ pyyaml>=6.0          # configs/accounts.yml (broker creds), bot/accounts_config.
 # --- Данные ---
 ccxt>=4.3            # крипта (если понадобится)
 yfinance>=0.2        # быстрый доступ к котировкам для прототипов
+redis>=5.2,<6        # shared cache + distributed locks (utils/redis_client.py, `redis` service in docker-compose.yml)
 
 # --- Бэктест ---
 vectorbt>=0.26       # быстрый скрининг идей / перебор параметров

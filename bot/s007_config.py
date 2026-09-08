@@ -67,7 +67,21 @@ PLATFORM = "CTRADER"
 # once). Anton made an explicit, informed decision to promote anyway, accepting
 # that tradeoff (chat 2026-08-12) -- NOT an automatic backtest-passed promotion,
 # flag this context if revisiting the choice.
-PRESET = "WORKING_S007_LIQFLOOR"
+#
+# PROMOTED 2026-09-02 -> WORKING_S007_NEWSSAFE_MAX8_BE05 (ALGODEV-37, the
+# "maximally prop" scheme): 8 slots @ 0.25%/R + breakeven at 0.5R + news-safe
+# exit 14:24. Gate-3 prop simulation (backtest/run_s007_propscheme.py,
+# block-bootstrap MC, N=4000, cashout +9% / daily -3% / totalDD -10%,
+# FILL_PROB=0.75 -- since cross-checked at ~0.735 realized on live demo logs
+# 2026-08-06..31): 100.0% cashout / 0.0% daily-bust vs 62.5%/35.7% for the
+# previous 4-slot live shape, at comparable %/day return. Anton's explicit
+# decision (chat 2026-09-02): full cutover, no parallel demo track. Requires
+# the live breakeven amend support shipped the same day (bot/ctrader_s007.py
+# ::_amend_position_sltp_step + the be_moved flow in bot/s007_paper.py).
+# NOTE: this preset's exit_end (14:24) only takes effect because EXIT_END
+# below was switched with it -- plan_now() overrides the preset's session
+# fields with this module's values (see the EXIT_END comment below).
+PRESET = "WORKING_S007_NEWSSAFE_MAX8_BE05"
 
 # --- sizing ---
 RISK_PCT = 0.25            # % of CURRENT balance risked per position, refetched every
@@ -136,7 +150,13 @@ EUR_TO_USD_FX_RATE_APPROX = 1.1427
 
 # --- session (EET / Kyiv clock, anchored to the DAX cash open at 10:00) ---
 FR_START, FR_END = "09:00", "09:59"   # pre-open hour range (see spec §0)
-TRADE_START, EXIT_END = "10:00", "16:59"
+# EXIT_END must match the live preset's exit_end: plan_now() (bot/
+# s007_signals.py) overrides the preset's session fields with THESE values,
+# so a preset-only exit change silently never reaches the live bot.
+# 14:24 = NEWS_SAFE_EXIT_END (strategies/ger40_lonfra/config.py) -- flat
+# before the 14:29/15:15 news risk window, part of the NEWSSAFE/MAX8_BE05
+# scheme's Gate-3 numbers (switched 2026-09-02 with the PRESET above).
+TRADE_START, EXIT_END = "10:00", "14:24"
 
 # --- runtime ---
 HISTORY_DAYS = 4           # M1 lookback (need prior day for liquidity levels)

@@ -130,3 +130,44 @@ def test_a_wanted_position_uses_its_own_tp_not_the_primary_legs(monkeypatch):
     assert wanted["tp"] == 24818.666          # the recovery leg's OWN target
     assert wanted["tp"] != res["context"]["tp"]  # not the primary leg's day-level tp
     assert wanted["tp"] < wanted["entry"]     # valid for a sell (would be invalid for the primary leg's tp)
+
+
+def test_orig_sl_uses_the_engines_real_stop0_not_a_risk0_mirrored_guess(monkeypatch):
+    """ALGODEV-40, found live 2026-09-07: under stop_mode="mid_range" every
+    position in a leg (primary AND every pyramided add) shares ONE common
+    stop regardless of that add's own entry price -- so an add entered on a
+    pullback can legitimately have its shared stop on the "wrong" side of
+    its own entry (above entry for a long, e.g. entry=25979.5 stop=25994.25).
+    orig_sl used to be RE-DERIVED as `entry -+ risk0` (direction-based),
+    which silently mirrors to the "textbook" side regardless of where the
+    real stop actually sits -- for this shape that produces a stop on the
+    WRONG side entirely (25964.75 instead of 25994.25), which two live adds
+    hit for real losses that should have been wins. orig_sl must equal the
+    engine's own stop0 (the real, un-mutated creation-time stop engine.py
+    now stores), not a re-derived guess."""
+    import bot.s007_signals as sig
+
+    fake_r = dict(
+        scenario="B", direction="up", tp=26163.4, reached_tp=False, n_recovery=0, n_pos=1,
+        positions=[
+            # A pyramided add whose entry sits BELOW the leg's shared stop
+            # (mid_range) -- risk0 = |25979.5 - 25994.25| = 14.75, so a
+            # direction-based re-derivation would wrongly give
+            # entry - risk0 = 25964.75 (below entry) instead of the real
+            # stop0 = 25994.25 (above entry).
+            dict(idx=112, entry=25979.5, stop=25994.25, stop0=25994.25, status="eod",
+                exit=None, up=True, is_add=True, tp=26163.4),
+        ],
+    )
+    monkeypatch.setattr(sig, "simulate_day", lambda *a, **k: fake_r)
+
+    fr = _frankfurt_bars("2026-09-07", n=45, low=25969.5, high=26019.0)
+    ld_idx = pd.date_range("2026-09-07 10:00", periods=5, freq="1min")
+    ld = pd.DataFrame(dict(open=25980.0, high=25985.0, low=25975.0, close=25980.0), index=ld_idx)
+    bars = pd.concat([fr, ld])
+
+    res = plan_now(bars, now=pd.Timestamp("2026-09-07 10:05:00"), preset="WORKING_S007")
+
+    assert len(res["positions"]) == 1
+    wanted = res["positions"][0]
+    assert wanted["orig_sl"] == 25994.25   # the real shared stop, NOT 25964.75

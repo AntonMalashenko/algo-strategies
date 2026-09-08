@@ -272,6 +272,38 @@ def test_run_once_writes_to_the_ledger_file(tmp_path, monkeypatch):
     assert f"{FAKE_DAY + 1}," in (tmp_path / "ledger.csv").read_text()
 
 
+def test_no_ledger_file_ignores_a_stale_shared_broker_ledger(tmp_path, fake_bybit, monkeypatch):
+    """Found live 2026-09-03: the DB-driven caller (webapp/runner.py's
+    _worker_s009) never passes broker_ledger_file, so it's always None here
+    -- append_broker_ledger already honors that ("None" -> skip the write),
+    but _last_broker_ledger_row did NOT: it fell back to the single-account
+    BROKER_LEDGER_FILE constant for READS regardless, so every DB-driven
+    cycle silently compared today's equity against whatever a totally
+    unrelated stale row (last written 2026-08-11 by the legacy single-
+    account CLI) happened to contain -- real_net_ret/hours_since_prev ended
+    up spanning weeks while looking like a normal per-cycle reading. With no
+    broker_ledger_file passed in, both the read and the write must be
+    skipped -- real_net_ret/hours_since_prev must come back None, not a
+    number computed against an unrelated account's old data."""
+    stale_ledger = tmp_path / "shared_broker_ledger.csv"
+    pd.DataFrame([{"ts": "2020-01-01T00:00:00+00:00", "cycle": "old", "date": "2020-01-01",
+                  "broker_equity": 50.0, "hours_since_prev": None, "real_net_ret": None}]
+                ).to_csv(stale_ledger, index=False)
+    monkeypatch.setattr(s009, "BROKER_LEDGER_FILE", stale_ledger)
+
+    s009.run_cycle_for_account(
+        account_key="acct-a", creds={"api_key": "k", "api_secret": "s"}, cfg=s009.DEPLOY,
+        state=_store(tmp_path), logger=_log(tmp_path), do_fetch=False, drop_forming=False,
+        broker="dry", allow_mainnet=False)   # broker_ledger_file left at its None default
+
+    broker_events = [e for e in _read_events(tmp_path) if e["kind"] == "broker"]
+    assert len(broker_events) == 1
+    assert broker_events[0]["real_net_ret"] is None
+    assert broker_events[0]["hours_since_prev"] is None
+    # and the unrelated shared file must be untouched (still just the stale row)
+    assert len(pd.read_csv(stale_ledger)) == 1
+
+
 def test_run_cycle_for_account_without_ledger_file_writes_no_csv(tmp_path):
     state = _store(tmp_path)
     state.save({"last_day": FAKE_DAY, "equity": 1.0, "book": {}})

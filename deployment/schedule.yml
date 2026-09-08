@@ -15,8 +15,12 @@ strategies:
   # `python -m webapp.runner --strategy <name>`, which itself queries the DB
   # for enabled AccountStrategy rows and fans out per account. The schedule
   # here is a property of the STRATEGY (one job per strategy, not per
-  # account/user) -- mirrors scripts/s007_tick.py::in_session()'s window
-  # (TRADE_START/EXIT_END = "10:00"/"16:59", bot/s007_config.py:111).
+  # account/user) -- scripts/s007_tick.py::in_session() derives its window
+  # from bot/s007_config.py's TRADE_START/EXIT_END ("10:00"/"14:24" since the
+  # 2026-09-02 ALGODEV-37 cutover to the news-safe MAX8_BE05 preset). The
+  # cron hours below are deliberately WIDER (until 16:59): a cycle after
+  # EXIT_END is a cheap flatten/no-op, and the slack means a clock/config
+  # drift can't leave positions unflattened.
   - name: S007
     schedule: "* 10-16 * * 1-5"
   # S009 rebalances at most once a day (a new closed UTC day). It has a
@@ -96,7 +100,7 @@ tasks:
   # story.
   #
   # Target: fire at/after 16:00 UTC (spec SS3.4 -- the reference weekly
-  # short-strangle construction's Friday-16:00-UTC entry, S012 candidate).
+  # short-strangle construction's Friday-16:00-UTC entry, S013 candidate).
   # This cron is a LOCAL hour, matching the file header above (evaluated
   # against the container's Europe/Kyiv wall clock) -- picked for the
   # CURRENT summer offset (EEST, UTC+3): 19:00 local = 16:00 UTC. Because

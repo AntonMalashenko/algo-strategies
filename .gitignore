@@ -13,7 +13,7 @@ venv/
 env/
 .python-version
 
-# Data & outputs (не коммитим тяжёлые данные и сгенерированные отчёты)
+# Data & outputs (heavy data files and generated reports are not committed)
 data/raw/*
 data/processed/*
 data/histdata/*
@@ -38,6 +38,13 @@ accounts.yml
 # Claude Code local machine settings (per-machine permission grants, not shared)
 .claude/settings.local.json
 data/app.db
+data/app.db.bak-*
+data/state/
+
+# Machine-local agent skill mirrors / staging artifacts (not shared)
+.agents/
+_deploy_incoming.tgz
+_stage_tmp.tar.gz
 
 # Scratch holding pen for files pending manual deletion (device_bash cannot rm)
 _to_delete/

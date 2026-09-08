@@ -22,7 +22,7 @@ if HAVE_SDK:
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOAGetTrendbarsReq, ProtoOANewOrderReq, ProtoOAClosePositionReq,
         ProtoOAReconcileReq, ProtoOASymbolByIdReq, ProtoOADealListReq,
-        ProtoOAOrderErrorEvent, ProtoOAErrorRes,
+        ProtoOAOrderErrorEvent, ProtoOAErrorRes, ProtoOAAmendPositionSLTPReq,
     )
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
         ProtoOAOrderType, ProtoOATradeSide, ProtoOATrendbarPeriod,
@@ -138,6 +138,16 @@ class CTraderS007(CTraderAdapter):
             req.volume = volume
             d = self.client.send(req)
             d.addCallback(self._check_response)
+            d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
+        return self._run(work)
+
+    def amend_position_sl(self, position_id: int, sl_price: float,
+                          tp_price: float | None):
+        """Move an open position's stop loss (ALGODEV-37 live breakeven).
+        Standalone one-off variant of _amend_position_sltp_step below --
+        see that method for the takeProfit-preservation contract."""
+        def work(done):
+            d = self._amend_position_sltp_step(position_id, sl_price, tp_price)
             d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
         return self._run(work)
 
@@ -457,6 +467,32 @@ class CTraderS007(CTraderAdapter):
         d.addCallback(self._check_response)
         return d
 
+    def _amend_position_sltp_step(self, position_id: int, sl_price: float,
+                                  tp_price: float | None, digits: int = 2):
+        """Amend an open position's SL (ALGODEV-37 live breakeven at 0.5R).
+
+        ProtoOAAmendPositionSLTPReq REPLACES both protection levels: a field
+        left unset is REMOVED from the position, not "kept as is" -- so the
+        position's current takeProfit (from this cycle's _reconcile_step
+        snapshot) must always be passed back in, or moving the stop would
+        silently strip the TP. tp_price=None means the position genuinely
+        has no TP (never the case for S007 orders, which always place one --
+        see _place_market_step), tolerated here so a manually-edited
+        position can't crash the cycle.
+
+        `digits`: symbol price precision -- same rounding contract as
+        _place_market_step (cTrader rejects more decimals than the symbol
+        allows, found live 2026-08-06)."""
+        req = ProtoOAAmendPositionSLTPReq()
+        req.ctidTraderAccountId = self.account
+        req.positionId = position_id
+        req.stopLoss = round(float(sl_price), digits)
+        if tp_price:
+            req.takeProfit = round(float(tp_price), digits)
+        d = self.client.send(req)
+        d.addCallback(self._check_response)
+        return d
+
     def run_live_cycle(self, symbol_candidates, history_days: int, decide):
         """One connect/auth/work/disconnect session for a full bot cycle.
 
@@ -478,8 +514,11 @@ class CTraderS007(CTraderAdapter):
         (pure Python, no I/O -- balance and money_per_point_per_lot are
         fetched here, once per cycle, precisely so `decide` doesn't have to
         make its own broker calls) where each action is
-          {"kind": "place", side, sl, tp, volume_lots, label, ...}  or
-          {"kind": "close", position_id, volume, label, ...}
+          {"kind": "place", side, sl, tp, volume_lots, label, ...},
+          {"kind": "close", position_id, volume, label, ...}  or
+          {"kind": "amend", position_id, sl, tp, label, ...}   (move SL,
+              keep TP -- ALGODEV-37 live breakeven; tp MUST carry the
+              position's current takeProfit, see _amend_position_sltp_step)
         and executes the actions in order. Returns
           {"symbol", "m1", "positions", "actions", "results", "balance",
            "money_per_point_per_lot"}
@@ -553,19 +592,45 @@ class CTraderS007(CTraderAdapter):
                                  closed_deals=closed_deals)
 
                 results = []
+                placed_ok = False
                 for a in actions:
                     try:
                         if a["kind"] == "place":
                             r = yield self._place_market_step(
                                 symbol, a["side"], a["sl"], a["tp"], a["volume_lots"], a["label"],
                                 full_symbol=full_symbol)
+                            placed_ok = True
+                        elif a["kind"] == "amend":
+                            r = yield self._amend_position_sltp_step(
+                                a["position_id"], a["sl"], a["tp"],
+                                digits=full_symbol.digits)
                         else:
                             r = yield self._close_position_step(a["position_id"], a["volume"])
                         results.append(dict(action=a, result=r, error=None))
                     except Exception as e:
                         results.append(dict(action=a, result=None, error=e))
 
+                # ALGODEV-39: a fresh placement's REAL fill price/stop is only
+                # ever visible via reconcile() -- the `positions` snapshot
+                # above was fetched BEFORE this cycle's own orders, and the
+                # NewOrderReq response only carries positionId (see
+                # bot/s007_paper.py's `pid` extraction), not price. One extra
+                # reconcile call, same session, only when this cycle actually
+                # placed something, so the caller can log/use the broker's
+                # real entry immediately instead of waiting a full cycle for
+                # `have` to catch up. A fetch failure here must not fail
+                # orders that already succeeded -- fall back to the
+                # pre-orders snapshot (caller then falls back to its own
+                # planned values, same as before this existed).
+                post_positions = positions
+                if placed_ok:
+                    try:
+                        post_positions = yield self._reconcile_step()
+                    except Exception:
+                        post_positions = positions
+
                 return dict(symbol=symbol, m1=m1, positions=positions,
+                            post_positions=post_positions,
                             actions=actions, results=results, balance=balance,
                             money_per_point_per_lot=money_per_point_per_lot)
 

@@ -108,7 +108,24 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
     if buffer > 0 and abs(e_price - stop0) < buffer:
         return None, False
     positions = [dict(entry=e_price, stop=stop0, status="open", exit=None,
-                      is_add=False, up=up, idx=start_idx, tp=tp)]
+                      is_add=False, up=up, idx=start_idx, tp=tp,
+                      risk0=abs(e_price - stop0),
+                      # ALGODEV-40: the position's REAL stop as of creation,
+                      # kept alongside `stop` but never mutated by the
+                      # breakeven block below (`stop` itself IS mutated,
+                      # collapsing to `entry` once be_moved fires) -- this is
+                      # the single source of truth for "what was this
+                      # position's stop before any breakeven move", instead
+                      # of re-deriving it from risk0+direction (which
+                      # silently mirrors to the WRONG side whenever this
+                      # stop sits on the far side of entry -- normal under
+                      # stop_mode="mid_range", where every position in a leg
+                      # shares ONE common stop regardless of its own entry
+                      # price. Found live 2026-09-07: two pyramided adds
+                      # whose entries had crossed the shared stop got a
+                      # risk0-mirrored WRONG-side stop sent to the broker,
+                      # turning two engine-validated wins into real losses).
+                      stop0=stop0)]
     armed = False
     armed_price = np.nan   # the pullback swing extreme that armed the current add
     last_add = start_idx
@@ -143,6 +160,18 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
                     p["status"] = "stop"; p["exit"] = p["stop"]
                 elif lo <= tp:
                     p["status"] = "tp"; p["exit"] = tp
+            # breakeven (off by default, cfg.breakeven_at_r is None): move this
+            # position's own stop to its own entry once price has moved
+            # breakeven_at_r * risk0 in its favor. Checked AFTER the stop/tp
+            # test above so a same-bar stop-out at the ORIGINAL stop still
+            # wins (conservative ordering); the move only affects future bars.
+            if (cfg.breakeven_at_r is not None and p["status"] == "open"
+                    and not p.get("be_moved")):
+                trig = (p["entry"] + cfg.breakeven_at_r * p["risk0"] if up
+                        else p["entry"] - cfg.breakeven_at_r * p["risk0"])
+                if (up and hi >= trig) or ((not up) and lo <= trig):
+                    p["stop"] = p["entry"]
+                    p["be_moved"] = True
         if (up and hi >= tp) or ((not up) and lo <= tp):
             for p in positions:
                 if p["status"] == "open":
@@ -181,7 +210,8 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
                         if buffer > 0 and abs(c - st) < buffer:
                             continue
                         positions.append(dict(entry=c, stop=st, status="open",
-                                              exit=None, is_add=True, up=up, idx=t, tp=tp))
+                                              exit=None, is_add=True, up=up, idx=t, tp=tp,
+                                              risk0=abs(c - st), stop0=st))  # ALGODEV-40, see primary entry's comment
                         armed = False
                         last_add = t
     last_close = closes[-1]
@@ -271,7 +301,7 @@ def simulate_day(bars: pd.DataFrame, rh, rl, mid, height, lv, cfg: StrategyConfi
         # (see cfg.cost_model docstring / ALGODEV-21 follow-up).
         cost_points = (p["entry"] * (2.0 * cfg.spread_bps_per_side + cfg.commission_bps) / 10000.0
                       if cfg.cost_model == "bps" else flat_cost_points)
-        risk = abs(p["entry"] - p["stop"])
+        risk = p.get("risk0", abs(p["entry"] - p["stop"]))
         pu = p["up"]
         if risk <= 0:
             p["R"] = 0.0

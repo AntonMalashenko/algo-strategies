@@ -59,6 +59,8 @@ class LogKind(str, Enum):
     SKIP_RISK_CAP = "skip_risk_cap"
     LOOP_SETTLED = "loop_settled"
     LOOP_RESUMED = "loop_resumed"
+    # ALGODEV-37: live breakeven -- runner moved a position's SL to its fill
+    POSITION_AMENDED = "position_amended"
     # written by webapp/sync_positions.py, never by the trading runner
     SYNC = "sync"                        # one sync pass finished (summary counters)
     POSITION_ADOPTED = "position_adopted"  # broker had a position this bot never opened

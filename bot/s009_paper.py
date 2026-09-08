@@ -42,8 +42,14 @@ deployment use `scripts/s009_tick.py` + `deployment/com.algo.s009-paper.plist`
 (installed via `scripts/s009_tick_install.sh install`) instead — same daily
 cadence, no long-lived process for macOS to throttle.
 
-Deploy config (frozen champion + vol-target modifier): lb=7, short top-2 /
-long bottom-2, dollar-neutral, daily rebalance, taker 0.055%/side, vol-target 20%/yr.
+Deploy config (since 2026-08-31, ALGODEV-13 combo decision): 70% S009
+funding-carry (champion lb=7, 2/2) + 30% S012 cross-sectional momentum
+(deployed lb=14, 3/3) blended at WEIGHT level into one book, daily rebalance,
+taker 0.055%/side, portfolio-level vol-target 20%/yr (sleeves vol-off) — see
+strategies/xsect_combo.py's module docstring for the decision record. Before
+that date DEPLOY was pure S009 (lb7 2/2, vol-target 20%): ledger rows earlier
+than DEPLOY_CUTOVER_DAY were booked by that engine and are NOT reproducible
+by the combo backtest (see reconcile()).
 """
 from __future__ import annotations
 
@@ -63,6 +69,12 @@ sys.path.insert(0, str(REPO))
 from strategies.funding_carry import (  # noqa: E402
     FundingCarryConfig, load_panels, run_backtest, MS_PER_DAY, DEFAULT_UNIVERSE,
 )
+from strategies.xsect_combo import (  # noqa: E402
+    XSectComboConfig,
+    forward_target_book as combo_forward_target_book,
+    run_backtest as run_combo_backtest,
+)
+from strategies.xsect_momentum import XSectMomentumConfig  # noqa: E402
 from utils.trade_logger import StrategyLogger  # noqa: E402  (shared project logger)
 from utils.strategy_state import FileStateStore  # noqa: E402
 
@@ -108,13 +120,28 @@ BYBIT_ACCOUNT_NAME = "Bybit-algo009"
 LOW_CAPITAL_EXCLUDED_SYMBOLS = ("BTCUSDT", "ETHUSDT")
 DEPLOY_UNIVERSE = tuple(s for s in DEFAULT_UNIVERSE if s not in LOW_CAPITAL_EXCLUDED_SYMBOLS)
 
-# Frozen deploy config: champion mechanism + vol-target risk control, on the
-# capital-constrained deploy universe above.
-DEPLOY = FundingCarryConfig(
-    signal_lookback_days=7, top_n=2, bottom_n=2, min_universe=4,
-    taker_fee_per_side=0.00055, vol_target_annual=0.20,
-    universe=DEPLOY_UNIVERSE,
+# Frozen deploy config (since 2026-08-31): the S009+S012 combo book on the
+# capital-constrained deploy universe above. Sleeves run vol-off; risk is
+# controlled by ONE portfolio-level vol target (same 20%/yr as the previous
+# pure-S009 deploy). Weights/targets come from strategies/xsect_combo.py's
+# recorded decision constants (30% momentum), not re-hardcoded here.
+DEPLOY = XSectComboConfig(
+    carry=FundingCarryConfig(
+        signal_lookback_days=7, top_n=2, bottom_n=2, min_universe=4,
+        universe=DEPLOY_UNIVERSE,
+    ),
+    momentum=XSectMomentumConfig(
+        lookback_days=14, top_n=3, bottom_n=3, min_universe=6,
+        universe=DEPLOY_UNIVERSE,
+    ),
+    taker_fee_per_side=0.00055,
 )
+
+# First UTC day the combo book is actually held (the 2026-08-31 cycle set it).
+# Ledger rows for earlier days were booked by the previous pure-S009 deploy
+# engine and can NOT be reproduced by a fresh combo backtest — reconcile()
+# checks only rows from this day on.
+DEPLOY_CUTOVER_DAY = int(pd.Timestamp("2026-08-31", tz="UTC").timestamp() * 1000) // MS_PER_DAY
 
 FUNDING_URL = "https://api.bybit.com/v5/market/funding/history"
 KLINE_URL = "https://api.bybit.com/v5/market/kline"
@@ -233,9 +260,18 @@ def append_broker_ledger(row: dict, broker_ledger_file: Path | None = None) -> N
 # Core: run engine on current panels, return per-day frame + weights + components
 # --------------------------------------------------------------------------
 
-def _engine(data_dir: Path, cfg: FundingCarryConfig):
+def _run_backtest_for(cfg, close, funding):
+    """Dispatch to the right engine for this config type (pure S009 or combo)."""
+    if isinstance(cfg, XSectComboConfig):
+        return run_combo_backtest(close, funding, cfg)
+    return run_backtest(close, funding, cfg)
+
+
+def _engine(data_dir: Path, cfg):
+    """Panels + backtest for either a pure-S009 config or the combo DEPLOY —
+    one dispatch point so run_cycle/reconcile/simulate never fork on type."""
     close, funding = load_panels(data_dir, cfg.universe)
-    out, w = run_backtest(close, funding, cfg)
+    out, w = _run_backtest_for(cfg, close, funding)
     price_ret = close.pct_change()
     price_comp = (w.shift(0) * price_ret).fillna(0.0).sum(axis=1)   # per-day price component of held book
     fund_comp = (w * (-funding)).fillna(0.0).sum(axis=1)
@@ -246,10 +282,13 @@ def _fmt_book(wrow: pd.Series) -> dict:
     return {s: round(float(v), 4) for s, v in wrow.items() if abs(v) > 1e-9}
 
 
-def forward_target_book(close: pd.DataFrame, funding: pd.DataFrame, cfg: FundingCarryConfig) -> dict:
+def forward_target_book(close: pd.DataFrame, funding: pd.DataFrame, cfg) -> dict:
     """Book to hold for the day AHEAD, using funding through the last closed day.
     Selection needs only the funding signal (no forward price); vol-target scale
-    uses trailing realised vol of the vol-off strategy."""
+    uses trailing realised vol of the vol-off strategy. Combo configs delegate
+    to strategies/xsect_combo.py's live path (same contract)."""
+    if isinstance(cfg, XSectComboConfig):
+        return combo_forward_target_book(close, funding, cfg)
     sig = funding.rolling(cfg.signal_lookback_days, min_periods=1).mean().iloc[-1]
     last_close = close.iloc[-1]
     row = sig[sig.notna() & last_close.notna()].dropna()
@@ -420,7 +459,7 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
     return plan
 
 
-def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingCarryConfig,
+def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg,
                           state, logger: StrategyLogger, data_dir: Path = DATA_DIR,
                           do_fetch: bool = True, drop_forming: bool = True,
                           broker: str = "off", allow_mainnet: bool = False,
@@ -589,7 +628,18 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
                     # that gap is 24h, it routinely isn't (late tick, or a broker=off
                     # day with no reading at all in between).
                     now_ts = datetime.now(timezone.utc)
-                    prev = _last_broker_ledger_row(broker_ledger_file)
+                    # `broker_ledger_file is None` means "multi-account caller,
+                    # no ledger for this account" (see append_broker_ledger's
+                    # own guard below) -- _last_broker_ledger_row's own
+                    # late-binding-default would otherwise silently fall back
+                    # to the single-account BROKER_LEDGER_FILE, comparing a
+                    # DB-driven account's reading against whatever the
+                    # single-account CLI last wrote there (found live
+                    # 2026-09-03: that file's last row was 2026-08-11, so
+                    # every DB-driven cycle since then logged real_net_ret/
+                    # hours_since_prev against a ~3-week-stale reference
+                    # instead of not reporting them at all).
+                    prev = _last_broker_ledger_row(broker_ledger_file) if broker_ledger_file is not None else None
                     real_net_ret = None
                     hours_since_prev = None
                     if prev is not None and float(prev["broker_equity"]) > 0:
@@ -619,7 +669,7 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: FundingC
                broker_env=broker_env, broker_equity=broker_equity, broker_plan=broker_plan)
 
 
-def run_once(data_dir: Path, cfg: FundingCarryConfig, do_fetch: bool, drop_forming: bool = True,
+def run_once(data_dir: Path, cfg, do_fetch: bool, drop_forming: bool = True,
              broker: str = "off", allow_mainnet: bool = False) -> None:
     """Thin CLI wrapper around run_cycle_for_account() for the single
     accounts.yml-configured account (BYBIT_ACCOUNT_NAME) and the module's
@@ -679,7 +729,7 @@ def _expected_last_closed_day() -> int:
     return int(time.time() * 1000) // MS_PER_DAY - 1
 
 
-def run_loop(data_dir: Path, cfg: FundingCarryConfig, broker: str, allow_mainnet: bool,
+def run_loop(data_dir: Path, cfg, broker: str, allow_mainnet: bool,
              poll_minutes: int = POLL_MINUTES_DEFAULT) -> None:
     """Long-running daemon. Wakes every `poll_minutes`, and when a new UTC day has
     closed since the last processed one, runs a cycle (fetch → book → optional
@@ -731,10 +781,18 @@ def status() -> None:
     print(f"current book: {st['book']}")
 
 
-def reconcile(data_dir: Path, cfg: FundingCarryConfig) -> None:
+def reconcile(data_dir: Path, cfg) -> None:
     if not LEDGER_FILE.exists():
         print("No ledger yet."); return
     led = pd.read_csv(LEDGER_FILE)
+    skipped = int((led["day"] < DEPLOY_CUTOVER_DAY).sum())
+    led = led[led["day"] >= DEPLOY_CUTOVER_DAY]
+    if skipped:
+        print(f"(skipping {skipped} pre-combo ledger row(s) booked by the old pure-S009 deploy "
+              f"— not reproducible by the current engine, see DEPLOY_CUTOVER_DAY)")
+    if led.empty:
+        print("No ledger rows since the combo cutover yet.")
+        return
     _, _, out, _, _, _ = _engine(data_dir, cfg)
     bt = out["net_ret"].reindex(led["day"].values)
     diff = (led["net_ret"].values - bt.values)
@@ -804,7 +862,7 @@ def reconcile_broker() -> None:
           "the passport's execution-timing caveat before treating either as a bug.")
 
 
-def simulate(data_dir: Path, cfg: FundingCarryConfig, n: int) -> None:
+def simulate(data_dir: Path, cfg, n: int) -> None:
     """Replay last n days from local data (no network) + no-look-ahead self-check."""
     close, funding, out, w, price_comp, fund_comp = _engine(data_dir, cfg)
     tail = out.tail(n)
@@ -820,7 +878,7 @@ def simulate(data_dir: Path, cfg: FundingCarryConfig, n: int) -> None:
     # no-look-ahead self-check: truncating the panel must not change past days
     cut = int(out.index[-5])
     c2, f2 = load_panels(data_dir, cfg.universe)
-    o2, _ = run_backtest(c2[c2.index <= cut], f2[f2.index <= cut], cfg)
+    o2, _ = _run_backtest_for(cfg, c2[c2.index <= cut], f2[f2.index <= cut])
     common = [d for d in o2.index if d < cut]
     md = float(np.max(np.abs(out.loc[common, "net_ret"].values - o2.loc[common, "net_ret"].values))) if common else 0.0
     print(f"self-check (live path == backtest, no look-ahead): max|Δ|={md:.2e} -> {'OK' if md < 1e-12 else 'FAIL'}")

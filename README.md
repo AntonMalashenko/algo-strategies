@@ -32,16 +32,19 @@ multi-account web control panel. Primary markets: futures / forex / indices.
   Live/paper logs land under `reports/logs/<STRATEGY>/` (see `utils/trade_logger.py`).
 - `notebooks/` — research notebooks.
 - `tests/` — pytest test suite.
-- `docs/` — in-repo technical docs (e.g. `EXPERIMENTS.md`, `STRATEGY_S004.md`,
-  `DEV_PLANS.md` for decided-but-not-yet-built engineering initiatives like
-  the multi-account Docker migration).
+- `docs/` — in-repo technical docs (e.g. `DERIBIT_OPTIONS_SNAPSHOT.md` — the
+  Deribit snapshot data schema, `DEV_PLANS.md` for decided-but-not-yet-built
+  engineering initiatives like the multi-account Docker migration). Strategy
+  research narratives that used to live here were moved to Confluence on
+  2026-08-30; the remaining `.md` stubs point at their new homes.
 - `.claude/skills/` — repo-scoped Claude skills documenting this codebase's
   conventions (architecture, strategy lifecycle, modifiers, logging, webapp).
 
 Strategy **passports, specs, the strategy registry, and the decisions/experiments
-logs** are not in this repo — they live in the AlgoTrading Claude Project (the
-research narrative track). This repo is the code track; see
-`.claude/skills/strategy-lifecycle/SKILL.md` for how the two stay in sync.
+logs** are not in this repo — the registry and per-strategy documentation live
+in Confluence (space "Обзор" → Algo → Strategies), with the research-narrative
+working copies in the AlgoTrading Claude Project. This repo is the code track;
+see `.claude/skills/strategy-lifecycle/SKILL.md` for how the tracks stay in sync.
 
 ## Environment
 
@@ -82,13 +85,19 @@ Each validated strategy has its own runner in `backtest/`:
 python -m backtest.run_donchian     # S001-S003
 python -m backtest.run_fvg          # S004
 python -m backtest.run_carry        # S005
+python -m backtest.run_funding_carry  # S009 (+ wf_/harden_funding_carry.py)
+python -m backtest.run_rsi2_portfolio # S011 (per-setup: run_rsi2/run_double_seven/...)
+python -m backtest.run_xsect_momentum # S012
 ```
 
+Other runners follow the same `backtest/run_<name>.py` pattern (S016 top-down,
+the gap-fade candidate studies `run_gap_*.py`, S007 variant studies).
+
 S007 (`strategies/ger40_lonfra/`) is validated (regression, walk-forward, real-
-spread costs, prop-firm simulation — see the strategy passport) but its
-backtest/validation scripts are not yet mirrored into this repo's `backtest/`;
-migrating them in is a pending reorg task. Until then, results and methodology
-are documented in the Claude Project (`strategy-passport-S007.md`).
+spread costs, prop-firm simulation — see the strategy passport). Variant/
+filter studies live in `backtest/run_s007_filters.py` and
+`backtest/run_s007_liqfloor.py`; the original validation scripts are
+documented in the Claude Project (`strategy-passport-S007.md`).
 
 ### S007 live/paper bot (direct path)
 
@@ -107,8 +116,8 @@ python -m bot.s007_paper --live       # one live reconcile cycle
 Run `--live` every minute during the trading session (schedule with cron —
 see `bot/S007_README.md` for the exact line). The bot is stateless: it rebuilds
 the day's state from recent M1 bars each cycle, so a missed/restarted minute is
-harmless. Current config (`bot/s007_config.py`): preset `WORKING_S007`
-(recommended champion — see `.claude/skills/strategy-modifiers/SKILL.md`).
+harmless. Current config (`bot/s007_config.py`): preset `WORKING_S007_LIQFLOOR`
+(current champion — see `.claude/skills/strategy-modifiers/SKILL.md`).
 Sizing is percent-risk (`bot/risk.py`, 0.25% equal-dollar-risk per trade) since
 2026-07-21 — `USE_FIXED_LOT` now defaults to `False`; the fixed-lot path still
 exists as a fallback but is no longer the default.

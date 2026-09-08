@@ -115,7 +115,8 @@ def dry_run(at: str | None):
     print(f"desired open positions: {len(res['positions'])}")
     for p in res["positions"]:
         tag = "ADD" if p["is_add"] else "ENTRY"
-        print(f"  {tag:5} {p['side']:4} @{p['entry']:.1f}  SL {p['sl']:.1f}  TP {p['tp']:.1f}  [{p['label']}]")
+        be = "  [BE]" if p.get("be_moved") else ""
+        print(f"  {tag:5} {p['side']:4} @{p['entry']:.1f}  SL {p['sl']:.1f}  TP {p['tp']:.1f}  [{p['label']}]{be}")
         LOG.position(p["label"], "desired", cycle=cid, side=p["side"], entry=p["entry"],
                      sl=p["sl"], tp=p["tp"], is_add=p["is_add"])
     LOG.cycle_end(cid, n_desired=len(res["positions"]))
@@ -166,9 +167,11 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     row) falls back to the broker's live balance, unchanged from before.
 
     Returns dict(cycle_id, actions, error, day_done, in_window, filtered,
-    manual_stop) -- actions is a list of dicts, each either
-    {kind: "open", label, side, entry, sl, tp, is_add, volume_lots} or
-    {kind: "close", label, reason}. `error` is None on success or a short
+    manual_stop) -- actions is a list of dicts, each one of
+    {kind: "open", label, side, entry, sl, tp, is_add, volume_lots},
+    {kind: "close", label, reason} or
+    {kind: "amend", label, sl, prev_sl} (ALGODEV-37 breakeven stop move).
+    `error` is None on success or a short
     repr() of the exception that ended the cycle early.
     """
     from bot.ctrader_s007 import CTraderS007
@@ -356,7 +359,25 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                                  opened_today=opened_today_count + placed_this_cycle,
                                  max_positions_per_day=max_positions_per_day)
                     continue
-                stop_distance = abs(o["entry"] - o["sl"])
+                # ALGODEV-38: this loop only ever reaches here for a label
+                # NOT already in `have` -- i.e. every position placed below
+                # is, by construction, brand new at the broker. It must use
+                # the position's PRE-breakeven stop (o["orig_sl"]), not
+                # o["sl"] -- the engine's bar replay can report a position as
+                # already be_moved (sl == entry) on the very first cycle it's
+                # detected, if the replayed price path crossed the breakeven
+                # trigger before this cycle ever ran. Using o["sl"] there
+                # placed a live market order with a zero-distance stop
+                # (instant stop-out on the next tick/spread) AND silently
+                # zeroed this trade's cost in the $ risk-cap check below
+                # (new_risk = lot * stop_distance * ... = 0), letting it
+                # bypass a cap that had just correctly rejected it -- found
+                # live 2026-09-03 (twice, same session). The existing amend
+                # path (below) still moves the broker's real stop to
+                # breakeven from the ACTUAL fill price once the position is
+                # genuinely open -- unaffected by this fix.
+                place_sl = o.get("orig_sl", o["sl"])
+                stop_distance = abs(o["entry"] - place_sl)
                 if use_fixed_lot:
                     lot = fixed_lot
                 else:
@@ -381,8 +402,90 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                 logger.event("size", cycle=cid, label=lab, stop_distance=stop_distance,
                              risk_amount=risk_amount, money_per_point_per_lot=money_per_point_per_lot,
                              lot=lot)
-                out.append(dict(kind="place", label=lab, side=o["side"], sl=o["sl"], tp=o["tp"],
+                out.append(dict(kind="place", label=lab, side=o["side"], sl=place_sl, tp=o["tp"],
                                 volume_lots=lot, entry=o["entry"], is_add=o["is_add"]))
+            # ALGODEV-37 live breakeven: originally WHEN to fire came only
+            # from the engine (plan_now()'s be_moved flag, computed on the
+            # engine's own theoretical entry/risk0), and this layer only
+            # decided WHERE the stop goes (the broker's ACTUAL fill price,
+            # so the amend itself includes slippage). ALGODEV-39 (found live
+            # 2026-09-04): that left the TRIGGER blind to slippage -- a
+            # poorly filled entry can sit real price = 0.5R+ of its REAL
+            # (fill-to-stop) risk in favor while the engine, replaying its
+            # own clean entry, still sees far less than 0.5R and never
+            # fires. So the trigger now ALSO fires off the broker's real
+            # numbers: real fill/stop (already fetched into `have` this
+            # cycle) plus the active preset's breakeven_at_r (surfaced by
+            # plan_now() as res["breakeven_at_r"]), checked against every M1
+            # bar since the position's real open time (`opened_ts`) the same
+            # conservative way the engine checks its own bars. Either
+            # trigger firing is sufficient -- the engine path still covers
+            # the base (near-zero-slippage) case exactly as before.
+            # Deliberately OUTSIDE the day-cap accounting above (frozen
+            # invariant, 2026-09-02 fix): an amend opens nothing, so it must
+            # never touch opened_today/spent_risk_today math. Moving the SL
+            # toward entry shrinks the broker-reported open_risk NEXT cycle
+            # -- that is correct (the risk really is gone), and the position
+            # still counts in opened_today_count, so the count cap cannot be
+            # bypassed.
+            breakeven_at_r = res.get("breakeven_at_r")
+            for lab, o in want.items():
+                engine_triggered = bool(o.get("be_moved"))
+                # Cheap short-circuit BEFORE touching `have`/`p` at all: if
+                # breakeven is off for this preset AND the engine hasn't
+                # fired, neither trigger path below can possibly apply --
+                # skip exactly like the pre-ALGODEV-39 code did. Matters
+                # beyond speed: `p["side"]` isn't guaranteed to exist on
+                # every broker-position shape a caller/test hands in, and
+                # this label may not even be a real broker position worth
+                # inspecting yet.
+                if not engine_triggered and breakeven_at_r is None:
+                    continue
+                if lab not in have:
+                    continue
+                p = have[lab]
+                fill, cur_sl = p.get("price"), p.get("stop_loss")
+                if not fill:
+                    continue
+                # Only ever tighten: skip if the broker stop already sits at
+                # or beyond breakeven (makes the amend one-shot across cycles
+                # without needing its own state -- after a successful amend,
+                # cur_sl == fill and this test fails forever after). Never
+                # loosen a stop the broker/user may have moved further.
+                if cur_sl and ((p["side"] == "buy" and cur_sl >= fill)
+                               or (p["side"] == "sell" and cur_sl <= fill)):
+                    continue
+                triggered = engine_triggered
+                if not triggered and breakeven_at_r is not None and cur_sl is not None:
+                    real_risk = abs(fill - cur_sl)
+                    opened_ts = p.get("opened_ts")
+                    position_opened_at = (
+                        pd.to_datetime(opened_ts, unit="ms", utc=True)
+                        .tz_convert("Europe/Bucharest").tz_localize(None)
+                        if opened_ts else None)
+                    # `opened_ts` isn't always available (e.g. a test double
+                    # that doesn't model it) -- fall back to just the latest
+                    # bar rather than the WHOLE day's bars, so a price swing
+                    # from before this position even existed can never be
+                    # mistaken for a real breakeven move.
+                    bars_since_open = (m1[m1.index >= position_opened_at]
+                                      if position_opened_at is not None else m1.tail(1))
+                    if real_risk > 0 and len(bars_since_open):
+                        if p["side"] == "buy":
+                            real_trigger_price = fill + breakeven_at_r * real_risk
+                            triggered = bool((bars_since_open["high"] >= real_trigger_price).any())
+                        else:
+                            real_trigger_price = fill - breakeven_at_r * real_risk
+                            triggered = bool((bars_since_open["low"] <= real_trigger_price).any())
+                if not triggered:
+                    continue
+                logger.event("breakeven_trigger", cycle=cid, label=lab,
+                             engine_entry=o["entry"], engine_sl=o["sl"],
+                             engine_be_moved=bool(o.get("be_moved")),
+                             broker_fill=fill, broker_sl=cur_sl)
+                out.append(dict(kind="amend", label=lab, position_id=p["position_id"],
+                                sl=fill, tp=p.get("take_profit"),
+                                prev_sl=cur_sl))
         return out
 
     # CTraderS007() is constructed OUTSIDE the try below, deliberately: its
@@ -396,6 +499,7 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     try:
         cyc = api.run_live_cycle(symbol_candidates, history_days, decide)
         symbol = cyc["symbol"]
+        post_positions = cyc.get("post_positions", cyc["positions"])
         for r in cyc["results"]:
             a, err, res_ = r["action"], r["error"], r["result"]
             lab = a["label"]
@@ -407,6 +511,22 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                 logger.order(lab, "close_position", cycle=cid, request=req, result=res_)
                 logger.position(lab, "close", cycle=cid, reason=a["reason"])
                 actions_taken.append(dict(kind="close", label=lab, reason=a["reason"]))
+            elif a["kind"] == "amend":
+                # ALGODEV-37 live breakeven: stop moved to the broker's own
+                # fill price once the engine's be_moved flag fired (see
+                # decide() above). A failed amend is logged and retried
+                # naturally next cycle (the improvement check in decide()
+                # still sees the old stop).
+                req = dict(position_id=a["position_id"], sl=a["sl"], tp=a["tp"],
+                           prev_sl=a["prev_sl"])
+                if err is not None:
+                    logger.order(lab, "amend_position_sltp", cycle=cid, request=req, error=err)
+                    continue
+                logger.order(lab, "amend_position_sltp", cycle=cid, request=req, result=res_)
+                logger.position(lab, "breakeven_moved", cycle=cid, sl=a["sl"],
+                                prev_sl=a["prev_sl"], tp=a["tp"])
+                actions_taken.append(dict(kind="amend", label=lab, sl=a["sl"],
+                                          prev_sl=a["prev_sl"]))
             else:
                 req = dict(symbol=symbol, side=a["side"], sl=a["sl"], tp=a["tp"], lot=a["volume_lots"])
                 if err is not None:
@@ -423,11 +543,26 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                     pid = int(res_.position.positionId) or None
                 except Exception:
                     pid = None
-                logger.position(lab, "open", cycle=cid, side=a["side"], entry=a["entry"],
-                                sl=a["sl"], tp=a["tp"], is_add=a["is_add"],
-                                volume_lots=a["volume_lots"], position_id=pid)
-                actions_taken.append(dict(kind="open", label=lab, side=a["side"], entry=a["entry"],
-                                          sl=a["sl"], tp=a["tp"], is_add=a["is_add"],
+                # ALGODEV-39: log the broker's REAL fill price/stop (from the
+                # extra reconcile CTraderS007.run_live_cycle does right after
+                # placing, cyc["post_positions"]), not just the engine's
+                # planned entry/sl (a["entry"]/a["sl"]) -- a market order can
+                # slip, and our own position log is the source every later
+                # cycle's day-cap fallback math (spent_risk_today above) reads
+                # back via logger.open_records() when the broker's own deal
+                # history has no match for a same-day close. Planned values
+                # are kept alongside (planned_entry/planned_sl) so slippage
+                # stays visible/diagnosable, but `entry`/`sl` are now real.
+                broker_position = next((p for p in post_positions
+                                        if pid is not None and p.get("position_id") == pid), None)
+                real_entry = broker_position["price"] if broker_position else a["entry"]
+                real_sl = broker_position["stop_loss"] if broker_position else a["sl"]
+                logger.position(lab, "open", cycle=cid, side=a["side"], entry=real_entry,
+                                sl=real_sl, tp=a["tp"], is_add=a["is_add"],
+                                volume_lots=a["volume_lots"], position_id=pid,
+                                planned_entry=a["entry"], planned_sl=a["sl"])
+                actions_taken.append(dict(kind="open", label=lab, side=a["side"], entry=real_entry,
+                                          sl=real_sl, tp=a["tp"], is_add=a["is_add"],
                                           volume_lots=a["volume_lots"]))
     except Exception as e:
         logger.error("live cycle failed", exc=e, cycle=cid)
@@ -446,6 +581,8 @@ def live():
     for a in actions_taken:
         if a["kind"] == "close":
             print(f"  close {a['label']} ({a['reason']})")
+        elif a["kind"] == "amend":
+            print(f"  amend {a['label']} SL{a['sl']:.1f} (breakeven, was {a['prev_sl']})")
         else:
             print(f"  open {a['label']} {a['side']} lot={a['volume_lots']:.3f} "
                   f"SL{a['sl']:.1f} TP{a['tp']:.1f}")

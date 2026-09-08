@@ -52,6 +52,11 @@ class AccountCreate(BaseModel):
     env: Env
     label: str = ""
     broker_host: str | None = None
+    # How much has actually been deposited into this broker account -- a
+    # fact about the account, distinct from AccountStrategyCreate's own
+    # initial_balance (a per-strategy seed/risk-cap reference). Not read by
+    # any runner/bot code yet.
+    initial_balance: float | None = Field(default=None, ge=0)
 
     credentials: dict
 

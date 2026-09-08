@@ -137,7 +137,7 @@ def add_account_form(request: Request, db=Depends(get_db)):
 @app.post("/accounts/add")
 def add_account(request: Request, broker: str = Form(...), env: str = Form(...),
                 external_account_id: str = Form(""), label: str = Form(""),
-                broker_host: str = Form(""),
+                broker_host: str = Form(""), initial_balance: str = Form(""),
                 client_id: str = Form(""), client_secret: str = Form(""), access_token: str = Form(""),
                 api_key: str = Form(""), api_secret: str = Form(""),
                 db=Depends(get_db)):
@@ -151,7 +151,9 @@ def add_account(request: Request, broker: str = Form(...), env: str = Form(...),
         payload = AccountCreate(
             user_id=u.id, broker=broker, env=env,
             external_account_id=external_account_id or None, label=label or "",
-            broker_host=broker_host or None, credentials=creds)
+            broker_host=broker_host or None,
+            initial_balance=float(initial_balance) if initial_balance else None,
+            credentials=creds)
     except ValidationError as e:
         flash(request, f"Could not add account: {e.errors()[0]['msg']}", "err")
         return _redirect("/accounts/add")
@@ -174,12 +176,30 @@ def add_account(request: Request, broker: str = Form(...), env: str = Form(...),
     acc = Account(user_id=payload.user_id, broker=payload.broker.value, broker_id=broker_row.id,
                   env=payload.env.value,
                   external_account_id=payload.external_account_id, label=payload.label,
-                  broker_host=payload.broker_host)
+                  broker_host=payload.broker_host, initial_balance=payload.initial_balance)
     acc.credentials = payload.credentials   # encrypted by the model property setter
     db.add(acc)
     db.commit()
     flash(request, f"Account '{acc.label or acc.external_account_id}' added -- "
                     f"link a strategy to it to start trading")
+    return _redirect("/")
+
+
+@app.post("/accounts/{aid}/save")
+def save_account(aid: int, request: Request, initial_balance: str = Form(""),
+                 db=Depends(get_db)):
+    u = current_user(request, db)
+    if not u:
+        return _redirect("/login")
+    acc = db.get(Account, aid)
+    if acc and acc.user_id == u.id:
+        try:
+            acc.initial_balance = float(initial_balance) if initial_balance else None
+        except ValueError:
+            flash(request, "Initial balance must be a number", "err")
+            return _redirect("/")
+        db.commit()
+        flash(request, "Saved")
     return _redirect("/")
 
 

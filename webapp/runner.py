@@ -232,6 +232,12 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
             _open_position_db(session, acc, strat, a)
             _log_event(session, LogKind.POSITION_OPEN, message=a["label"], user=user,
                       account=acc, strategy=strat, cycle_id=result.get("cycle_id"), payload=a)
+        elif a["kind"] == "amend":
+            # ALGODEV-37 breakeven SL move: the position stays open -- log
+            # only, never route into _close_position_db. The DB row's SL is
+            # refreshed by the post-cycle sync_positions pass below.
+            _log_event(session, LogKind.POSITION_AMENDED, message=a["label"], user=user,
+                      account=acc, strategy=strat, cycle_id=result.get("cycle_id"), payload=a)
         else:
             _close_position_db(session, acc, strat, a["label"], a["reason"])
             _log_event(session, LogKind.POSITION_CLOSE, message=a["label"], user=user,

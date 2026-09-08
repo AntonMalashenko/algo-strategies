@@ -31,9 +31,10 @@ something that already existed). Concretely:
 - **Cowork / Claude Project session (Projects tool available):** read `claude/status.md`
   first — it's the "read this first" dashboard (current state, priorities, doc map). Then
   skim `claude/roadmap.md` for the specific track's open items if the task needs more detail.
-- **Repo-bound console session (no Projects tool):** read `docs/DEV_PLANS.md`, and tail the
+- **Repo-bound console session (no Projects tool):** read `docs/DEV_PLANS.md`, tail the
   relevant `.claude/change-log/<component>.jsonl` file(s) for anything touched recently by
-  another session. If a doc's claim looks stale against what the code actually does, verify
+  another session, and — for doc-heavy or strategy-status tasks — check the Confluence
+  work journal / Strategies index (see `confluence-docs`). If a doc's claim looks stale against what the code actually does, verify
   against the code/commit history before trusting it — don't propagate a stale claim into a
   new plan.
 
@@ -83,6 +84,12 @@ documents, flag the drift and propose the skill update for consent — don't app
   now, and if it holds no position, is that a bug or expected. Strategy-agnostic (S007,
   S009, future ones). Use for: "проанализируй торговлю <NNN/name>", "why are there no
   positions", "is this a bug or normal", auditing a session or a wider date range.
+- **`confluence-docs`** — where all documentation goes: directly into Confluence under
+  the Algo page tree (strategy subpages under *Strategies*, dev-work updates on the
+  "Апдейты (журнал работ)" page), the Jira comment+document loop, plain-language research
+  plans with ready-to-use prompts, and MCP-connector-or-REST-API access with `.env` creds.
+  Use for: any "задокументируй / запиши в конфлюенс / add docs", strategy docs, research
+  plans, work-journal updates, Jira ticket commenting.
 - **`orchestrator`** (this) — routing + response format. Always first.
 
 If a task matches no domain skill (a plain factual question, a one-off calculation), still

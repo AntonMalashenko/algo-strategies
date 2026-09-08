@@ -100,6 +100,112 @@ def test_live_sizes_new_positions_by_risk_not_fixed_lot(fake_broker, monkeypatch
     assert by_label["S007:2024-05-10:1"]["volume_lots"] > 0.01
 
 
+def test_fresh_placement_uses_orig_sl_not_an_already_be_moved_sl(fake_broker, monkeypatch):
+    """ALGODEV-38, found live 2026-09-03: a label seen for the FIRST time
+    (never open at the broker before) can already come back from plan_now()
+    with be_moved=True / sl == entry, if the engine's bar-replay determined
+    breakeven had already triggered before this cycle ever ran. Placing the
+    order with that already-moved sl gives a zero-distance stop -- an
+    instant stop-out on the next tick/spread, and (worse) a $0 nominal risk
+    that can silently bypass the day's $ risk cap (new_risk = lot *
+    stop_distance * ... = 0). decide() must use orig_sl (the pre-breakeven
+    stop) for a brand-new placement instead."""
+    from bot import s007_paper, s007_config as C
+
+    monkeypatch.setattr(C, "USE_FIXED_LOT", True)
+    monkeypatch.setattr(C, "FIXED_LOT", 0.01)
+
+    fake_positions = [
+        # sl == entry (already "be_moved" by the engine's replay), but
+        # orig_sl carries the real, wide, pre-breakeven stop.
+        dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=18000.0,
+             orig_sl=17950.0, tp=18100.0, is_add=False, be_moved=True),
+    ]
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=fake_positions,
+        direction="up", context={}))
+
+    s007_paper.live()
+
+    _, _, actions = fake_broker.last_decide_args
+    placed = [a for a in actions if a["label"] == "S007:2024-05-10:0"]
+    assert len(placed) == 1
+    assert placed[0]["sl"] == pytest.approx(17950.0)   # orig_sl, NOT entry
+
+
+class _FakeCTraderS007Slipped:
+    """run_live_cycle returns a `post_positions` reconcile whose real fill
+    price/stop differ from what decide() requested -- simulates broker-side
+    slippage on a fresh market order (ALGODEV-39)."""
+
+    last_decide_args = None
+    real_price = 18025.0
+    real_stop = 17953.5
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def run_live_cycle(self, symbol_candidates, history_days, decide):
+        m1 = pd.DataFrame(
+            {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+            index=pd.to_datetime(["2024-05-10 10:05"]),
+        )
+        balance = 10_000.0
+        money_per_point_per_lot = 114.3
+        actions = decide("GER40", m1, [], balance, money_per_point_per_lot)
+        type(self).last_decide_args = (balance, money_per_point_per_lot, actions)
+        results = []
+        post_positions = []
+        for a in actions:
+            if a["kind"] == "place":
+                res = types.SimpleNamespace(position=types.SimpleNamespace(positionId=777))
+                results.append(dict(action=a, result=res, error=None))
+                post_positions.append(dict(
+                    position_id=777, label=a["label"], side=a["side"],
+                    volume=int(a["volume_lots"] * 100),
+                    price=type(self).real_price, stop_loss=type(self).real_stop,
+                    take_profit=a["tp"]))
+            else:
+                results.append(dict(action=a, result={"ok": True}, error=None))
+        return dict(symbol="GER40", m1=m1, positions=[], post_positions=post_positions,
+                    actions=actions, results=results, balance=balance,
+                    money_per_point_per_lot=money_per_point_per_lot)
+
+
+def test_fresh_placement_logs_the_real_broker_fill_not_the_planned_entry(monkeypatch):
+    """ALGODEV-39 follow-up, found live 2026-09-04: our own position log/DB
+    used to always record the ENGINE's planned entry/sl (a['entry']/a['sl']),
+    never the broker's real fill -- a slipped short's real entry differed
+    from the logged one by 25pts, throwing off downstream breakeven/risk math
+    relative to what the trader's real account actually shows. run_live_cycle
+    now does one extra reconcile right after placing (`post_positions`); the
+    caller must prefer those real values over the planned ones when logging
+    the open and building actions_taken (which feeds the DB Position row)."""
+    from bot import s007_paper, s007_config as C
+
+    fake_mod = types.SimpleNamespace(CTraderS007=_FakeCTraderS007Slipped)
+    monkeypatch.setitem(sys.modules, "bot.ctrader_s007", fake_mod)
+    monkeypatch.setattr(C, "USE_FIXED_LOT", True)
+    monkeypatch.setattr(C, "FIXED_LOT", 0.01)
+
+    fake_positions = [
+        dict(label="S007:2024-05-10:0", side="sell", entry=18000.0, sl=18050.0,
+             tp=17900.0, is_add=False),
+    ]
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=fake_positions,
+        direction="down", context={}))
+
+    result = s007_paper.run_cycle_for_account(
+        None, preset=C.PRESET, risk_pct=C.RISK_PCT, fixed_lot=C.FIXED_LOT,
+        use_fixed_lot=C.USE_FIXED_LOT, magic=C.MAGIC, logger=s007_paper.LOG)
+
+    opened = [a for a in result["actions"] if a["kind"] == "open"]
+    assert len(opened) == 1
+    assert opened[0]["entry"] == pytest.approx(_FakeCTraderS007Slipped.real_price)
+    assert opened[0]["sl"] == pytest.approx(_FakeCTraderS007Slipped.real_stop)
+
+
 def test_live_skips_reopening_a_label_the_log_already_closed(fake_broker, monkeypatch):
     # Fix 1 wiring: the broker's reconcile shows nothing open for this label
     # (broker_positions=[] in _FakeCTraderS007), which is exactly the

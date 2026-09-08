@@ -151,6 +151,17 @@ class Account(Base):
     env: Mapped[str] = mapped_column(String(16), nullable=False)
     label: Mapped[str] = mapped_column(String(64), default="")
     broker_host: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # How much capital has actually been deposited into THIS broker account
+    # (a fact about the account, e.g. for account-wide ROI/equity-curve
+    # tracking) -- distinct from AccountStrategy.initial_balance below, which
+    # is a per-(account,strategy) seed/risk-cap reference (an account can
+    # run several strategies with independent capital allocations, e.g. the
+    # S009+S012 combo book on one Bybit account). Purely a stored fact; no
+    # runner/bot code reads this yet (2026-09-05) -- added so the two
+    # concepts have separate homes before anything is built on top of
+    # either, per Anton's explicit call after noticing S009's deposit had
+    # nowhere correct to live.
+    initial_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # broker credentials: one encrypted JSON blob, shape depends on `broker`
     # (see webapp/schemas/accounts.py's CREDENTIALS_BY_BROKER) -- set/read via
@@ -214,9 +225,14 @@ class AccountStrategy(Base):
     risk_pct: Mapped[float] = mapped_column(Float, default=0.25)
     fixed_lot: Mapped[float] = mapped_column(Float, default=0.01)
     use_fixed_lot: Mapped[bool] = mapped_column(Boolean, default=True)
-    # seed capital for this (account, strategy) pair's paper/shadow ledger
-    # (e.g. S009's reports/paper_s009/ledger.csv) -- NOT live balance, which
-    # is always fetched fresh from the broker each cycle.
+    # seed capital for THIS (account, strategy) pair's own paper/shadow
+    # ledger or risk-cap math (e.g. S007's day-scoped $ risk cap, ALGODEV-37
+    # -- see bot/s007_paper.py) -- NOT live balance, which is always fetched
+    # fresh from the broker each cycle, and NOT the same thing as
+    # Account.initial_balance above (how much was actually deposited into
+    # the broker account itself). One account can run several strategies
+    # with independent capital allocations/risk bases, so this stays on the
+    # per-pair association row, not the account.
     initial_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
     # "off" (shadow, default) | "dry" (compute+log intended orders, no broker
     # calls) | "execute" (place real orders) -- see webapp/schemas/enums.py's

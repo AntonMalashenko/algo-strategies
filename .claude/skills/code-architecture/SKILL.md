@@ -65,6 +65,14 @@ it, subclass it or add a config flag instead (the modifier discipline is in the
 - **Clear module boundaries.** Broker I/O in `bot/`, strategy math in `strategies/`, cross-
   cutting helpers in `utils/`. Don't put broker calls in strategy math or strategy math in
   the adapter.
+- **Readable variable names.** A name should say what the value IS, not just its type or
+  position — `broker_position` over `p`, `real_entry`/`planned_entry` over `entry` when a
+  distinction between the two matters, `bars_since_open` over `recent`. Avoid single/double-
+  letter and generic names (`p`, `o`, `r`, `real`, `tmp`, `val`, `data`) outside a genuinely
+  tiny, obvious scope (a one-line lambda, a loop index, an established idiom already used
+  consistently nearby). When extending code that already uses a terse convention, match it
+  for the surrounding lines you're not touching, but give any NEW variable you introduce a
+  self-explanatory name regardless of what's around it — don't propagate terseness forward.
 - **Prove behavior-preserving refactors.** After any change to a shared engine, re-run the
   regression checks (the `REF_*` presets / no-look-ahead assertions) so "cleanup" can't
   silently change results.

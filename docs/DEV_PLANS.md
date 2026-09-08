@@ -60,11 +60,33 @@ users, each with multiple broker accounts.
   parallel code `enum.Enum` + Pydantic validation at the write boundary, not
   a DB enum type. Domain objects and request/response schemas live together
   in `webapp/schemas/`, shared by DB validation and any future API.
-- **Deferred, explicitly parked for later:** a local market-data cache (e.g.
-  a shared M1-bar cache per tick, since accounts trading the same symbol
-  currently each independently re-fetch identical bars from the broker —
-  the dominant cost in the observed ~7-10s per-account cycle time). Revisit
-  when implementing the parallel fan-out.
+- **Shared Redis — added 2026-09-08.** One `redis` service in the compose
+  stack (`redis:7.4.1-alpine`, `--appendonly yes --maxmemory-policy
+  noeviction`), on an explicitly-named `algo` network that the Ofelia
+  job-run label (`ofelia.job-run.dispatch.network`) attaches every per-tick
+  worker container to. **Not published to the host** (Anton's call): only
+  the compose containers can reach it, a process on the macOS host cannot.
+  One instance, two roles: durable shared state / distributed locks /
+  pub-sub on logical DB 0, market-data cache (below) on logical DB 1 —
+  cache keys carry their own TTL, nothing relies on a global LRU. Client
+  entry point: `utils/redis_client.py` (`STATE_DB` / `CACHE_DB`,
+  `is_available()`); `redis` is in `requirements-docker.txt` so the worker
+  image must be rebuilt. Redis is an optional accelerator — every caller
+  must guard with `is_available()` and keep a no-Redis fallback path.
+- **Market-data cache — infra ready 2026-09-08, not yet wired.** A shared
+  per-tick market-data cache (e.g. the M1-bar cache: accounts trading the
+  same symbol currently each independently re-fetch identical bars from the
+  broker — the dominant cost in the observed ~7-10s per-account cycle
+  time). The Redis it needs now exists (above). Still to do: have the
+  shared cTrader adapter's `get_m1` read through `redis_client` (CACHE_DB,
+  short TTL keyed by symbol+timeframe+last-bar) before hitting the broker.
+  Revisit when implementing the parallel fan-out.
+- **`scripts/scheduler_tick.py` locks — candidate to move to Redis.** The
+  file-based `data/.scheduler_locks/` dispatch lock (stale-steal after
+  `ITEM_TIMEOUT_SECONDS`) works but relies on the host-persistent `data/`
+  bind mount; a Redis lock (`SET NX PX`) on STATE_DB would be the natural
+  replacement once Redis is a hard part of the stack. Not done yet — the
+  file lock is fine and self-healing as-is.
 - **Logging split:** a DB `logs` table (FKs to user/account/strategy,
   optional position; `level`/`kind`/`payload`/`cycle_id`) holds only
   curated business events (position open/close, errors, cycle summaries,

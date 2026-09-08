@@ -120,6 +120,7 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                  trend_ma_days: int | None = None,
                  trend_align: str = "with",
                  max_reentries: int = 0,
+                 fta_min_r: float | None = None,
                  return_state: bool = False):
     """Event-driven backtest. Returns a DataFrame of trades.
 
@@ -140,6 +141,16 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                          must first close back beyond the near edge (leave
                          the zone in the trade direction) and then touch the
                          edge again. Zone invalidation still applies.
+
+    fta_min_r       -- Failure-To-Advance filter (OFF by default, S016 E1
+                         experiment, 2026-08-26): skip an entry whose nearest
+                         known opposing structure level (the same confirmed
+                         swing extreme already used as `z["ref"]` for the
+                         shift/ob entry modes) sits closer than
+                         `fta_min_r * risk` price units ahead of entry in the
+                         trade direction. No known obstacle (`ref` is NaN) ->
+                         trade is allowed, filter is silent. Causal: `ref` is
+                         only ever a swing confirmed strictly before bar t.
 
     Intrabar pessimism: within one bar SL is always assumed to be hit BEFORE
     any favourable level (partial/BE trigger/TP).
@@ -264,6 +275,10 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                     if pos is None:
                         z["dead"] = True
                         break           # keep original bar semantics
+                    if not _fta_ok(z["ref"], pos["entry"], pos["risk"], d, fta_min_r):
+                        z["dead"] = True    # too little room to target: consumed
+                        pos = None
+                        break           # keep original bar semantics
                     z["entries"] += 1
                     z["in_trade"] = True
                     pos["zref"] = z
@@ -306,6 +321,10 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                 pos = _open(z, entry, t, times, stop, rr, buf, d)
                 if pos is None:
                     z["dead"] = True
+                    break               # keep original bar semantics
+                if not _fta_ok(z["ref"], pos["entry"], pos["risk"], d, fta_min_r):
+                    z["dead"] = True
+                    pos = None
                     break               # keep original bar semantics
                 z["entries"] += 1
                 z["in_trade"] = True
@@ -356,6 +375,19 @@ def _trend_ok(tv: float, d: int, align: str) -> bool:
     return tv == want
 
 
+def _fta_ok(ref: float, entry: float, risk: float, d: int,
+           fta_min_r: float | None) -> bool:
+    """Failure-To-Advance filter (S016 E1, off by default -- see run_backtest
+    docstring). True = trade allowed. `ref` is the nearest confirmed
+    opposing swing extreme (same value used by shift/ob entry modes as the
+    break trigger) -- the closest KNOWN structure the trade would have to
+    clear on the way to target. No known obstacle -> allowed."""
+    if fta_min_r is None or np.isnan(ref):
+        return True
+    room = (ref - entry) * d            # positive if ref sits ahead of entry
+    return room >= fta_min_r * risk
+
+
 def _record(trades, pos, bar_time, t, exit_px, r, reason, mode, stop, rr):
     trades.append(dict(
         time_in=pos["time_in"], time_out=bar_time,
@@ -364,6 +396,13 @@ def _record(trades, pos, bar_time, t, exit_px, r, reason, mode, stop, rr):
         bars_held=t - pos["t_in"], exit_reason=reason,
         sweep=pos.get("sweep", False), attempt=pos.get("attempt", 1),
         mode=mode, stop=stop, rr=rr,
+        # Diagnostic-only fields (S004 meta-labeling, P1, 2026-08-27): pure
+        # bookkeeping, do not feed back into any trading decision. zone_avail
+        # = time the H4 zone became tradable (bar close); ref = nearest
+        # confirmed opposing swing extreme known at entry time (same value
+        # the FTA filter uses), NaN if none known.
+        zone_top=pos.get("zone_top"), zone_bot=pos.get("zone_bot"),
+        zone_avail=pos.get("zone_avail"), ref=pos.get("ref"),
     ))
 
 
@@ -379,7 +418,10 @@ def _open(z, entry, t, times, stop, rr, buf, d):
     return dict(entry=entry, sl=sl, sl0=sl, tp=tp, dir=d, risk=risk,
                 frac=1.0, realized=0.0, partial_done=False, be_done=False,
                 t_in=t, time_in=times[t], hour=times[t].hour,
-                sweep=z.get("sweep", False))
+                sweep=z.get("sweep", False),
+                # diagnostic-only, see _record()
+                zone_top=z["top"], zone_bot=z["bot"], zone_avail=z["avail"],
+                ref=z.get("ref"))
 
 
 def _find_ob(o, c, h, l, start, end, d):

@@ -87,8 +87,12 @@ python -m bot.s007_paper --check         # auth + resolve GER40 symbol
 python -m bot.s007_paper --dry-run --at "2024-05-10 10:45"   # offline sanity
 ```
 
-Config in `bot/s007_config.py`: `PRESET` (BASELINE_S007 by default), `RISK_PCT`,
-`SYMBOL_CANDIDATES` (GER40/DE40/…), `FIXED_LOT`.
+Config in `bot/s007_config.py`: `PRESET` (`WORKING_S007_NEWSSAFE_MAX8_BE05`
+since 2026-09-02, ALGODEV-37 -- 8 slots @ 0.25%/R, breakeven at 0.5R via live
+SL amend, news-safe exit 14:24; `EXIT_END` must stay in sync with the
+preset's exit_end, see its comment), `RISK_PCT`, `SYMBOL_CANDIDATES`
+(GER40/DE40/…), `FIXED_LOT`. Margin for 8 simultaneous slots verified
+comfortable (~27% of balance) via `scripts/check_s007_margin_8slots.py`.
 
 ## Run live (demo) — every minute in the session
 

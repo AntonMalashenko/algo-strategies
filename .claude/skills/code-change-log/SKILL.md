@@ -20,7 +20,7 @@ description: >-
 
 `.claude/change-log/` holds one append-only JSONL file per **component**:
 one per package (`bot.jsonl`, `webapp.jsonl`, `utils.jsonl`, `scripts.jsonl`,
-`configs.jsonl`, `backtest.jsonl`) and one per **strategy** (named after its
+`configs.jsonl`, `backtest.jsonl`, `deployment.jsonl`) and one per **strategy** (named after its
 module under `strategies/`: `ger40_lonfra.jsonl`, `donchian.jsonl`,
 `fvg_mtf.jsonl`, `fx_carry.jsonl`, `funding_carry.jsonl`,
 `crypto_mtf.jsonl`, ...), plus `repo.jsonl` for cross-cutting/meta changes
@@ -93,6 +93,10 @@ mappings as of this writing (extend this list when a new strategy shows up
 | `strategies/fvg_mtf.py`, `fvg`            | `fvg_mtf`           |
 | `strategies/fx_carry.py`, `fx_carry`      | `fx_carry`          |
 | `strategies/funding_carry.py`, `funding_carry` | `funding_carry` |
+| `strategies/xsect_momentum.py`, `xsect_momentum`, `s012` | `xsect_momentum` |
+| `strategies/xsect_combo.py`, `xsect_combo` | `xsect_combo`   |
+| `strategies/gap_fade.py`, `gap_fade`, `s019` | `gap_fade`       |
+| `strategies/s017_elliott.py`, `s017`      | `s017_elliott`      |
 | `strategies/crypto_mtf/`, `crypto_mtf`    | `crypto_mtf`        |
 | `s009`, `bybit` (no clearer match yet)    | `bybit`             |
 
@@ -129,9 +133,11 @@ Fields:
 
 ### Finding the session id
 
-There's no direct tool call for "what is my session id". Derive it from the
-transcript directory: the current session's transcript is always the most
-recently modified `*.jsonl` file directly under this project's Claude folder:
+There's no direct tool call for "what is my session id". If the assistant's own
+session/context metadata already states the session id (e.g. Copilot CLI's session
+folder name), use that. Otherwise (Claude Code) derive it from the transcript
+directory: the current session's transcript is always the most recently modified
+`*.jsonl` file directly under this project's Claude folder:
 
 ```bash
 ls -t "$HOME/.claude/projects/-Users-Anton-Malashenko-Trading-algo/"*.jsonl 2>/dev/null \

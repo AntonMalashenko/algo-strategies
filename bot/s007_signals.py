@@ -39,7 +39,20 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
       day_done    -- True if the day's target was reached (=> close all)
       flat        -- True at/after EXIT_END (=> close all)
       positions   -- list of positions that SHOULD be open right now, each:
-                     {label, side, entry, sl, tp, is_add}
+                     {label, side, entry, sl, orig_sl, tp, is_add, be_moved}
+                     be_moved (ALGODEV-37): True once the engine's breakeven
+                     rule (cfg.breakeven_at_r, off unless the preset sets it)
+                     has fired for this position -- `sl` then already equals
+                     the engine's entry. The live layer uses this flag (not
+                     an sl==entry comparison) to decide to amend the broker
+                     stop, targeting the broker's ACTUAL fill price so the
+                     real breakeven includes slippage.
+                     orig_sl (ALGODEV-38): the stop BEFORE any breakeven
+                     move -- the live layer must use THIS, not `sl`, when
+                     placing a position for the first time (a label not yet
+                     seen open at the broker), since `sl` can already be
+                     be_moved-collapsed to `entry` on the very first cycle a
+                     late-detected reversal/add leg is seen.
       direction   -- 'up'/'down'/None for the day
       filtered    -- True only when today's Frankfurt range failed the
                      day-quality height filter -- a verdict that is FINAL for
@@ -47,6 +60,11 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
                      Absent/falsy in every other case, including "not enough
                      bars yet" and "no A/B scenario yet", which can still
                      resolve later today and must keep being polled.
+      breakeven_at_r -- (ALGODEV-39) the active preset's breakeven trigger, in
+                     R (None if off). Lets decide() ALSO check breakeven
+                     against the broker's REAL fill price/stop -- be_moved
+                     above only ever reflects the engine's theoretical entry,
+                     blind to slippage.
     """
     cfg = _preset(preset).with_(trade_start=C.TRADE_START, exit_end=C.EXIT_END,
                                 fr_start=C.FR_START, fr_end=C.FR_END)
@@ -119,13 +137,45 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
         # leg's (lower) target attached -- cTrader rejected it outright
         # (TRADING_BAD_STOPS: TP below entry on a BUY), found live 2026-08-06.
         p_tp = float(p.get("tp", tp))
+        # orig_sl (ALGODEV-38, fixed ALGODEV-40): the position's stop BEFORE
+        # any breakeven move. p["stop"] can already equal p["entry"]
+        # (be_moved=True) the VERY FIRST cycle a position is seen as "eod",
+        # if the replayed price path crossed its own breakeven trigger
+        # before the live bot ever placed a broker order for it -- found
+        # live 2026-09-03: a brand-new market order went out with sl==entry
+        # (zero stop distance) because the caller used p["stop"]
+        # unconditionally. orig_sl lets bot/s007_paper.py's decide() use the
+        # correct WIDE stop for a genuinely new placement.
+        #
+        # ALGODEV-40 (found live 2026-09-07): this used to be RE-DERIVED as
+        # `entry -+ risk0` (direction-based), which silently mirrors the
+        # stop to the "textbook" side of entry -- wrong whenever the
+        # position's REAL stop sits on the opposite side, which is a normal,
+        # expected situation under stop_mode="mid_range": every position in
+        # a leg (primary AND every pyramided add) shares ONE common stop
+        # regardless of that add's own entry price, so an add entered on a
+        # pullback can legitimately have its shared stop on the "wrong"
+        # side of its own entry. Two such adds got a wrong-side, too-tight
+        # stop sent to the broker and turned engine-validated wins into
+        # real losses (-$60 combined). Fixed by reading engine.py's own
+        # p["stop0"] directly -- the position's real stop as of creation,
+        # stored once and never mutated by the breakeven block (mirrors how
+        # p["risk0"] is already handled) -- instead of re-deriving it.
+        orig_sl = float(p.get("stop0", p["stop"]))
         if p["status"] == "eod":
             wanted.append(dict(label=label, side=side, entry=float(p["entry"]),
-                               sl=float(p["stop"]), tp=p_tp, is_add=bool(p["is_add"])))
+                               sl=float(p["stop"]), orig_sl=float(orig_sl), tp=p_tp,
+                               is_add=bool(p["is_add"]),
+                               be_moved=bool(p.get("be_moved", False))))
         else:
             resolved.append(dict(label=label, side=side, entry=float(p["entry"]),
                                  sl=float(p["stop"]), exit=float(p["exit"]),
                                  status=p["status"], is_add=bool(p["is_add"]),
                                  is_recovery=bool(p.get("is_recovery", False)), r=float(p["R"])))
     return dict(in_window=in_window, day_done=reached, flat=flat,
-                positions=wanted, resolved=resolved, direction=r["direction"], context=context)
+                positions=wanted, resolved=resolved, direction=r["direction"], context=context,
+                # ALGODEV-39: surfaced so decide() can ALSO check breakeven
+                # against the broker's real fill price (the engine-only
+                # be_moved above can't see slippage) -- None when the active
+                # preset has breakeven off, same as cfg.breakeven_at_r itself.
+                breakeven_at_r=cfg.breakeven_at_r)

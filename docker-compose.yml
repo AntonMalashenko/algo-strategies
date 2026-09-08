@@ -39,6 +39,49 @@ services:
       dockerfile: Dockerfile
     image: algo-worker:latest
     profiles: ["build-only"]   # excluded from `up`/`start` by default
+    # Only takes effect if `worker` is ever started via compose directly
+    # (it normally isn't -- see header). The REAL per-tick worker containers
+    # are created straight through the podman socket by ofelia, and get the
+    # `algo` network from the `ofelia.job-run.dispatch.network` label below.
+    networks:
+      - algo
+
+  # Shared Redis -- reachable as `redis://redis:6379` from every job-run
+  # worker container (they join the `algo` network via the job-run label
+  # below). Deliberately NO `ports:` -- not published to the host (Anton's
+  # call, 2026-09-08), so it is reachable only from inside the compose
+  # network; a process on the macOS host (the manually-run webapp) cannot
+  # see it. Add `ports: ["127.0.0.1:6379:6379"]` here if that ever needs to
+  # change.
+  #
+  # One instance, two roles (see docs/DEV_PLANS.md):
+  #   - logical DB 0: durable shared state / distributed locks / pub-sub
+  #   - logical DB 1: market-data cache (the parked per-tick M1-bar cache)
+  # Hence `--maxmemory-policy noeviction` (a lock key must never be silently
+  # evicted) + `--appendonly yes` (survive a restart). Cache entries carry
+  # their own per-key TTL rather than leaning on a global LRU. `--maxmemory`
+  # is a generous ceiling that makes an overflow fail loudly instead of
+  # eating the podman-machine VM's RAM; bump it in this one line if needed.
+  redis:
+    image: redis:7.4.1-alpine
+    restart: unless-stopped
+    command: >-
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --dir /data
+    volumes:
+      - redis-data:/data
+    networks:
+      - algo
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   ofelia:
     image: mcuadros/ofelia:latest
@@ -90,6 +133,12 @@ services:
       ofelia.job-run.dispatch.image: "algo-worker:latest"
       ofelia.job-run.dispatch.command: "python -m scripts.scheduler_tick"
       ofelia.job-run.dispatch.delete: "true"
+      # Attach every per-tick worker container to the `algo` network so it
+      # can resolve+reach `redis:6379`. Referenced by the literal network
+      # name (see the top-level `networks:` block -- `name: algo` there is
+      # what keeps this from being project-prefixed); these containers are
+      # NOT compose services and never see the project-scoped name.
+      ofelia.job-run.dispatch.network: "algo"
       # Multi-value fields need a JSON array (Ofelia label syntax, not compose's).
       ofelia.job-run.dispatch.volume: >-
         ["${PWD}/data:/app/data:rw", "${PWD}/reports:/app/reports:rw"]
@@ -105,4 +154,19 @@ services:
       # session end, for no effect (the worker's own in_window check would
       # just no-op there, but still a wasted/confusing extra dispatch).
       ofelia.job-run.dispatch.environment: >-
-        ["APP_SECRET_KEY=${APP_SECRET_KEY}", "APP_DB_URL=sqlite:////app/data/app.db", "TZ=Europe/Kyiv"]
+        ["APP_SECRET_KEY=${APP_SECRET_KEY}", "APP_DB_URL=sqlite:////app/data/app.db", "TZ=Europe/Kyiv", "REDIS_URL=redis://redis:6379"]
+
+
+networks:
+  # Explicitly named (NOT `<project>_algo`) so the Ofelia job-run
+  # `network` label above can attach worker containers to it by this exact
+  # literal -- those containers are created through the podman socket, not
+  # as compose services, so a project-scoped name would not resolve.
+  algo:
+    name: algo
+
+volumes:
+  # Redis AOF + RDB persistence. Podman-managed named volume (correct
+  # SELinux context out of the box -- unlike a host bind mount, which is
+  # why this is not `${PWD}/...`).
+  redis-data:

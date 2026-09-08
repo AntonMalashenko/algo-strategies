@@ -30,9 +30,14 @@ launchd S007 job to the Docker/Ofelia path.
   `init_db()` (`create_all()`) is a **dev/test-only convenience** — the running app
   no longer calls it automatically; schema is owned by Alembic (see below).
 - `models.py` — `User` (login only), `Account` (broker/env/label + one Fernet-encrypted
-  JSON credentials blob, shape depends on `broker` — see `crypto.py`/`Account.credentials`),
+  JSON credentials blob, shape depends on `broker` — see `crypto.py`/`Account.credentials`
+  — plus, since migration 007, `initial_balance`: how much was actually deposited into
+  this broker account, a fact about the account, not read by any runner/bot code yet),
   `Strategy` (lookup: name + broker), `AccountStrategy` (the account↔strategy join —
-  preset/risk/lot/enabled/status/last_cycle_at), `Position` (bot-tracked; entry/sl/tp
+  preset/risk/lot/enabled/status/last_cycle_at, plus its OWN `initial_balance` — a per-
+  (account,strategy) seed/risk-cap reference, e.g. S007's day-scoped $ risk cap; an
+  account can run several strategies with independent capital allocations, so this stays
+  separate from `Account.initial_balance` above), `Position` (bot-tracked; entry/sl/tp
   plus, since migration 002, broker-synced fill data: `origin`, `exit_price`,
   `volume_lots`, `gross_profit`, `swap`, `commission`, `pnl`, `broker_deal_id`,
   `synced_at` — `pnl IS NULL` means "not yet synced", never 0.0), `LogEntry` (curated
