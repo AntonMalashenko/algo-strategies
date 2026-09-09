@@ -339,6 +339,11 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
                 # drop_forming reasoning, applied per-instrument since D1 bar
                 # completeness can differ across FX/index/crypto instruments
                 # on this broker) before computing today's decided position.
+                # Same filter as CTraderS011._drop_forming_bar (kept inline
+                # here rather than called through the client so this signal
+                # computation has no dependency on it -- see that method's
+                # docstring for the live incident that made run_live_cycle_
+                # multi's OWN order-sizing price apply this guard too).
                 today_utc = datetime.now(timezone.utc).date()
                 bars = df[df.index.date < today_utc] if df.index[-1].date() >= today_utc else df
                 if len(bars) < 2:

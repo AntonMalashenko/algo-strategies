@@ -128,6 +128,37 @@ class CTraderS011(CTraderAdapter):
         d.addCallback(fin)
         return d
 
+    @staticmethod
+    def _drop_forming_bar(df: pd.DataFrame) -> pd.DataFrame:
+        """Drop a still-forming current-UTC-day bar, if `_get_daily_step`
+        returned one (broker D1 feed quirk -- the feed can hand back a last
+        row for TODAY before that day's bar has actually closed). Single
+        source of truth for this filter: bot/s011_paper.py's decide() reuses
+        it for its RSI signal instead of re-deriving the same date
+        comparison, so the signal and the order-sizing price can never
+        silently diverge on which bar counts as "current" again -- see
+        `_last_closed_price`'s docstring for the incident this guards
+        against."""
+        if df.empty:
+            return df
+        today_utc = datetime.now(timezone.utc).date()
+        return df[df.index.date < today_utc] if df.index[-1].date() >= today_utc else df
+
+    @classmethod
+    def _last_closed_price(cls, df: pd.DataFrame) -> float | None:
+        """Latest CLOSED D1 bar's close -- never a still-forming current-UTC-
+        day bar (see `_drop_forming_bar`). run_live_cycle_multi's
+        `last_price` used to skip this guard even though it feeds directly
+        into `_place_market_step`'s order sizing -- found live 2026-08-19:
+        an incomplete bar's close priced a $1500-target CAC40 order at what
+        was actually a ~$8500 position (~5.7x oversized), invisible in the
+        log because only the (correctly filtered) `bars["close"]` used for
+        rsi_close ever got logged, never this one."""
+        bars = cls._drop_forming_bar(df)
+        if bars.empty:
+            return None
+        return float(bars["close"].iloc[-1])
+
     def _reconcile_step(self):
         req = ProtoOAReconcileReq()
         req.ctidTraderAccountId = self.account
@@ -275,8 +306,8 @@ class CTraderS011(CTraderAdapter):
                 symbol_meta = {asset: by_id[self._symbols[symbol.upper()].symbolId]
                               for asset, symbol in resolved.items()
                               if self._symbols[symbol.upper()].symbolId in by_id}
-                last_price = {asset: float(df["close"].iloc[-1])
-                             for asset, df in daily_bars.items() if not df.empty}
+                last_price = {asset: price for asset, df in daily_bars.items()
+                             if (price := self._last_closed_price(df)) is not None}
 
                 actions = decide(daily_bars, positions, balance, symbol_meta, last_price, resolved)
 
