@@ -83,6 +83,11 @@ strategies:
   # fire every 15 minutes on weekdays instead of once daily, so a missed
   # exact-minute trigger self-heals within ~15 minutes instead of a full
   # trading day.
+  #
+  # UPDATE 2026-09-09: _expected_last_closed_trading_date is now computed in
+  # UTC against the broker's own D1 close (bot/s011_paper.py::
+  # BROKER_DAY_CLOSE_UTC_HOUR), so that check no longer depends on this
+  # container's Europe/Kyiv wall clock -- only the cron line above does.
   - name: S011
     schedule: "*/15 * * * 1-5"
 

@@ -98,6 +98,14 @@ LEDGER_FILE = STATE_DIR / "ledger.csv"
 
 HISTORY_DAYS = 400   # >= trend_sma(200) + a comfortable margin for RSI/SMA warmup
 
+BROKER_DAY_CLOSE_UTC_HOUR = 22   # cTrader D1 closes at the broker's midnight:
+                                 # 21:00 UTC summer / 22:00 UTC winter -- use the
+                                 # later so we never treat a day's bar as available
+                                 # before it has actually closed
+
+# cycle_end status marker + event name when the broker D1 feed lags the calendar
+STALE_FEED_STATUS = "stale-d1-feed"
+
 # Live-deploy-only universe trim -- see module docstring. Frozen BACKTEST
 # universe (backtest/run_rsi2_portfolio.py::WALK_FORWARD_UNIVERSE) is
 # untouched; only the live/paper book excludes this.
@@ -137,24 +145,28 @@ def _expected_last_closed_trading_date(now: datetime | None = None) -> str:
     """Pure, network-free function mirroring bot/s009_paper.py's
     _expected_last_closed_day() role for the up-to-date pre-check in
     run_cycle_for_account below, adapted to S011's calendar-date (not
-    Unix-day) state and its documented single fixed local cutover (22:05,
-    see module docstring's "Timing decision" section). Naive
-    datetime.now() by design, same convention scripts/s007_tick.py::
-    in_session() uses -- correct as long as this runs in a process whose
-    TZ is Europe/Kyiv (deployment/schedule.yml documents this is true for
-    the Ofelia/scheduler container that actually runs it); accepts an
-    explicit `now` for testing.
+    Unix-day) state.
 
-    Returns the ISO date string of the most recently closed trading day a
-    fully-caught-up state (state.json for the single-account CLI, or a
-    DB `strategy_state` row for the DB-driven runner)'s `last_date` should
-    already equal, given only wall-clock time -- weekends always resolve
-    back to the preceding Friday, matching every included instrument's own
-    lack of weekend bars.
+    Returns the ISO **session date** -- the same convention
+    `CTraderS011._session_dated_index` labels the broker's D1 bars with --
+    of the most recently closed broker trading day that a fully-caught-up
+    state (state.json for the single-account CLI, or a DB `strategy_state`
+    row for the DB-driven runner)'s `last_date` should already equal, given
+    only wall-clock time. Weekends always resolve back to the preceding
+    Friday, matching every included instrument's own lack of weekend bars.
+
+    Computed entirely in UTC against BROKER_DAY_CLOSE_UTC_HOUR (the broker's
+    own D1 boundary), so it no longer depends on the process TZ at all --
+    the previous version used a naive `datetime.now()` with a 22:05 local
+    cutover and was only correct in a Europe/Kyiv process, while the broker
+    D1 actually closes at 21:00/22:00 UTC. Accepts an explicit `now` for
+    testing.
     """
-    now = now or datetime.now()
-    cutover = now.replace(hour=22, minute=5, second=0, microsecond=0)
-    d = now.date() if now >= cutover else now.date() - timedelta(days=1)
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:            # tolerate a naive datetime (older callers / tests)
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    d = now.date() if now.hour >= BROKER_DAY_CLOSE_UTC_HOUR else now.date() - timedelta(days=1)
     while d.weekday() >= 5:  # Saturday=5, Sunday=6 -- walk back to Friday
         d -= timedelta(days=1)
     return d.isoformat()
@@ -231,7 +243,8 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
                           state, logger: StrategyLogger, broker: str = "off",
                           allow_mainnet: bool = False, env: str | None = None,
                           history_days: int = HISTORY_DAYS,
-                          candidates: dict[str, tuple[str, ...]] | None = None) -> dict:
+                          candidates: dict[str, tuple[str, ...]] | None = None,
+                          ledger_file: Path | None = None) -> dict:
     """One S011 daily cycle for an arbitrary account -- same
     never-raises / cycle_start-cycle_end-always-paired contract as
     bot/s009_paper.py::run_cycle_for_account, for the same reason (a future
@@ -253,6 +266,18 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
     passing Account.env explicitly -- see that worker's own docstring for
     the "silently defaulting the env is how S009 traded on the wrong
     network for 17h" incident this mirrors).
+
+    `ledger_file`: append each booked day's row to this CSV, or write NO
+    ledger row when None (the DB-driven multi-account caller passes None --
+    `reports/paper_s011/ledger.csv` is a single-account-CLI artifact and a
+    shared file across accounts would collide, exactly the S009 collision
+    fixed 2026-08-08). `run_once` passes its own `LEDGER_FILE`.
+
+    Stale broker feed: when the newest D1 bar `decide` can see is BEHIND
+    `_expected_last_closed_trading_date()`, the cycle is a logged no-op --
+    no orders, no state save, no ledger row (see `decide`'s own docstring
+    for why, and for the ALGODEV-34 retry interaction this deliberately
+    throttles).
 
     Returns dict(booked: bool, target: dict[asset, notional], equity, error,
     date, actions, unresolved, broker_orders).
@@ -326,6 +351,34 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
         decided: dict = {}
 
         def decide(daily_bars, positions, balance, symbol_meta, last_price, resolved):
+            """Pure signal + target-book decision, run INSIDE the broker
+            session (see the closure note above).
+
+            Stale-feed guard (added 2026-09-09): the broker's D1 feed for
+            this universe can lag the calendar by a whole trading day (seen
+            live over the 2026-09-07 US-holiday week -- the newest bar
+            stayed 2026-09-07 while
+            `_expected_last_closed_trading_date()` had already advanced to
+            2026-09-08). Acting on that bar re-decides the SAME stale
+            signal, and since `last_date` never reaches the expected day the
+            up-to-date short-circuit above never fires either, so every
+            15-min cycle re-ran the whole thing. When the newest bar is
+            behind the expected last closed trading day this returns no
+            actions and flags `stale_feed`, and the caller turns the cycle
+            into a no-op (no orders, no state save, no ledger row); normal
+            behaviour resumes by itself once the feed catches up, so no
+            persisted flag is needed.
+
+            Consequence accepted on purpose: this also throttles the
+            ALGODEV-34 retry of a rejected open/close -- during a stale-feed
+            window a previously-failed action is not re-attempted every 15
+            min, it waits until the feed advances. That is fine for a
+            once-a-day strategy that already tolerates a missed daily slot,
+            and far better than the ~100+ rejected orders/day the 15-min
+            retry produced live on 2026-09-02 / 2026-09-07. On a FRESH feed
+            day the retry still happens on the next cycle exactly as before
+            (the stale branch is simply not taken).
+            """
             cash = st.get("cash", cfg.start_capital)
             position_value = st.get("position_value", {})
             prev_held = st.get("prev_held", {})
@@ -343,7 +396,13 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
                 # here rather than called through the client so this signal
                 # computation has no dependency on it -- see that method's
                 # docstring for the live incident that made run_live_cycle_
-                # multi's OWN order-sizing price apply this guard too).
+                # multi's OWN order-sizing price apply this guard too). Both
+                # now work on SESSION-dated bars (CTraderS011.
+                # _session_dated_index relabels each D1 bar from its
+                # broker-day OPEN stamp to the date the session closes on),
+                # so "today's UTC date" here means the session still forming
+                # right now -- the comparison below is unchanged and still
+                # correct under that labelling.
                 today_utc = datetime.now(timezone.utc).date()
                 bars = df[df.index.date < today_utc] if df.index[-1].date() >= today_utc else df
                 if len(bars) < 2:
@@ -358,6 +417,15 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
                 return []
 
             decided["date"] = max(latest_dates).strftime("%Y-%m-%d")
+
+            # Stale broker feed -- see this function's docstring. Plain
+            # string comparison is correct: both sides are ISO dates.
+            expected_date = _expected_last_closed_trading_date()
+            if decided["date"] < expected_date:
+                decided["stale_feed"] = True
+                decided["expected_date"] = expected_date
+                return []
+
             deltas, new_cash, new_position_value = _decide_target_book(
                 held_today, prev_held, cash, position_value, cfg)
             decided["deltas"] = deltas
@@ -400,6 +468,21 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
         if unresolved:
             logger.event("unresolved_symbols", cycle=cid, assets=unresolved,
                          level="warning" if broker != "off" else "info")
+
+        if decided.get("stale_feed"):
+            logger.event(STALE_FEED_STATUS, cycle=cid, level=logging.WARNING,
+                         newest_bar=decided["date"], expected=decided["expected_date"],
+                         text=(f"newest D1 bar {decided['date']} is behind the expected "
+                               f"last closed trading day {decided['expected_date']} -- "
+                               f"skipping: no signal is acted on, no state/ledger write, "
+                               f"until the broker feed catches up"))
+            logger.cycle_end(cid, status=f"{STALE_FEED_STATUS} (newest={decided['date']} < "
+                                         f"expected={decided['expected_date']})",
+                             equity=st.get("equity"))
+            return dict(booked=False,
+                       target={a: v for a, v in st.get("position_value", {}).items() if v > 0},
+                       equity=st.get("equity"), error=None, date=None, actions=[],
+                       unresolved=unresolved)
 
         if decided:
             date = decided["date"]
@@ -455,9 +538,11 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
                       "position_value": position_value_final,
                       "prev_held": held_today_final})
             state.save(st)
-            append_ledger({"date": date, "cash": round(cash_final, 2), "equity": round(equity, 2),
-                          "n_positions": sum(1 for v in position_value_final.values() if v > 0),
-                          "n_actions": len(deltas_final)}, LEDGER_FILE)
+            if ledger_file is not None:
+                append_ledger({"date": date, "cash": round(cash_final, 2),
+                              "equity": round(equity, 2),
+                              "n_positions": sum(1 for v in position_value_final.values() if v > 0),
+                              "n_actions": len(deltas_final)}, ledger_file)
             target = {a: v for a, v in position_value_final.items() if v > 0}
             booked = True
 
@@ -478,7 +563,7 @@ def run_once(broker: str = "off", allow_mainnet: bool = False) -> None:
     log = StrategyLogger("S011", log_root=REPO / "reports" / "logs", console=False)
     result = run_cycle_for_account(account_key="single", creds=None, cfg=DEPLOY,
                                    state=_state_store, logger=log, broker=broker,
-                                   allow_mainnet=allow_mainnet)
+                                   allow_mainnet=allow_mainnet, ledger_file=LEDGER_FILE)
     if result["error"]:
         print(f"ERROR: {result['error']}")
         return

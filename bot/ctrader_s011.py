@@ -44,6 +44,16 @@ if HAVE_SDK:
 
 PRICE_SCALE = 100000.0   # Open API trendbar/price integers = human_price * 1e5
 
+# cTrader D1 trendbars are stamped at the broker-day OPEN (this broker's local
+# midnight -- 21:00 UTC in summer, 22:00 UTC in winter), so a bar stamped
+# "D 21:00Z" is the D+1 session. We relabel each D1 bar to the UTC date its
+# broker-day CLOSES on == the session date, which is what the Yahoo-sourced
+# backtest (backtest/run_rsi2_portfolio.py) dates its bars by. Verified live
+# 2026-09-09 against IC Markets (every D1 bar stamped 21:00Z).
+D1_SESSION_DATE_ROLL = "D"   # pandas ceil() frequency used for that relabelling:
+                             # roll a broker-day OPEN stamp up to the UTC
+                             # midnight that same broker-day CLOSES on
+
 
 class CTraderS011(CTraderAdapter):
     def __init__(self, creds: dict | None = None, require_account: bool = True):
@@ -91,6 +101,22 @@ class CTraderS011(CTraderAdapter):
                     break
         return resolved
 
+    @staticmethod
+    def _session_dated_index(utc_open_ts) -> pd.DatetimeIndex:
+        """cTrader D1 open timestamps -> naive session-date index.
+
+        `utc_open_ts`: a tz-aware (UTC) pd.Series/Index of D1 bar OPEN times.
+        Returns a tz-naive DatetimeIndex normalised to the UTC midnight the
+        broker-day CLOSES on (== the trading session's calendar date). A bar
+        already opening exactly at 00:00 UTC (a GMT-based broker) is left on
+        its own date; any evening open (21:00/22:00 UTC) rolls to the next
+        day. DST-safe: both 21:00Z and 22:00Z ceil to the same next midnight.
+
+        See D1_SESSION_DATE_ROLL for why this relabelling exists at all.
+        """
+        opens_utc = pd.DatetimeIndex(pd.to_datetime(utc_open_ts, utc=True))
+        return opens_utc.ceil(D1_SESSION_DATE_ROLL).tz_localize(None)
+
     def _get_daily_step(self, symbol: str, days: int):
         """D1 trendbars for ONE symbol, human index/price points (same
         PRICE_SCALE convention as CTraderS007._get_m1_step, just period=D1).
@@ -118,12 +144,20 @@ class CTraderS011(CTraderAdapter):
             df = pd.DataFrame(rows)
             if df.empty:
                 return df
-            # D1 bars: cTrader's own daily-bar close convention (broker/server
-            # time, NOT necessarily each instrument's own exchange midnight --
-            # see bot/s011_paper.py's module docstring for the "one fixed
-            # cutover for a mixed-session universe" tradeoff this accepts).
-            idx = pd.to_datetime(df.pop("ts"), unit="s", utc=True).dt.tz_localize(None)
-            df.index = idx
+            # D1 bars arrive stamped at the broker-day OPEN, so the raw
+            # timestamp names the PREVIOUS calendar day (and, over a weekend,
+            # up to two days back) relative to the session the bar actually
+            # covers -- see D1_SESSION_DATE_ROLL. Relabel to the session date
+            # (the UTC midnight the broker-day closes on) so every downstream
+            # date comparison -- the paper ledger's `date`, the up-to-date
+            # short-circuit, the stale-feed guard, a reconciliation against
+            # the Yahoo-dated backtest -- talks about the same day the
+            # backtest does. This is still ONE fixed cutover for a
+            # mixed-session universe, NOT each instrument's own exchange
+            # midnight (see bot/s011_paper.py's module docstring for that
+            # tradeoff); relabelling changes only the index, never the OHLC.
+            opens_utc = pd.to_datetime(df.pop("ts"), unit="s", utc=True)
+            df.index = self._session_dated_index(opens_utc)
             return df.sort_index()
         d.addCallback(fin)
         return d
@@ -138,7 +172,13 @@ class CTraderS011(CTraderAdapter):
         comparison, so the signal and the order-sizing price can never
         silently diverge on which bar counts as "current" again -- see
         `_last_closed_price`'s docstring for the incident this guards
-        against."""
+        against.
+
+        (D1 convention: the index this reads is SESSION-dated, not stamped at
+        the broker-day open -- see `_session_dated_index` -- so a
+        still-forming current session labels as TODAY's UTC date and is what
+        gets dropped here. In practice this broker's `GetTrendbarsReq` only
+        returns already-closed bars, so this is defence-in-depth.)"""
         if df.empty:
             return df
         today_utc = datetime.now(timezone.utc).date()
@@ -147,7 +187,9 @@ class CTraderS011(CTraderAdapter):
     @classmethod
     def _last_closed_price(cls, df: pd.DataFrame) -> float | None:
         """Latest CLOSED D1 bar's close -- never a still-forming current-UTC-
-        day bar (see `_drop_forming_bar`). run_live_cycle_multi's
+        day bar (operates on the session-dated, forming-bar-filtered series;
+        see `_session_dated_index` and `_drop_forming_bar`).
+        run_live_cycle_multi's
         `last_price` used to skip this guard even though it feeds directly
         into `_place_market_step`'s order sizing -- found live 2026-08-19:
         an incomplete bar's close priced a $1500-target CAC40 order at what

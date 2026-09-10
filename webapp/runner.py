@@ -418,6 +418,7 @@ def _worker_s011(link: AccountStrategy, session, budget_s: float | None) -> int:
               strategy=strat)
     session.commit()
 
+    # ledger_file omitted on purpose -- DB path, see run_cycle_for_account docstring
     result = run_s011_cycle(
         account_key=acc.label or f"acct{acc.id}", creds=creds, cfg=DEPLOY, state=state,
         logger=logger, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env)
