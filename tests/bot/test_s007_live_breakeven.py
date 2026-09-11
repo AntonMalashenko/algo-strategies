@@ -231,6 +231,86 @@ def test_no_amend_when_real_price_has_not_reached_real_breakeven_yet(monkeypatch
     assert [a for a in actions if a["kind"] == "amend"] == []
 
 
+def test_amend_target_carries_the_breakeven_offset_past_the_fill(monkeypatch):
+    """ALGODEV-41: with breakeven_offset_points set, the amend must target
+    fill + offset for a buy (fill - offset for a sell), so a retrace onto the
+    BE stop clears the round-trip spread instead of booking it as a loss.
+    Market is far away here, so nothing clamps."""
+    from bot import s007_paper
+
+    broker = [dict(label="S007:2024-05-10:0", position_id=31, volume=100,
+                   price=18000.0, stop_loss=17950.0, take_profit=18100.0, side="buy",
+                   opened_ts=int(pd.Timestamp("2024-05-10 10:00", tz="Europe/Bucharest")
+                                .tz_convert("UTC").timestamp() * 1000))]
+    wanted = [dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=18000.0,
+                   tp=18100.0, is_add=False, be_moved=True)]
+    bars = pd.DataFrame(
+        {"open": [18040.0], "high": [18050.0], "low": [18035.0], "close": [18045.0]},
+        index=pd.to_datetime(["2024-05-10 10:06"]),
+    )
+    fake = _install_with_real_bars(monkeypatch, broker, wanted, bars)
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=wanted,
+        direction="up", context={}, breakeven_at_r=0.5, breakeven_offset_points=3.0))
+
+    s007_paper.live()
+
+    _, _, actions = fake.last_decide_args
+    amends = [a for a in actions if a["kind"] == "amend"]
+    assert len(amends) == 1
+    assert amends[0]["sl"] == 18003.0       # fill 18000 + 3pt offset, not the bare fill
+
+
+def test_amend_offset_is_clamped_to_the_safe_side_of_the_latest_bar(monkeypatch):
+    """ALGODEV-41: if price has ALREADY retraced to near fill+offset, an amend
+    at fill+offset would be a stop on the wrong side of the market -- exactly
+    the TRADING_BAD_STOPS rejection seen live. The target is capped at the
+    last bar's low less the named buffer, and never falls back past `fill`."""
+    from bot import s007_paper
+
+    broker = [dict(label="S007:2024-05-10:0", position_id=32, volume=100,
+                   price=18000.0, stop_loss=17950.0, take_profit=18100.0, side="buy",
+                   opened_ts=int(pd.Timestamp("2024-05-10 10:00", tz="Europe/Bucharest")
+                                .tz_convert("UTC").timestamp() * 1000))]
+    wanted = [dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=18000.0,
+                   tp=18100.0, is_add=False, be_moved=True)]
+    # last bar's low is 18002 -> cap = 18002 - 1.5 = 18000.5, well short of
+    # the requested 18000 + 3 = 18003.
+    bars = pd.DataFrame(
+        {"open": [18003.0], "high": [18004.0], "low": [18002.0], "close": [18002.5]},
+        index=pd.to_datetime(["2024-05-10 10:06"]),
+    )
+    fake = _install_with_real_bars(monkeypatch, broker, wanted, bars)
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=wanted,
+        direction="up", context={}, breakeven_at_r=0.5, breakeven_offset_points=3.0))
+
+    s007_paper.live()
+
+    _, _, actions = fake.last_decide_args
+    amends = [a for a in actions if a["kind"] == "amend"]
+    assert len(amends) == 1
+    assert amends[0]["sl"] == 18002.0 - s007_paper.BREAKEVEN_AMEND_MARKET_BUFFER_POINTS
+    assert amends[0]["sl"] >= 18000.0       # never worse than the old sl=fill behaviour
+
+
+def test_breakeven_stop_price_falls_back_to_fill_on_a_deep_retrace(monkeypatch):
+    """The clamp is one-sided: a retrace already BELOW fill can never push the
+    BE stop below the fill (that would be looser than the frozen ALGODEV-37
+    behaviour), it just degrades to the plain sl=fill amend."""
+    from bot import s007_paper
+
+    bars = pd.DataFrame(
+        {"open": [17999.0], "high": [18001.0], "low": [17999.0], "close": [18000.0]},
+        index=pd.to_datetime(["2024-05-10 10:06"]),
+    )
+    assert s007_paper.breakeven_stop_price("buy", 18000.0, 3.0, bars) == 18000.0
+    assert s007_paper.breakeven_stop_price("sell", 18000.0, 3.0, bars) == 18000.0
+    # offset 0.0 (every preset that doesn't opt in) is the identity case
+    assert s007_paper.breakeven_stop_price("buy", 18000.0, 0.0, bars) == 18000.0
+    assert s007_paper.breakeven_stop_price("sell", 18000.0, 0.0, bars) == 18000.0
+
+
 def test_amend_does_not_consume_day_caps(monkeypatch):
     """Frozen invariant (2026-09-02 risk-cap fix): an amend opens nothing.
     With the day already AT the count cap (4 open of 4 allowed at

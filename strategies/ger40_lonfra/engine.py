@@ -16,6 +16,15 @@ from .data import daily_levels
 from .setups import find_setup
 from .structure import structure_levels
 
+# ALGODEV-41: the moved breakeven stop must stay STRICTLY inside the trigger
+# price, otherwise cfg.breakeven_offset_points >= breakeven_at_r*risk0 would put
+# the "moved" stop at or beyond the very price that armed it and the position
+# would be stopped out on the next bar's first touch (a same-bar artifact, not a
+# real exit). One index point is far finer than GER40's ~1.27pt round-trip
+# spread, so clamping here can never bite a sane preset -- it only bounds a
+# misconfigured one.
+BE_OFFSET_MIN_GAP_POINTS = 1.0
+
 
 def pick_stop(mode, t, entry, up, L, range_stop):
     def ok(v):
@@ -165,13 +174,26 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
             # breakeven_at_r * risk0 in its favor. Checked AFTER the stop/tp
             # test above so a same-bar stop-out at the ORIGINAL stop still
             # wins (conservative ordering); the move only affects future bars.
+            #
+            # ALGODEV-41: the stop goes to entry +- cfg.breakeven_offset_points
+            # (in the PROFIT direction), not to entry exactly, so a retrace back
+            # onto the BE stop books a small WIN instead of the ~1.27pt
+            # round-trip spread + commission as a small loss. 0.0 (default) ==
+            # the original entry-exact behaviour, base untouched. The offset is
+            # clamped to stay BE_OFFSET_MIN_GAP_POINTS below the trigger price
+            # this same bar -- a stop at/beyond `trig` would be hit immediately.
             if (cfg.breakeven_at_r is not None and p["status"] == "open"
                     and not p.get("be_moved")):
-                trig = (p["entry"] + cfg.breakeven_at_r * p["risk0"] if up
-                        else p["entry"] - cfg.breakeven_at_r * p["risk0"])
+                be_move_points = cfg.breakeven_at_r * p["risk0"]
+                trig = (p["entry"] + be_move_points if up
+                        else p["entry"] - be_move_points)
                 if (up and hi >= trig) or ((not up) and lo <= trig):
-                    p["stop"] = p["entry"]
+                    offset = min(cfg.breakeven_offset_points,
+                                 be_move_points - BE_OFFSET_MIN_GAP_POINTS)
+                    offset = max(offset, 0.0)
+                    p["stop"] = p["entry"] + offset if up else p["entry"] - offset
                     p["be_moved"] = True
+                    p["be_offset"] = offset
         if (up and hi >= tp) or ((not up) and lo <= tp):
             for p in positions:
                 if p["status"] == "open":
