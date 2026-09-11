@@ -108,6 +108,71 @@ class StrategyConfig:
     # experiments-log.md S007 E4, backtest-log.md 2026-09-02.
     breakeven_at_r: float | None = None
 
+    # breakeven_offset_points (ALGODEV-41, Anton 2026-09-10: "make the BE a few
+    # points more favourable so even tiny losses don't happen"): when the
+    # breakeven rule above fires, the stop goes to entry + this many points
+    # (long) / entry - this many points (short) instead of exactly `entry`, so a
+    # subsequent retrace onto the BE stop exits `breakeven_offset_points` in
+    # PROFIT -- enough to clear the ~1.27pt round-trip spread + commission
+    # instead of booking it as a small loss (which is what an entry-exact BE
+    # exit does today: gross 0.0R minus cost_points/risk_points).
+    # Unit: RAW engine points, the same convention as max_height and
+    # liquidity_tp_floor_points -- NOT R, and not a fraction of risk0.
+    # Only meaningful when breakeven_at_r is not None (nothing reads it
+    # otherwise). 0.0 (default) == today's exact-entry behaviour, base
+    # untouched.
+    # Constraint: must stay well below breakeven_at_r * risk0, or the "moved"
+    # stop would sit at/beyond the trigger price that armed it and the position
+    # would be stopped out on the next bar's first touch. engine.py clamps it to
+    # trigger - BE_OFFSET_MIN_GAP_POINTS as a safety net, but a preset should
+    # stay a few points against a ~30-60pt risk0, not anywhere near it.
+    #
+    # TESTED 2026-09-10 (backtest/run_s007_breakeven.py, Dukascopy
+    # 2023-06-26..2026-08-11, offsets 0/1/2/3/5pt at the live
+    # breakeven_at_r=0.5, Gate 1 + Gate 2 at 0.635/side). VERDICT: the stated
+    # goal IS achieved -- BE exits stop being small losses from ~2pt up -- but
+    # the whole-book effect is MARGINAL and NON-MONOTONIC, so nothing is
+    # promoted. Gate 2 net R/day:
+    #   WORKING_S007_NEWSSAFE_MAX8_BE05 (deployment candidate, max_positions=8)
+    #     off=0.0 +1.6513   off=1.0 +1.6260 (-1.5%)   off=2.0 +1.6287 (-1.4%)
+    #     off=3.0 +1.6623 (+0.7%)            off=5.0 +1.6217 (-1.8%)
+    #   BASELINE_S007 + BE@0.5R
+    #     off=0.0 +0.4406   off=1.0 +0.4275 (-3.0%)   off=2.0 +0.4333 (-1.7%)
+    #     off=3.0 +0.4468 (+1.4%)            off=5.0 +0.4605 (+4.5%)
+    # The BE-exit bucket (positions that actually exited ON the moved stop)
+    # behaves exactly as intended and crosses zero between 1 and 2pt, i.e. at
+    # ~the 1.27pt round-trip spread this is meant to clear:
+    #   MAX8_BE05, n(BE-exits) 1269..1444 of 5049 positions, total / avg R:
+    #     off=0.0  -87.5R / -0.0689   off=1.0  -20.9R / -0.0160
+    #     off=2.0  +42.1R / +0.0314   off=3.0 +101.0R / +0.0737
+    #     off=5.0 +208.7R / +0.1445
+    #   BASELINE_S007, n 629..683 of 2313:
+    #     off=0.0  -36.1R / -0.0575   off=2.0  +18.1R / +0.0278
+    #     off=3.0  +43.7R / +0.0659   off=5.0  +90.7R / +0.1329
+    # (At off=0.0 the same bucket is EXACTLY 0.00R gross and negative only
+    # after costs -- the arithmetic proof of Anton's complaint.)
+    # The tradeoff is the usual S007 one: the offset also arms a TIGHTER
+    # post-breakeven stop on every be_moved position, so more positions exit
+    # there at all (1269 -> 1444 on MAX8_BE05) and some would-be runners get
+    # clipped. That clipping roughly cancels the bucket's gain, which is why
+    # net R/day wobbles within +-2% instead of tracking the bucket. maxDD is
+    # the one axis that improves consistently and monotonically with the
+    # offset (MAX8_BE05 -19.2 -> -15.6R at 5pt; BASELINE -25.4 -> -23.5R), and
+    # day win-rate rises (69 -> 72%), both for the same reason. Worst-year
+    # goes the OTHER way on the deployment candidate (+173.9 -> +154.3R at
+    # 3pt) while improving on BASELINE (+17.3 -> +25.1R at 5pt).
+    # Best single value = 3.0pt: the only offset positive on BOTH bases
+    # (+0.7% / +1.4% net), with maxDD better on both and the BE-exit bucket
+    # solidly positive. But 5pt being WORSE than 3pt on the deployment
+    # candidate while better on BASELINE means 3pt is within sampling noise,
+    # not a located optimum -- treat it as "costs nothing, cleans up the
+    # small-loss exits", not as an edge. Named as
+    # WORKING_S007_NEWSSAFE_MAX8_BE05_OFF3 below, NOT promoted.
+    # Gate 3 (prop cashout%/daily-bust%, backtest/run_s007_propscheme.py --
+    # the axis BE@0.5R was actually chosen on) NOT re-run for the offset; see
+    # that preset's comment below.
+    breakeven_offset_points: float = 0.0
+
     # --- take profit ---
     # 'range'      : fixed 100% of range (B) / opposite boundary (A)
     # 'liquidity'  : nearest liquidity proxy (asia / prior-day / prev swing)
@@ -418,7 +483,44 @@ WORKING_S007_NEWSSAFE_MAX8 = WORKING_S007_NEWSSAFE.with_(max_positions=8)
 # (bot/ctrader_s007.py + bot/s007_paper.py, ALGODEV-37) before promotion.
 WORKING_S007_NEWSSAFE_MAX8_BE05 = WORKING_S007_NEWSSAFE_MAX8.with_(breakeven_at_r=0.5)
 
+# ALGODEV-41 (2026-09-10, Anton: "make the BE a few points more favourable so
+# even tiny losses don't happen -- they eat the balance too"): MAX8_BE05 with
+# the breakeven stop placed 3 points PAST entry instead of exactly at entry, so
+# a BE exit clears the ~1.27pt round-trip spread + commission and books a small
+# WIN instead of a small loss. 3.0pt is the best of the swept offsets
+# (0/1/2/3/5pt, backtest/run_s007_breakeven.py, Dukascopy 2023-06-26..
+# 2026-08-11, real spread 0.635/side) -- see breakeven_offset_points' own
+# verdict comment for the full table. Against MAX8_BE05 at the same Gate 2
+# costs and the same 0.25%/R sizing the MAX8 family is intended for:
+#   net    +1.6513 -> +1.6623 R/day  (+0.7%)
+#   sum    +1122.9 -> +1130.4 R
+#   maxDD    -19.2 ->   -15.9 R      (-17%, the clearest gain)
+#   days+       69% ->     71%
+#   worst_yr +173.9 -> +154.3 R      (-11%, the clearest cost)
+#   BE-exit trades  1269 @ -87.5R total  ->  1370 @ +101.0R total
+# NOT RECOMMENDED over MAX8_BE05 on the numbers alone: +0.7% net is inside
+# noise (5pt is worse than 3pt on this base while better on BASELINE_S007 --
+# no located optimum), and it gives up worst-year to buy maxDD. It IS the
+# right preset if the goal is Anton's stated one -- never book a sub-spread
+# loss on a breakeven exit -- since it delivers that at no measurable cost to
+# expectancy. Gate 3 (prop cashout% / daily-bust%, the axis MAX8_BE05 was
+# actually chosen on, backtest/run_s007_propscheme.py) NOT re-run for this
+# preset: the offset's maxDD/win-rate improvements should if anything help
+# there, but that is an expectation, not a measurement -- re-run Gate 3 before
+# any promotion. NOT promoted: bot/s007_config.py::PRESET and every DB row are
+# unchanged; the live cutover is Anton's call.
+WORKING_S007_NEWSSAFE_MAX8_BE05_OFF3 = WORKING_S007_NEWSSAFE_MAX8_BE05.with_(
+    breakeven_offset_points=3.0)
+
 # --- Exact reproductions of the two reference result files (regression only) ---
+# NOTE (ALGODEV-41): neither REF preset sets breakeven_at_r, so the breakeven
+# block in engine.py never runs for them and breakeven_offset_points is dead
+# code on this path -- the regression reproduces history byte-for-byte
+# regardless of the new field. Verified 2026-09-10: per-day day_R and the
+# n_pos/n_tp/n_stop/n_eod counts are BIT-identical (max |diff| = 0.0, not just
+# ~1e-14) before/after the offset change for both REF presets (and for
+# BASELINE_S007 / WORKING_S007_LIQFLOOR / WORKING_S007_NEWSSAFE_MAX8_BE05,
+# which DOES use breakeven but at the default offset 0.0).
 # pyramid_duka.csv  <- pyramid.py run(k=2,max=4, use_structure_stop=True), 2h, range TP
 REF_PYRAMID_DUKA = StrategyConfig(
     k=2, max_positions=4, do_pyramid=True,

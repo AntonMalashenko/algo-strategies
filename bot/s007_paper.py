@@ -52,6 +52,44 @@ LOG = StrategyLogger("S007", log_root=str(ROOT / "reports" / "logs"))
 # ignored automatically -- no manual cleanup needed, unlike a plain touch-file.
 STOP_FLAG = ROOT / "reports" / "control" / "S007_STOP_TODAY"
 
+# ALGODEV-41: how far the offset breakeven stop must stay on the safe side of
+# the latest M1 bar. cTrader rejects an amend whose stopLoss sits on the wrong
+# side of the current market outright (TRADING_BAD_STOPS -- seen live
+# 2026-08-06 and 2026-08-31 on other wrong-side stop bugs), so the amend target
+# fill +- breakeven_offset_points is capped at the last bar's low (buy) / high
+# (sell) minus/plus this buffer. Points, GER40's own price units; ~1 round-trip
+# spread of headroom against the bar-to-tick gap our 1-minute poll cannot see.
+BREAKEVEN_AMEND_MARKET_BUFFER_POINTS = 1.5
+
+
+def breakeven_stop_price(side: str, fill: float, offset_points: float,
+                         m1: pd.DataFrame) -> float:
+    """Where a live breakeven amend should put the stop (pure, no I/O).
+
+    Base behaviour (offset_points == 0.0, every preset that doesn't set
+    cfg.breakeven_offset_points): exactly the broker's own fill price, the
+    frozen ALGODEV-37/39 result -- a BE exit then books the round-trip spread
+    as a small loss.
+
+    With an offset: fill + offset (buy) / fill - offset (sell), so a retrace
+    onto the moved stop clears the spread instead. Two clamps, both one-sided:
+      * never past the latest M1 bar's low (buy) / high (sell) less
+        BREAKEVEN_AMEND_MARKET_BUFFER_POINTS -- if price has ALREADY retraced
+        to near fill+offset, an amend there would be a stop on the wrong side
+        of the market and cTrader rejects the whole request;
+      * never back beyond `fill` itself, so the fallback of a deep retrace is
+        exactly the old sl=fill amend, never something looser or on the far
+        side of the entry.
+    """
+    if offset_points <= 0 or not len(m1):
+        return fill
+    last_bar = m1.iloc[-1]
+    if side == "buy":
+        market_cap = float(last_bar["low"]) - BREAKEVEN_AMEND_MARKET_BUFFER_POINTS
+        return max(min(fill + offset_points, market_cap), fill)
+    market_floor = float(last_bar["high"]) + BREAKEVEN_AMEND_MARKET_BUFFER_POINTS
+    return min(max(fill - offset_points, market_floor), fill)
+
 
 def _stop_flag_active() -> bool:
     if not STOP_FLAG.exists():
@@ -429,6 +467,9 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
             # still counts in opened_today_count, so the count cap cannot be
             # bypassed.
             breakeven_at_r = res.get("breakeven_at_r")
+            # ALGODEV-41: 0.0 (or a missing key, e.g. an older/stubbed
+            # plan_now) keeps the frozen "amend to exactly the fill" behaviour.
+            breakeven_offset_points = res.get("breakeven_offset_points", 0.0) or 0.0
             for lab, o in want.items():
                 engine_triggered = bool(o.get("be_moved"))
                 # Cheap short-circuit BEFORE touching `have`/`p` at all: if
@@ -452,6 +493,17 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                 # without needing its own state -- after a successful amend,
                 # cur_sl == fill and this test fails forever after). Never
                 # loosen a stop the broker/user may have moved further.
+                # ALGODEV-41: the threshold stays `fill`, NOT fill+offset, and
+                # that is deliberate on both sides. First amend: the original
+                # stop is below fill for a buy (above for a sell), so the test
+                # is false and we proceed -- unchanged by the offset. After a
+                # successful amend: cur_sl is fill+offset >= fill (or exactly
+                # fill when the market clamp in breakeven_stop_price() bit), so
+                # the test is true and the amend stays one-shot either way.
+                # Raising the threshold to fill+offset would instead RE-amend
+                # every cycle whenever the clamp had capped the first move --
+                # repeated no-progress broker calls for a stop we already
+                # deliberately placed short of the target.
                 if cur_sl and ((p["side"] == "buy" and cur_sl >= fill)
                                or (p["side"] == "sell" and cur_sl <= fill)):
                     continue
@@ -479,12 +531,24 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                             triggered = bool((bars_since_open["low"] <= real_trigger_price).any())
                 if not triggered:
                     continue
+                # ALGODEV-41: the stop goes to fill +- breakeven_offset_points
+                # (profit direction) rather than to the fill exactly, so a
+                # retrace onto it clears the round-trip spread instead of
+                # booking it. offset 0.0 -> amend_sl == fill, unchanged.
+                amend_sl = breakeven_stop_price(p["side"], fill,
+                                                breakeven_offset_points, m1)
                 logger.event("breakeven_trigger", cycle=cid, label=lab,
                              engine_entry=o["entry"], engine_sl=o["sl"],
                              engine_be_moved=bool(o.get("be_moved")),
-                             broker_fill=fill, broker_sl=cur_sl)
+                             broker_fill=fill, broker_sl=cur_sl,
+                             breakeven_offset_points=breakeven_offset_points,
+                             amend_sl=amend_sl,
+                             # what the offset actually bought after the
+                             # market clamp: signed distance entry -> BE stop,
+                             # always >= 0 and <= breakeven_offset_points.
+                             applied_offset_points=abs(amend_sl - fill))
                 out.append(dict(kind="amend", label=lab, position_id=p["position_id"],
-                                sl=fill, tp=p.get("take_profit"),
+                                sl=amend_sl, tp=p.get("take_profit"),
                                 prev_sl=cur_sl))
         return out
 

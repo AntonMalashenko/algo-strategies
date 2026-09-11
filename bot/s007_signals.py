@@ -65,6 +65,13 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
                      against the broker's REAL fill price/stop -- be_moved
                      above only ever reflects the engine's theoretical entry,
                      blind to slippage.
+      breakeven_offset_points -- (ALGODEV-41) how far PAST the entry, in raw
+                     index points, the breakeven stop is placed when the rule
+                     fires; 0.0 when off (and meaningless while
+                     breakeven_at_r is None). The live layer adds it to the
+                     amend target (in the profit direction, off the broker's
+                     REAL fill) so a BE exit clears the round-trip spread
+                     instead of booking it as a small loss.
     """
     cfg = _preset(preset).with_(trade_start=C.TRADE_START, exit_end=C.EXIT_END,
                                 fr_start=C.FR_START, fr_end=C.FR_END)
@@ -178,4 +185,10 @@ def plan_now(m1: pd.DataFrame, now: pd.Timestamp | None = None,
                 # against the broker's real fill price (the engine-only
                 # be_moved above can't see slippage) -- None when the active
                 # preset has breakeven off, same as cfg.breakeven_at_r itself.
-                breakeven_at_r=cfg.breakeven_at_r)
+                breakeven_at_r=cfg.breakeven_at_r,
+                # ALGODEV-41: how far past entry the BE stop goes, in raw
+                # points. decide() applies it to the broker's real fill so a
+                # live BE exit clears the round-trip spread; 0.0 (default on
+                # every preset but an explicit _OFF<N> one) reproduces the
+                # original "amend to exactly the fill price" behaviour.
+                breakeven_offset_points=cfg.breakeven_offset_points)
