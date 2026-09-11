@@ -171,6 +171,12 @@ class StrategyConfig:
     # Gate 3 (prop cashout%/daily-bust%, backtest/run_s007_propscheme.py --
     # the axis BE@0.5R was actually chosen on) NOT re-run for the offset; see
     # that preset's comment below.
+    #
+    # LIVE (2026-09-11, Anton's explicit decision, shown this whole tradeoff):
+    # 2.0pt (WORKING_S007_NEWSSAFE_MAX8_BE05_OFF2, see its own comment below)
+    # is wired to the S007 demo account (account_strategy id=1) -- the
+    # smallest swept offset whose BE-exit bucket is actually positive, chosen
+    # over 3.0pt's slightly-better net R/day to keep the offset minimal.
     breakeven_offset_points: float = 0.0
 
     # --- take profit ---
@@ -483,7 +489,7 @@ WORKING_S007_NEWSSAFE_MAX8 = WORKING_S007_NEWSSAFE.with_(max_positions=8)
 # (bot/ctrader_s007.py + bot/s007_paper.py, ALGODEV-37) before promotion.
 WORKING_S007_NEWSSAFE_MAX8_BE05 = WORKING_S007_NEWSSAFE_MAX8.with_(breakeven_at_r=0.5)
 
-# ALGODEV-41 (2026-09-10, Anton: "make the BE a few points more favourable so
+# ALGODEV-43 (2026-09-10, Anton: "make the BE a few points more favourable so
 # even tiny losses don't happen -- they eat the balance too"): MAX8_BE05 with
 # the breakeven stop placed 3 points PAST entry instead of exactly at entry, so
 # a BE exit clears the ~1.27pt round-trip spread + commission and books a small
@@ -512,8 +518,22 @@ WORKING_S007_NEWSSAFE_MAX8_BE05 = WORKING_S007_NEWSSAFE_MAX8.with_(breakeven_at_
 WORKING_S007_NEWSSAFE_MAX8_BE05_OFF3 = WORKING_S007_NEWSSAFE_MAX8_BE05.with_(
     breakeven_offset_points=3.0)
 
+# ALGODEV-43 follow-up (2026-09-11, Anton's explicit deploy decision): asked
+# for 1.0pt first, but the swept BE-exit bucket at 1.0pt is STILL net negative
+# (-20.86R total / -0.016R avg on this preset -- 1pt doesn't cover the 1.27pt
+# round-trip spread). 2.0pt is the smallest swept offset where BE-exits are
+# actually positive (+42.13R total / +0.031R avg), so it's the minimum that
+# satisfies the stated goal ("BE exits should never book a loss"), shown the
+# tradeoff (net R/day -1.4% vs MAX8_BE05, maxDD -17.0R vs -19.2R, worst_yr
+# +159.1 vs +173.9) and chose it anyway -- see breakeven_offset_points' and
+# OFF3's comments above for the full sweep table and mechanism. THIS preset
+# (not OFF3) is the one wired live -- see webapp DB account_strategies.preset
+# for account_strategy id=1 (S007, demo ctrader-47939312).
+WORKING_S007_NEWSSAFE_MAX8_BE05_OFF2 = WORKING_S007_NEWSSAFE_MAX8_BE05.with_(
+    breakeven_offset_points=2.0)
+
 # --- Exact reproductions of the two reference result files (regression only) ---
-# NOTE (ALGODEV-41): neither REF preset sets breakeven_at_r, so the breakeven
+# NOTE (ALGODEV-43): neither REF preset sets breakeven_at_r, so the breakeven
 # block in engine.py never runs for them and breakeven_offset_points is dead
 # code on this path -- the regression reproduces history byte-for-byte
 # regardless of the new field. Verified 2026-09-10: per-day day_R and the
