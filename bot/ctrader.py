@@ -18,6 +18,7 @@ interactively on first run.
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -63,6 +64,15 @@ class CTraderAdapter:
         self._result = None
         self._error = None
         self._symbols = None            # NAME -> light symbol
+        # Populated fresh by every _run() call (ALGODEV-44 latency
+        # investigation): {"connect_ms", "app_auth_ms", "account_auth_ms"}
+        # -- wall-clock time spent getting a usable session before any
+        # subclass work() step runs. A subclass's run_live_cycle-style
+        # method merges this into its own per-step timings so a cold
+        # connect+auth (a new TCP/TLS session + 1-2 round trips every
+        # cycle, per webapp/runner.py's stateless-tick model) is visible
+        # separately from the actual trading-data round trips.
+        self._session_timings: dict = {}
 
     # ---------- session plumbing ----------
 
@@ -74,7 +84,18 @@ class CTraderAdapter:
         from twisted.internet import reactor
 
         self._result, self._error = None, None
+        self._session_timings = {}
         finished = threading.Event()
+        t_start = time.monotonic()
+
+        def mark(key: str, t0: float):
+            """Deferred callback that records elapsed ms under `key` and
+            passes the result through unchanged -- lets a timing be spliced
+            into an existing callback chain without altering its value."""
+            def cb(result):
+                self._session_timings[key] = round((time.monotonic() - t0) * 1000, 1)
+                return result
+            return cb
 
         def done(result=None, error=None):
             if finished.is_set():
@@ -89,12 +110,22 @@ class CTraderAdapter:
                 reactor.callFromThread(reactor.stop)
 
         def on_connected(_client):
+            # ALGODEV-44: connect_ms covers TCP+TLS handshake, i.e. the time
+            # from startService() until the SDK's own ClientService calls us
+            # back -- the part a persistent-connection redesign (Phase 3 of
+            # that ticket) would eliminate entirely, so worth seeing on its
+            # own before that's attempted.
+            self._session_timings["connect_ms"] = round((time.monotonic() - t_start) * 1000, 1)
+            t_app_auth = time.monotonic()
             req = ProtoOAApplicationAuthReq()
             req.clientId = self.client_id
             req.clientSecret = self.secret
             d = self.client.send(req)
+            d.addCallback(mark("app_auth_ms", t_app_auth))
             if auth_account:
+                t_account_auth = time.monotonic()
                 d.addCallback(lambda _r: self._auth_account())
+                d.addCallback(mark("account_auth_ms", t_account_auth))
             d.addCallback(lambda _r: work(done))
             d.addErrback(lambda f: done(error=f))
 

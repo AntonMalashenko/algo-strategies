@@ -562,6 +562,15 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     error = None
     try:
         cyc = api.run_live_cycle(symbol_candidates, history_days, decide)
+        # ALGODEV-44: surface CTraderS007.run_live_cycle's per-step timings
+        # (absent from tests/e2e/conftest.py's fake client, hence .get) so
+        # events-<date>.jsonl shows where a slow cycle's time actually went
+        # before any parallelization fix is attempted -- see that ticket's
+        # Phase 0.
+        step_timings = cyc.get("timings")
+        if step_timings:
+            logger.event("step_timing", cycle=cid, **step_timings,
+                        action_timings=cyc.get("action_timings", []))
         symbol = cyc["symbol"]
         post_positions = cyc.get("post_positions", cyc["positions"])
         for r in cyc["results"]:

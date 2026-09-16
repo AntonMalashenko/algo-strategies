@@ -10,6 +10,7 @@ of order/price details can differ by SDK version and broker — run `--check` an
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -56,6 +57,7 @@ class CTraderS007(CTraderAdapter):
         self._result = None
         self._error = None
         self._symbols = None
+        self._session_timings: dict = {}  # see CTraderAdapter.__init__/_run
 
     def resolve_symbol(self, candidates) -> str:
         """First matching broker symbol name from a candidate list (GER40/DE40/...)."""
@@ -521,13 +523,36 @@ class CTraderS007(CTraderAdapter):
               position's current takeProfit, see _amend_position_sltp_step)
         and executes the actions in order. Returns
           {"symbol", "m1", "positions", "actions", "results", "balance",
-           "money_per_point_per_lot"}
+           "money_per_point_per_lot", "timings", "action_timings"}
         where results[i] = {"action", "result", "error"} lines up with actions.
+
+        timings (ALGODEV-44, added 2026-09-15): {step_name: duration_ms} for
+        every step above (connect_ms/app_auth_ms/account_auth_ms come from
+        the same session's CTraderAdapter._run, plus load_symbols_ms/
+        full_symbol_ms/balance_ms/m1_ms/reconcile_ms/deal_list_ms/decide_ms/
+        actions_total_ms/post_reconcile_ms) -- pure instrumentation, no
+        behavior change; see that ticket's Phase 0. action_timings is a
+        parallel per-action list ({kind, label, duration_ms}), since a
+        cycle's action count/labels vary run to run.
         """
         def work(done):
             @defer.inlineCallbacks
             def flow():
+                # ALGODEV-44: per-step wall-clock timings, to find out where
+                # the reported up-to-20s cycle time actually goes (network
+                # round trips, the SDK's own send-queue throttle, or decide()
+                # itself) before attempting any parallelization fix -- see
+                # that ticket's Phase 0. `t` is reset after each measured
+                # step; self._session_timings (connect/app-auth/account-auth,
+                # populated by CTraderAdapter._run before flow() ever starts)
+                # is merged in at the end so callers get one complete picture.
+                timings: dict = {}
+                t = time.monotonic()
+
                 yield self._load_symbols()
+                timings["load_symbols_ms"] = round((time.monotonic() - t) * 1000, 1)
+                t = time.monotonic()
+
                 up = {n.upper() for n in self._symbols.keys()}
                 symbol = None
                 for c in symbol_candidates:
@@ -542,7 +567,12 @@ class CTraderS007(CTraderAdapter):
                 # Fetched once per cycle (not per order) -- see _place_market_step's
                 # full_symbol param and bot/risk.py for how these two feed sizing.
                 full_symbol = yield self._get_full_symbol_step(symbol)
+                timings["full_symbol_ms"] = round((time.monotonic() - t) * 1000, 1)
+                t = time.monotonic()
+
                 balance = yield self._get_balance_step()
+                timings["balance_ms"] = round((time.monotonic() - t) * 1000, 1)
+                t = time.monotonic()
                 # Correct in THIS SYMBOL's own quote currency (EUR for
                 # GER40/DE40) -- NOT yet converted to the account's deposit
                 # currency. bot/s007_paper.py::decide() applies that
@@ -573,7 +603,13 @@ class CTraderS007(CTraderAdapter):
                 # is a signal-engine behavior change and needs backtest
                 # validation (Gate 0/1) first, not a quick live patch.
                 m1 = yield self._get_m1_step(symbol, history_days)
+                timings["m1_ms"] = round((time.monotonic() - t) * 1000, 1)
+                t = time.monotonic()
+
                 positions = yield self._reconcile_step()
+                timings["reconcile_ms"] = round((time.monotonic() - t) * 1000, 1)
+                t = time.monotonic()
+
                 # Closing deals over the last 24h (one cheap read in the same
                 # session): the only place a position that opened AND closed
                 # between two reconcile snapshots still exists, with its real
@@ -588,12 +624,22 @@ class CTraderS007(CTraderAdapter):
                         now_ms - 24 * 3600 * 1000, now_ms)
                 except Exception:
                     closed_deals = []
+                timings["deal_list_ms"] = round((time.monotonic() - t) * 1000, 1)
+                t = time.monotonic()
+
                 actions = decide(symbol, m1, positions, balance, money_per_point_per_lot,
                                  closed_deals=closed_deals)
+                # decide() is pure Python (no I/O, see its own docstring) --
+                # timed anyway so a slow cycle can be told apart from "the
+                # engine itself is slow" vs. "the network/broker is slow"
+                # instead of assuming it's always the latter.
+                timings["decide_ms"] = round((time.monotonic() - t) * 1000, 1)
 
                 results = []
                 placed_ok = False
+                action_timings = []
                 for a in actions:
+                    t_action = time.monotonic()
                     try:
                         if a["kind"] == "place":
                             r = yield self._place_market_step(
@@ -609,6 +655,11 @@ class CTraderS007(CTraderAdapter):
                         results.append(dict(action=a, result=r, error=None))
                     except Exception as e:
                         results.append(dict(action=a, result=None, error=e))
+                    action_timings.append(dict(
+                        kind=a["kind"], label=a.get("label"),
+                        duration_ms=round((time.monotonic() - t_action) * 1000, 1)))
+                timings["actions_total_ms"] = round(
+                    sum(x["duration_ms"] for x in action_timings), 1)
 
                 # ALGODEV-39: a fresh placement's REAL fill price/stop is only
                 # ever visible via reconcile() -- the `positions` snapshot
@@ -623,16 +674,25 @@ class CTraderS007(CTraderAdapter):
                 # pre-orders snapshot (caller then falls back to its own
                 # planned values, same as before this existed).
                 post_positions = positions
+                t = time.monotonic()
                 if placed_ok:
                     try:
                         post_positions = yield self._reconcile_step()
                     except Exception:
                         post_positions = positions
+                timings["post_reconcile_ms"] = round((time.monotonic() - t) * 1000, 1)
+
+                # self._session_timings (connect_ms/app_auth_ms/account_auth_ms)
+                # was populated by CTraderAdapter._run before flow() started --
+                # merge last so a caller sees one flat dict for the whole
+                # session, not two.
+                timings.update(self._session_timings)
 
                 return dict(symbol=symbol, m1=m1, positions=positions,
                             post_positions=post_positions,
                             actions=actions, results=results, balance=balance,
-                            money_per_point_per_lot=money_per_point_per_lot)
+                            money_per_point_per_lot=money_per_point_per_lot,
+                            timings=timings, action_timings=action_timings)
 
             d = flow()
             d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
