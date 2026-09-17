@@ -21,9 +21,10 @@ if HAVE_SDK:
     from twisted.internet import defer
     from ctrader_open_api import Client, TcpProtocol, EndPoints
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-        ProtoOAGetTrendbarsReq, ProtoOANewOrderReq, ProtoOAClosePositionReq,
-        ProtoOAReconcileReq, ProtoOASymbolByIdReq, ProtoOADealListReq,
-        ProtoOAOrderErrorEvent, ProtoOAErrorRes, ProtoOAAmendPositionSLTPReq,
+        ProtoOAApplicationAuthReq, ProtoOAGetTrendbarsReq, ProtoOANewOrderReq,
+        ProtoOAClosePositionReq, ProtoOAReconcileReq, ProtoOASymbolByIdReq,
+        ProtoOADealListReq, ProtoOAOrderErrorEvent, ProtoOAErrorRes,
+        ProtoOAAmendPositionSLTPReq,
     )
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
         ProtoOAOrderType, ProtoOATradeSide, ProtoOATrendbarPeriod,
@@ -735,3 +736,130 @@ class CTraderS007(CTraderAdapter):
             d = flow()
             d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
         return self._run(work)
+
+    # ---------- ALGODEV-45 step 2: persistent-session observation daemon ----------
+    #
+    # Everything below is NEW and ADDITIVE for scripts/s007_daemon.py's shadow-
+    # only observation loop -- run_live_cycle/_run above are NOT touched by any
+    # of this and remain the one and only path that can place/amend/close a
+    # real order. Deliberately duplicates (rather than shares/refactors) the
+    # small connect+auth bootstrap that CTraderAdapter._run already has: that
+    # method is the live trading path for BOTH S007 and S011, real money runs
+    # through it every minute, and step 2's own plan (ALGODEV-45) is explicit
+    # that this stage must not touch anything already proven and live -- a
+    # careful duplication here is the safer trade against a shared refactor of
+    # code this sensitive. Promote to CTraderAdapter later if a second
+    # persistent-session consumer actually needs it (code-architecture's
+    # "generalize when a second consumer needs it", not speculatively).
+
+    def _run_persistent(self, on_ready, on_disconnected=None) -> None:
+        """Connect + app-auth + account-auth ONCE, then call `on_ready()` and
+        keep the reactor running -- unlike _run(), nothing here ever calls
+        reactor.stop() on its own. Blocks the calling thread for as long as
+        the reactor runs; call stop_persistent() (e.g. from a signal handler)
+        for a clean shutdown, or rely on `on_disconnected` firing if the
+        connection drops on its own.
+
+        Step 2 is deliberately conservative about failure: a dropped
+        connection calls `on_disconnected` (if given) and then stops the
+        reactor outright -- no automatic reconnect. Auto-reconnect is its own
+        source of subtle bugs (exactly the kind of thing the ALGODEV-45 plan
+        wants proven separately, not bundled in) -- during this observation
+        phase a disconnect should be visible and require a human to restart
+        the process, not silently paper over itself.
+        """
+        from twisted.internet import reactor
+        self._session_timings = {}
+        self._persistent_stopped = False
+        t_start = time.monotonic()
+
+        def mark(key: str, t0: float):
+            def cb(result):
+                self._session_timings[key] = round((time.monotonic() - t0) * 1000, 1)
+                return result
+            return cb
+
+        def _on_disconnected(_client, reason):
+            if self._persistent_stopped:
+                return
+            if on_disconnected:
+                on_disconnected(reason)
+            self.stop_persistent()
+
+        def on_connected(_client):
+            self._session_timings["connect_ms"] = round((time.monotonic() - t_start) * 1000, 1)
+            t_app_auth = time.monotonic()
+            req = ProtoOAApplicationAuthReq()
+            req.clientId = self.client_id
+            req.clientSecret = self.secret
+            d = self.client.send(req)
+            d.addCallback(mark("app_auth_ms", t_app_auth))
+            t_account_auth = time.monotonic()
+            d.addCallback(lambda _r: self._auth_account())
+            d.addCallback(mark("account_auth_ms", t_account_auth))
+            d.addCallback(lambda _r: on_ready())
+            d.addErrback(lambda f: (on_disconnected(f) if on_disconnected else None,
+                                    self.stop_persistent()))
+
+        self.client.setConnectedCallback(on_connected)
+        self.client.setDisconnectedCallback(_on_disconnected)
+        self.client.startService()
+        reactor.run(installSignalHandlers=False)
+
+    def stop_persistent(self) -> None:
+        """Clean shutdown for _run_persistent -- safe to call more than once
+        (e.g. once from a signal handler and once from a disconnect callback
+        racing it) and safe to call from any thread."""
+        from twisted.internet import reactor
+        if self._persistent_stopped:
+            return
+        self._persistent_stopped = True
+        try:
+            self.client.stopService()
+        except Exception:
+            pass
+        if reactor.running:
+            reactor.callFromThread(reactor.stop)
+
+    @defer.inlineCallbacks
+    def shadow_tick_step(self, symbol_candidates, history_days: int):
+        """One observation tick on an ALREADY-open persistent session
+        (call only from inside _run_persistent's on_ready/LoopingCall, never
+        standalone). Fetches exactly what a real cycle would -- symbol
+        resolution, contract metadata, balance, M1 bars, open positions,
+        closing deals, the same ALGODEV-44 Phase 1 parallel read -- but never
+        calls decide() and never places/amends/closes anything. There is no
+        code path from here to any order-sending method.
+
+        This step is about proving the PERSISTENT-SESSION MECHANICS hold up
+        (does reusing one connection for these reads work correctly and
+        indefinitely, across hours, without hanging) -- NOT about
+        re-validating the trading logic itself, which is already exercised
+        live via the untouched run_live_cycle path above. Returns a small
+        summary dict for the daemon to log each tick.
+        """
+        yield self._load_symbols()
+        up = {n.upper() for n in self._symbols.keys()}
+        symbol = next((c for c in symbol_candidates if c.upper() in up), None)
+        if symbol is None:
+            raise RuntimeError(
+                f"none of {symbol_candidates} found; broker symbols "
+                f"e.g. {sorted(self._symbols.keys())[:15]}")
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        d_deal_list = self._deal_list_step(now_ms - 24 * 3600 * 1000, now_ms)
+        d_deal_list.addErrback(lambda f: [])
+
+        try:
+            full_symbol, balance, m1, positions, closed_deals = yield defer.gatherResults(
+                [self._get_full_symbol_step(symbol), self._get_balance_step(),
+                 self._get_m1_step(symbol, history_days), self._reconcile_step(),
+                 d_deal_list],
+                consumeErrors=True)
+        except defer.FirstError as fe:
+            raise fe.subFailure.value from fe.subFailure.value
+
+        return dict(symbol=symbol, balance=balance,
+                    n_bars=len(m1), last_bar=str(m1.index[-1]) if len(m1) else None,
+                    n_positions=len(positions), n_closed_deals=len(closed_deals),
+                    lot_size=full_symbol.lotSize)
