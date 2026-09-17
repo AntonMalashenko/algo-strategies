@@ -25,6 +25,15 @@ and reusing it, tick after tick, for hours, work without hanging or leaking
 -- and does the daemon correctly notice an operator's config change (Stop /
 preset) via its own periodic DB read, not just at startup.
 
+WINDOW-AWARE (Anton, 2026-09-17: "пусть работает по графику стратегии"):
+only does real work (the broker fetch) during S007's own trading window
+(reuses scripts.s007_watchdog.expected_to_run -- same Kyiv 10-16 weekday
+window as deployment/schedule.yml's S007 cron). Outside that window the
+session stays OPEN (that overnight/weekend idle-connection endurance is
+itself part of what this step needs to prove) but this process does not
+hit the broker at all -- no point burning API calls or log volume for a
+window nothing is supposed to happen in.
+
 Usage (manual only during the observation phase -- NOT wired into
 deployment/schedule.yml or docker-compose.yml):
     python -m scripts.s007_daemon --account-strategy-id 1
@@ -38,7 +47,7 @@ import argparse
 import json
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +121,7 @@ def main() -> None:
     from bot.ctrader_s007 import CTraderS007
     from bot import s007_config as C
     from utils.trade_logger import StrategyLogger
+    from scripts.s007_watchdog import expected_to_run
 
     startup = _load_creds_and_config(args.account_strategy_id)
     logger = StrategyLogger("S007-daemon-shadow", log_root=str(ROOT / "reports" / "logs"))
@@ -122,7 +132,26 @@ def main() -> None:
 
     from twisted.internet import reactor, task
 
+    # None until the first tick decides either way -- lets the very first
+    # tick always log its window state once, instead of only logging on a
+    # TRANSITION (which would stay silent forever if the daemon happens to
+    # start already outside the window, e.g. started in the evening for an
+    # overnight idle-connection soak per Anton's 2026-09-17 request).
+    window_state = {"active": None}
+
     def one_tick():
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC, matches expected_to_run
+        active = expected_to_run(now_utc)
+        if active != window_state["active"]:
+            logger.event("daemon_window_change", active=active)
+            window_state["active"] = active
+        if not active:
+            # Session stays open (that's the whole point -- see module
+            # docstring's WINDOW-AWARE note) but no broker call outside
+            # S007's own trading window: nothing to observe there that
+            # isn't already covered by "the session is still connected".
+            return
+
         cfg = _refresh_config(args.account_strategy_id)
         if not cfg["enabled"]:
             logger.event("daemon_tick_skipped", reason="account_strategy disabled")
