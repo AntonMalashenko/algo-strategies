@@ -526,14 +526,20 @@ class CTraderS007(CTraderAdapter):
            "money_per_point_per_lot", "timings", "action_timings"}
         where results[i] = {"action", "result", "error"} lines up with actions.
 
-        timings (ALGODEV-44, added 2026-09-15): {step_name: duration_ms} for
-        every step above (connect_ms/app_auth_ms/account_auth_ms come from
-        the same session's CTraderAdapter._run, plus load_symbols_ms/
-        full_symbol_ms/balance_ms/m1_ms/reconcile_ms/deal_list_ms/decide_ms/
-        actions_total_ms/post_reconcile_ms) -- pure instrumentation, no
-        behavior change; see that ticket's Phase 0. action_timings is a
-        parallel per-action list ({kind, label, duration_ms}), since a
-        cycle's action count/labels vary run to run.
+        timings (ALGODEV-44, added 2026-09-15, parallelized 2026-09-17):
+        {step_name: duration_ms} for every step above (connect_ms/
+        app_auth_ms/account_auth_ms come from the same session's
+        CTraderAdapter._run, plus load_symbols_ms/decide_ms/actions_total_ms/
+        post_reconcile_ms). full_symbol_ms/balance_ms/m1_ms/reconcile_ms/
+        deal_list_ms are fired concurrently via defer.gatherResults (Phase 1
+        -- confirmed independent of each other, only of _load_symbols()) and
+        each records its OWN elapsed time, so they overlap rather than sum;
+        parallel_read_ms is the wall-clock cost of that whole block, for
+        comparing against the old sequential total (sum of the five) to see
+        the actual saving. action_timings is a parallel per-action list
+        ({kind, label, duration_ms}), since a cycle's action count/labels
+        vary run to run -- actions themselves are still placed sequentially
+        (see the loop below), not parallelized.
         """
         def work(done):
             @defer.inlineCallbacks
@@ -541,11 +547,14 @@ class CTraderS007(CTraderAdapter):
                 # ALGODEV-44: per-step wall-clock timings, to find out where
                 # the reported up-to-20s cycle time actually goes (network
                 # round trips, the SDK's own send-queue throttle, or decide()
-                # itself) before attempting any parallelization fix -- see
-                # that ticket's Phase 0. `t` is reset after each measured
-                # step; self._session_timings (connect/app-auth/account-auth,
-                # populated by CTraderAdapter._run before flow() ever starts)
-                # is merged in at the end so callers get one complete picture.
+                # itself) -- Phase 0. Confirmed live (2026-09-16/17) that the
+                # SDK's send-queue throttle, not decide() or real network
+                # latency, dominates -- see the parallel-reads block below
+                # (Phase 1) for the fix that follows from that. `t` is reset
+                # after each SEQUENTIALLY measured step; self._session_timings
+                # (connect/app-auth/account-auth, populated by
+                # CTraderAdapter._run before flow() ever starts) is merged in
+                # at the end so callers get one complete picture.
                 timings: dict = {}
                 t = time.monotonic()
 
@@ -564,22 +573,51 @@ class CTraderS007(CTraderAdapter):
                         f"none of {symbol_candidates} found; broker symbols "
                         f"e.g. {sorted(self._symbols.keys())[:15]}")
 
+                # ALGODEV-44 Phase 1: the five reads below (contract metadata,
+                # balance, M1 bars, open positions, closing deals) depend only
+                # on _load_symbols() above, not on each other -- confirmed by
+                # live timings (2026-09-16/17): each cost ~0.75-1.2s fired
+                # sequentially, dominated by the ctrader-open-api SDK's own
+                # send-queue throttle (TcpProtocol._sendStrings, a 1s
+                # LoopingCall flushing up to 5 queued messages -- see
+                # client.py/tcpProtocol.py in the installed SDK), not real
+                # network/server latency (a plain balance query and a full M1
+                # history fetch cost almost the same). Firing them together
+                # via gatherResults lets the SDK flush most of them in the
+                # SAME 1s tick instead of one tick each -- ~6s of sequential
+                # reads measured live collapsing toward ~1-2s. `_timed` records
+                # each one's OWN elapsed time (not shared/reset like the
+                # `t`-based timings elsewhere in this method), since they now
+                # resolve concurrently, not in sequence.
+                def _timed(d, key):
+                    t0 = time.monotonic()
+
+                    def record(result):
+                        timings[key] = round((time.monotonic() - t0) * 1000, 1)
+                        return result
+                    d.addCallback(record)
+                    return d
+
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                # Closing deals over the last 24h: the only place a position
+                # that opened AND closed between two reconcile snapshots still
+                # exists, with its real fill price. decide() matches them to
+                # its own opened-today labels by position_id for the
+                # day-level risk budget (see bot/s007_paper.py::decide,
+                # 2026-09-02 incident) -- a fetch failure must not kill the
+                # trading cycle, so fall back to [] (decide then uses its own
+                # logged planned-entry risk). The errback is attached BEFORE
+                # this joins the gatherResults call below so a deal-list
+                # failure can never fail the other four reads (consumeErrors
+                # only protects against an UNCONSUMED failure spamming
+                # "Unhandled error in Deferred" -- it does not add
+                # per-deferred fallback values on its own).
+                d_deal_list = self._deal_list_step(now_ms - 24 * 3600 * 1000, now_ms)
+                d_deal_list.addErrback(lambda f: [])
+
                 # Fetched once per cycle (not per order) -- see _place_market_step's
                 # full_symbol param and bot/risk.py for how these two feed sizing.
-                full_symbol = yield self._get_full_symbol_step(symbol)
-                timings["full_symbol_ms"] = round((time.monotonic() - t) * 1000, 1)
-                t = time.monotonic()
-
-                balance = yield self._get_balance_step()
-                timings["balance_ms"] = round((time.monotonic() - t) * 1000, 1)
-                t = time.monotonic()
-                # Correct in THIS SYMBOL's own quote currency (EUR for
-                # GER40/DE40) -- NOT yet converted to the account's deposit
-                # currency. bot/s007_paper.py::decide() applies that
-                # conversion (C.EUR_TO_USD_FX_RATE_APPROX) before using this
-                # for any risk math; see decisions-log.md 2026-07-23.
-                money_per_point_per_lot = full_symbol.lotSize
-
+                #
                 # KNOWN GAP (documented, not fixed): unlike bot/s009_paper.py's
                 # drop_forming, nothing here excludes the most-recently-closed
                 # M1 bar even when the cycle queries it only seconds after it
@@ -602,30 +640,30 @@ class CTraderS007(CTraderAdapter):
                 # code changed for this -- touching find_setup's bar window
                 # is a signal-engine behavior change and needs backtest
                 # validation (Gate 0/1) first, not a quick live patch.
-                m1 = yield self._get_m1_step(symbol, history_days)
-                timings["m1_ms"] = round((time.monotonic() - t) * 1000, 1)
-                t = time.monotonic()
-
-                positions = yield self._reconcile_step()
-                timings["reconcile_ms"] = round((time.monotonic() - t) * 1000, 1)
-                t = time.monotonic()
-
-                # Closing deals over the last 24h (one cheap read in the same
-                # session): the only place a position that opened AND closed
-                # between two reconcile snapshots still exists, with its real
-                # fill price. decide() matches them to its own opened-today
-                # labels by position_id for the day-level risk budget (see
-                # bot/s007_paper.py::decide, 2026-09-02 incident) -- a fetch
-                # failure must not kill the trading cycle, so fall back to []
-                # (decide then uses its own logged planned-entry risk).
-                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                t_parallel = time.monotonic()
                 try:
-                    closed_deals = yield self._deal_list_step(
-                        now_ms - 24 * 3600 * 1000, now_ms)
-                except Exception:
-                    closed_deals = []
-                timings["deal_list_ms"] = round((time.monotonic() - t) * 1000, 1)
+                    full_symbol, balance, m1, positions, closed_deals = yield defer.gatherResults(
+                        [_timed(self._get_full_symbol_step(symbol), "full_symbol_ms"),
+                         _timed(self._get_balance_step(), "balance_ms"),
+                         _timed(self._get_m1_step(symbol, history_days), "m1_ms"),
+                         _timed(self._reconcile_step(), "reconcile_ms"),
+                         _timed(d_deal_list, "deal_list_ms")],
+                        consumeErrors=True)
+                except defer.FirstError as fe:
+                    # Unwrap: a bare FirstError hides which of the 4 required
+                    # reads actually failed and why (deal_list can't reach
+                    # here, its own errback above already turned failure into
+                    # a successful [] -- so a FirstError only ever means one
+                    # of full_symbol/balance/m1/reconcile genuinely failed).
+                    raise fe.subFailure.value from fe.subFailure.value
+                timings["parallel_read_ms"] = round((time.monotonic() - t_parallel) * 1000, 1)
                 t = time.monotonic()
+                # Correct in THIS SYMBOL's own quote currency (EUR for
+                # GER40/DE40) -- NOT yet converted to the account's deposit
+                # currency. bot/s007_paper.py::decide() applies that
+                # conversion (C.EUR_TO_USD_FX_RATE_APPROX) before using this
+                # for any risk math; see decisions-log.md 2026-07-23.
+                money_per_point_per_lot = full_symbol.lotSize
 
                 actions = decide(symbol, m1, positions, balance, money_per_point_per_lot,
                                  closed_deals=closed_deals)
