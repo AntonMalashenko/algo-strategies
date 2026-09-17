@@ -40,6 +40,10 @@ accounts.yml
 data/app.db
 data/app.db.bak-*
 data/state/
+# ALGODEV-45 step 1: scripts/s007_watchdog.py runtime artifacts -- the
+# sentinel alert file and its dedupe-state, not source.
+data/watchdog_alerts.log
+data/.s007_watchdog_state.json
 
 # Machine-local agent skill mirrors / staging artifacts (not shared)
 .agents/

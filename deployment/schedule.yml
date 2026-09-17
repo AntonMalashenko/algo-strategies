@@ -119,3 +119,14 @@ tasks:
   - name: deribit_snapshot
     command: python -m scripts.fetch_deribit_snapshot
     schedule: "0 19 * * *"
+  # ALGODEV-45 step 1: S007 stall watchdog (scripts/s007_watchdog.py). Reads
+  # AccountStrategy.last_cycle_at only -- never touches the broker, never
+  # kills/restarts anything (there is nothing persistent to manage yet;
+  # that's step 2/3 of that ticket). Every 2 minutes, same "* 10-16 * * 1-5"
+  # window as the S007 entry above -- no point checking for a stalled S007
+  # tick outside the hours a tick is even expected. Alerts land in
+  # data/watchdog_alerts.log (normally empty) and, for context, that day's
+  # events-<date>.jsonl.
+  - name: s007_watchdog
+    command: python -m scripts.s007_watchdog
+    schedule: "*/2 10-16 * * 1-5"
