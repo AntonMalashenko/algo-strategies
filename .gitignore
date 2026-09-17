@@ -44,6 +44,9 @@ data/state/
 # sentinel alert file and its dedupe-state, not source.
 data/watchdog_alerts.log
 data/.s007_watchdog_state.json
+# ALGODEV-45 step 2: the observation daemon's own PID file (manual run,
+# recorded so it can be found/stopped later in this session).
+data/.s007_daemon.pid
 
 # Machine-local agent skill mirrors / staging artifacts (not shared)
 .agents/
