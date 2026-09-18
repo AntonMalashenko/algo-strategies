@@ -1,7 +1,7 @@
 """scripts/s007_watchdog.py (ALGODEV-45 step 1) -- pure decision logic
-(expected_to_run/evaluate take plain, naive-UTC arguments, no I/O), tested
-directly per the same style as tests/scripts/test_s007_tick.py's
-in_session() tests.
+(expected_to_run/evaluate/is_settled_for_today take plain, naive-UTC
+arguments, no I/O), tested directly per the same style as
+tests/scripts/test_s007_tick.py's in_session() tests.
 
 All datetimes here are naive UTC, matching AccountStrategy.last_cycle_at
 (always written as datetime.now(timezone.utc) -- see webapp/runner.py) and
@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from scripts.s007_watchdog import (  # noqa: E402
-    STALE_THRESHOLD_MINUTES, evaluate, expected_to_run,
+    STALE_THRESHOLD_MINUTES, evaluate, expected_to_run, is_settled_for_today,
 )
 
 # Kyiv 10:00-16:59 on 2026-09-17 (EEST, UTC+3) == UTC 07:00-13:59.
@@ -49,50 +49,75 @@ class TestExpectedToRun:
         assert not expected_to_run(datetime(2026, 9, 20, 9, 0))  # Sunday
 
 
+class TestIsSettledForToday:
+    def test_none_status_not_settled(self):
+        assert not is_settled_for_today(None, UTC_SESSION_MID)
+
+    def test_other_status_not_settled(self):
+        assert not is_settled_for_today("idle", UTC_SESSION_MID)
+        assert not is_settled_for_today("error", UTC_SESSION_MID)
+
+    def test_settled_today_kyiv_date(self):
+        # UTC_SESSION_MID (2026-09-17 10:30 UTC) is 2026-09-17 13:30 Kyiv --
+        # same calendar date either way this time of day.
+        assert is_settled_for_today("settled:2026-09-17", UTC_SESSION_MID)
+
+    def test_settled_yesterday_is_not_settled_today(self):
+        assert not is_settled_for_today("settled:2026-09-16", UTC_SESSION_MID)
+
+    def test_settled_date_uses_kyiv_not_utc(self):
+        # 2026-09-17 22:30 UTC is already 2026-09-18 01:30 Kyiv (EEST, +3) --
+        # a status stamped for the Kyiv date "2026-09-18" must read as
+        # settled against this UTC instant, not "settled:2026-09-17".
+        late_utc = datetime(2026, 9, 17, 22, 30)
+        assert is_settled_for_today("settled:2026-09-18", late_utc)
+        assert not is_settled_for_today("settled:2026-09-17", late_utc)
+
+
 class TestEvaluate:
     def test_never_run_yet_no_alert(self):
         now = UTC_SESSION_MID
-        new_state, alert = evaluate(now, None, {})
+        new_state, alert = evaluate(now, None, None, {})
         assert alert is None
         assert new_state == {}
 
     def test_fresh_cycle_no_alert(self):
         now = UTC_SESSION_MID
         last = now - timedelta(minutes=1)
-        new_state, alert = evaluate(now, last, {})
+        new_state, alert = evaluate(now, last, None, {})
         assert alert is None
         assert new_state == {"alerted_for": None}
 
     def test_stale_past_threshold_alerts_once(self):
         now = UTC_SESSION_MID
         last = now - timedelta(minutes=STALE_THRESHOLD_MINUTES + 1)
-        state, alert = evaluate(now, last, {})
+        state, alert = evaluate(now, last, None, {})
         assert alert is not None
         assert "ALERT" in alert
         assert state == {"alerted_for": last.isoformat()}
 
         # same outage, checked again a minute later -- must NOT re-alert
         now2 = now + timedelta(minutes=1)
-        state2, alert2 = evaluate(now2, last, state)
+        state2, alert2 = evaluate(now2, last, None, state)
         assert alert2 is None
         assert state2 == state
 
     def test_stale_exactly_at_threshold_is_not_yet_an_alert(self):
         now = UTC_SESSION_MID
         last = now - timedelta(minutes=STALE_THRESHOLD_MINUTES)
-        _state, alert = evaluate(now, last, {})
+        _state, alert = evaluate(now, last, None, {})
         assert alert is None
 
     def test_recovery_after_alert(self):
         now = UTC_SESSION_MID
         stale_last = now - timedelta(minutes=STALE_THRESHOLD_MINUTES + 1)
-        state, _alert = evaluate(now, stale_last, {})
+        state, _alert = evaluate(now, stale_last, None, {})
         assert state["alerted_for"] == stale_last.isoformat()
 
         # a fresh cycle finally lands
         now2 = now + timedelta(minutes=1)
         fresh_last = now2 - timedelta(seconds=5)
-        state2, alert2 = evaluate(now2, fresh_last, state)
+        state2, alert2 = evaluate(now2, fresh_last, None, state)
         assert alert2 is not None
         assert "RECOVERED" in alert2
         assert state2 == {"alerted_for": None}
@@ -100,7 +125,7 @@ class TestEvaluate:
     def test_outside_window_never_alerted_stays_silent(self):
         now = datetime(2026, 9, 19, 9, 0)  # Saturday
         stale_last = now - timedelta(hours=40)
-        state, alert = evaluate(now, stale_last, {})
+        state, alert = evaluate(now, stale_last, None, {})
         assert alert is None
         assert state == {}
 
@@ -108,18 +133,46 @@ class TestEvaluate:
         # e.g. the trading window closed for the day while S007 was stalled
         now = UTC_SESSION_MID
         stale_last = now - timedelta(minutes=STALE_THRESHOLD_MINUTES + 1)
-        state, _alert = evaluate(now, stale_last, {})
+        state, _alert = evaluate(now, stale_last, None, {})
 
         after_hours = UTC_SESSION_END + timedelta(hours=1)
-        state2, alert2 = evaluate(after_hours, stale_last, state)
+        state2, alert2 = evaluate(after_hours, stale_last, None, state)
         assert alert2 is not None
         assert "RECOVERED" in alert2 or "session window ended" in alert2
         assert state2 == {"alerted_for": None}
 
         # further checks after hours stay silent (already reported)
-        state3, alert3 = evaluate(after_hours + timedelta(minutes=5), stale_last, state2)
+        state3, alert3 = evaluate(after_hours + timedelta(minutes=5), stale_last, None, state2)
         assert alert3 is None
         assert state3 == state2
+
+    def test_settled_for_today_never_alerts_even_when_frozen_for_hours(self):
+        """The actual live incident, 2026-09-18: S007 hit day_done at 11:16
+        Kyiv (08:16 UTC) and correctly went quiet for the rest of the day
+        (webapp/runner.py's own settled short-circuit) -- last_cycle_at
+        froze there while every later cycle correctly opened no broker
+        session and updated nothing. Before this fix the watchdog read that
+        as a stall and alerted at 08:20 UTC; it must not."""
+        last_cycle_at = datetime(2026, 9, 18, 8, 16, 9)
+        status = "settled:2026-09-18"
+        state: dict = {}
+        t = last_cycle_at
+        end_of_window = datetime(2026, 9, 18, 13, 59)
+        while t <= end_of_window:
+            state, alert = evaluate(t, last_cycle_at, status, state)
+            assert alert is None, f"unexpected alert at {t}: {alert}"
+            t += timedelta(minutes=2)
+
+    def test_settled_yesterday_does_not_suppress_todays_real_stall(self):
+        """A stale settled:<yesterday> marker (the account simply hasn't run
+        a fresh cycle yet today) must NOT be mistaken for "settled today" --
+        that would silently blind the watchdog on exactly the days it's
+        most needed (the very first stall of a new trading day)."""
+        now = UTC_SESSION_MID  # 2026-09-17
+        stale_last = now - timedelta(minutes=STALE_THRESHOLD_MINUTES + 1)
+        state, alert = evaluate(now, stale_last, "settled:2026-09-16", {})
+        assert alert is not None
+        assert "ALERT" in alert
 
     def test_real_2026_09_16_outage_replay(self):
         """Replays the actual live outage from this project's own history
@@ -137,7 +190,7 @@ class TestEvaluate:
         t = last_good_utc
         alerts = []
         while t <= end_of_window_utc:
-            state, alert = evaluate(t, last_good_utc, state)
+            state, alert = evaluate(t, last_good_utc, None, state)
             if alert:
                 alerts.append((t, alert))
             t += timedelta(minutes=1)
