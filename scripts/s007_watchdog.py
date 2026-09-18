@@ -73,14 +73,43 @@ def expected_to_run(now_utc: datetime) -> bool:
     return local.weekday() in SESSION_WEEKDAYS and SESSION_START_HOUR <= local.hour <= SESSION_END_HOUR
 
 
-def evaluate(now_utc: datetime, last_cycle_at: datetime | None, prior_state: dict) -> tuple[dict, str | None]:
+def is_settled_for_today(status: str | None, now_utc: datetime) -> bool:
+    """True when webapp/runner.py's own per-day short-circuit (_worker_s007:
+    'settled = day_done or filtered or manual_stop', then
+    link.status = f"settled:{today_local}") has already fired -- S007
+    legitimately stopped trading for the rest of today (target reached, the
+    day's setup got filtered out, or a manual stop) and every subsequent
+    tick this whole session is an intentional, correct no-op that opens no
+    broker session and updates nothing, INCLUDING last_cycle_at.
+
+    Found live 2026-09-18 (Anton: "а сегодня он пытался торговать - я
+    перезапускал контейнеры" -- turned out unrelated to any container
+    restart): S007 hit day_done at 11:16 Kyiv, correctly went quiet for the
+    day, and this watchdog -- which only knew about last_cycle_at staleness,
+    not about the settled short-circuit -- raised a false "S007 stalled"
+    alert 4 minutes later. A frozen last_cycle_at during a legitimately
+    settled day is expected, not a stall; only a frozen last_cycle_at while
+    NOT settled is worth a human's attention.
+
+    `today_local` uses the SAME Europe/Kyiv wall-clock date webapp/runner.py
+    itself stamps the marker with (host-local, not UTC) -- see
+    expected_to_run's docstring for why now_utc needs converting first."""
+    if not status:
+        return False
+    today_local = now_utc.replace(tzinfo=timezone.utc).astimezone(KYIV).date().isoformat()
+    return status.startswith(f"settled:{today_local}")
+
+
+def evaluate(now_utc: datetime, last_cycle_at: datetime | None, status: str | None,
+            prior_state: dict) -> tuple[dict, str | None]:
     """Pure decision logic -- no I/O, no broker, unit-testable and safely
     replayable against real historical last_cycle_at gaps. Returns
     (new_state, alert_line_or_None): alert_line is a ready-to-write,
     human-readable line, or None if nothing should be written this run.
 
     `now_utc` and `last_cycle_at` are both naive UTC -- see
-    expected_to_run's docstring for why this matters.
+    expected_to_run's docstring for why this matters. `status` is
+    AccountStrategy.status as-is (see is_settled_for_today).
 
     prior_state: {"alerted_for": "<last_cycle_at.isoformat()>" or None} --
     the last_cycle_at value already alerted about, so a multi-hour outage
@@ -89,10 +118,11 @@ def evaluate(now_utc: datetime, last_cycle_at: datetime | None, prior_state: dic
     once a fresh last_cycle_at appears (or the window closes mid-alert).
     """
     now = now_utc
-    if last_cycle_at is None or not expected_to_run(now):
+    if (last_cycle_at is None or not expected_to_run(now)
+            or is_settled_for_today(status, now)):
         if prior_state.get("alerted_for"):
-            line = (f"{now.isoformat()}Z RECOVERED (or session window ended) -- "
-                    f"S007 last_cycle_at={last_cycle_at}Z")
+            line = (f"{now.isoformat()}Z RECOVERED (session window ended, or S007 "
+                    f"settled for today) -- S007 last_cycle_at={last_cycle_at}Z status={status!r}")
             return {"alerted_for": None}, line
         return prior_state, None
 
@@ -151,7 +181,7 @@ def main() -> None:
         for link in links:
             key = str(link.id)
             prior = state.get(key, {})
-            new_state, alert_line = evaluate(now, link.last_cycle_at, prior)
+            new_state, alert_line = evaluate(now, link.last_cycle_at, link.status, prior)
             if new_state != prior:
                 state[key] = new_state
                 changed = True
