@@ -45,8 +45,12 @@ data/state/
 data/watchdog_alerts.log
 data/.s007_watchdog_state.json
 # ALGODEV-45 step 2: the observation daemon's own PID file (manual run,
-# recorded so it can be found/stopped later in this session).
+# recorded so it can be found/stopped later in this session), plus the
+# caffeinate wrapper's PID (2026-09-21: prevents host idle-sleep for the
+# daemon's lifetime -- see reports/logs/S007-daemon-shadow, testing whether
+# that's what killed the 2026-09-17 overnight run's connection).
 data/.s007_daemon.pid
+data/.s007_daemon_caffeinate.pid
 
 # Machine-local agent skill mirrors / staging artifacts (not shared)
 .agents/
