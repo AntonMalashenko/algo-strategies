@@ -837,8 +837,22 @@ class CTraderS007(CTraderAdapter):
         re-validating the trading logic itself, which is already exercised
         live via the untouched run_live_cycle path above. Returns a small
         summary dict for the daemon to log each tick.
+
+        timings (added 2026-09-21, Anton: "есть логи сколько времени
+        занимают запросы"): {step_name: duration_ms}, same shape/fields as
+        run_live_cycle's (load_symbols_ms/full_symbol_ms/balance_ms/m1_ms/
+        reconcile_ms/deal_list_ms/parallel_read_ms) MINUS connect_ms/
+        app_auth_ms/account_auth_ms -- this call never pays those, that's
+        the entire point of a persistent session (paid once at daemon
+        startup, not per tick). Comparing these numbers against the
+        cold-connect-per-cycle baseline (ALGODEV-44 Phase 0/1, ~0.75-1.2s
+        per read) is exactly the data point this step exists to produce.
         """
+        timings: dict = {}
+        t = time.monotonic()
         yield self._load_symbols()
+        timings["load_symbols_ms"] = round((time.monotonic() - t) * 1000, 1)
+
         up = {n.upper() for n in self._symbols.keys()}
         symbol = next((c for c in symbol_candidates if c.upper() in up), None)
         if symbol is None:
@@ -846,20 +860,33 @@ class CTraderS007(CTraderAdapter):
                 f"none of {symbol_candidates} found; broker symbols "
                 f"e.g. {sorted(self._symbols.keys())[:15]}")
 
+        def _timed(d, key):
+            t0 = time.monotonic()
+
+            def record(result):
+                timings[key] = round((time.monotonic() - t0) * 1000, 1)
+                return result
+            d.addCallback(record)
+            return d
+
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         d_deal_list = self._deal_list_step(now_ms - 24 * 3600 * 1000, now_ms)
         d_deal_list.addErrback(lambda f: [])
 
+        t_parallel = time.monotonic()
         try:
             full_symbol, balance, m1, positions, closed_deals = yield defer.gatherResults(
-                [self._get_full_symbol_step(symbol), self._get_balance_step(),
-                 self._get_m1_step(symbol, history_days), self._reconcile_step(),
-                 d_deal_list],
+                [_timed(self._get_full_symbol_step(symbol), "full_symbol_ms"),
+                 _timed(self._get_balance_step(), "balance_ms"),
+                 _timed(self._get_m1_step(symbol, history_days), "m1_ms"),
+                 _timed(self._reconcile_step(), "reconcile_ms"),
+                 _timed(d_deal_list, "deal_list_ms")],
                 consumeErrors=True)
         except defer.FirstError as fe:
             raise fe.subFailure.value from fe.subFailure.value
+        timings["parallel_read_ms"] = round((time.monotonic() - t_parallel) * 1000, 1)
 
         return dict(symbol=symbol, balance=balance,
                     n_bars=len(m1), last_bar=str(m1.index[-1]) if len(m1) else None,
                     n_positions=len(positions), n_closed_deals=len(closed_deals),
-                    lot_size=full_symbol.lotSize)
+                    lot_size=full_symbol.lotSize, timings=timings)
