@@ -111,7 +111,22 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
     An add is validated only if the broken swing is >= swing_buffer (meaningful
     CHoCH, not a micro-swing) and t <= add_cut_idx (add-time window).
     max_pos_override caps this leg's total position count (used to apply
-    cfg.max_recovery_positions to the recovery leg only)."""
+    cfg.max_recovery_positions to the recovery leg only).
+
+    Each position also carries `exit_idx` (ALGODEV-44 execution-realism
+    follow-up, added 2026-09-16): the bar index its status stopped being
+    "open", alongside `idx` (its own entry bar index) already stored above --
+    together these let a caller measure how many bars a position was
+    genuinely open for. A position whose exit_idx is at or one bar after its
+    own idx resolved within the SAME minute the live bot could first ever see
+    it (bot/s007_paper.py::decide places a newly "eod" position the same
+    cycle it's first detected, and that cycle's own `last_bar` is always at
+    least one full bar behind real time -- see run_live_cycle's KNOWN GAP
+    comment in bot/ctrader_s007.py) -- i.e. it is a THEORETICAL win/loss the
+    backtest can see with hindsight but a 1-minute-polling live bot could
+    never actually have caught, no matter how fast its own code runs. Purely
+    additive/diagnostic: exit_idx feeds no R/cost calculation, so this cannot
+    change any existing backtest number."""
     n = len(closes)
     stop0 = pick_stop(cfg.stop_mode, start_idx, e_price, up, L, range_stop)
     if buffer > 0 and abs(e_price - stop0) < buffer:
@@ -161,14 +176,14 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
                 continue
             if up:
                 if lo <= p["stop"]:
-                    p["status"] = "stop"; p["exit"] = p["stop"]
+                    p["status"] = "stop"; p["exit"] = p["stop"]; p["exit_idx"] = t
                 elif hi >= tp:
-                    p["status"] = "tp"; p["exit"] = tp
+                    p["status"] = "tp"; p["exit"] = tp; p["exit_idx"] = t
             else:
                 if hi >= p["stop"]:
-                    p["status"] = "stop"; p["exit"] = p["stop"]
+                    p["status"] = "stop"; p["exit"] = p["stop"]; p["exit_idx"] = t
                 elif lo <= tp:
-                    p["status"] = "tp"; p["exit"] = tp
+                    p["status"] = "tp"; p["exit"] = tp; p["exit_idx"] = t
             # breakeven (off by default, cfg.breakeven_at_r is None): move this
             # position's own stop to its own entry once price has moved
             # breakeven_at_r * risk0 in its favor. Checked AFTER the stop/tp
@@ -197,14 +212,14 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
         if (up and hi >= tp) or ((not up) and lo <= tp):
             for p in positions:
                 if p["status"] == "open":
-                    p["status"] = "tp"; p["exit"] = tp
+                    p["status"] = "tp"; p["exit"] = tp; p["exit_idx"] = t
             reached = True
             break
         # aggregate daily-loss cap: close everything if day P&L (MtM) <= -cap
         if cfg.daily_loss_cap_R is not None and _agg_R(c) <= -cfg.daily_loss_cap_R:
             for p in positions:
                 if p["status"] == "open":
-                    p["status"] = "daycap"; p["exit"] = c
+                    p["status"] = "daycap"; p["exit"] = c; p["exit_idx"] = t
             break
         budget_ok = True
         if cfg.daily_loss_cap_R is not None:
@@ -239,7 +254,7 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
     last_close = closes[-1]
     for p in positions:
         if p["status"] == "open":
-            p["status"] = "eod"; p["exit"] = last_close
+            p["status"] = "eod"; p["exit"] = last_close; p["exit_idx"] = n - 1
     return positions, reached
 
 
@@ -296,15 +311,33 @@ def simulate_day(bars: pd.DataFrame, rh, rl, mid, height, lv, cfg: StrategyConfi
     n_recovery = 0
     if cfg.b_reversal_to_A and scenario == "B" and not reached:
         rev_idx = None
-        for t in range(e_idx + 1, n):
-            if (up and lows[t] <= mid) or ((not up) and highs[t] >= mid):
-                rev_idx = t
-                break
+        rev_entry = None
+        if cfg.reversal_confirm_close:
+            # close-based, two-bar confirmation (same style as setups.py::
+            # find_setup's primary A/B detection): a close beyond mid, then
+            # the NEXT close still beyond it -- see reversal_confirm_close's
+            # docstring in config.py for why (2026-09-16 wick-only incident).
+            for t in range(e_idx + 1, n - 1):
+                beyond = (closes[t] < mid) if up else (closes[t] > mid)
+                if not beyond:
+                    continue
+                c2 = closes[t + 1]
+                confirmed = (c2 < mid) if up else (c2 > mid)
+                if confirmed:
+                    rev_idx = t + 1
+                    rev_entry = c2
+                    break
+        else:
+            for t in range(e_idx + 1, n):
+                if (up and lows[t] <= mid) or ((not up) and highs[t] >= mid):
+                    rev_idx = t
+                    rev_entry = mid
+                    break
         if rev_idx is not None and rev_idx < n - 1:
             up_A = not up
             tp_A = rh if up_A else rl                     # opposite boundary
             range_stop_A = rl if up_A else rh             # origin boundary (A-style)
-            leg2, _ = _simulate_leg(highs, lows, closes, L, rev_idx, mid, up_A,
+            leg2, _ = _simulate_leg(highs, lows, closes, L, rev_idx, rev_entry, up_A,
                                     tp_A, range_stop_A, cfg, buffer,
                                     swing_buffer=swing_buffer, add_cut_idx=add_cut_idx,
                                     max_pos_override=cfg.max_recovery_positions)
