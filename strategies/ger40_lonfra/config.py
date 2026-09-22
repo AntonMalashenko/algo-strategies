@@ -198,14 +198,33 @@ class StrategyConfig:
     # tp_mode="liquidity" only: cap the liquidity candidate at
     # range_tp + this many points (None = uncapped, the ALGODEV-21 behavior).
     # The floor above only prevents a target NEARER than range_tp; nothing
-    # previously prevented one much FARTHER -- found live 2026-09-02 (Anton):
-    # a real cycle picked liquidity 285.9pt beyond range_tp (TP 26235.1 vs
-    # range_tp 25949.2), a move unlikely to complete inside one session.
-    # UNTESTED as of this writing -- ALGODEV-35 experiment, see
-    # backtest/run_s007_liqceiling.py for the points-swept comparison
-    # (10/20/30/40/50/100) against WORKING_S007_LIQFLOOR (uncapped). Only
+    # prevents one much FARTHER -- found live 2026-09-02 (Anton): a real
+    # cycle picked liquidity 285.9pt beyond range_tp (TP 26235.1 vs range_tp
+    # 25949.2), a move unlikely to complete inside one session. Only
     # meaningful when liquidity_tp_floor=True (an uncapped-and-unfloored
     # combination reintroduces the near-zero-R problem the floor fixed).
+    #
+    # TESTED 2026-09-22 (backtest/run_s007_liqceiling.py, Dukascopy
+    # 2023-2026, real spread 0.635/side, WORKING_S007_LIQFLOOR base) and
+    # REJECTED as a fix for the "TP looks disconnected from any real level"
+    # complaint it was meant to address (a live cycle that same day picked
+    # prev_day_low as TP, 95.8pt beyond range_tp, from nothing more than the
+    # single lowest M1 wick of the prior session -- not a confirmed
+    # structural level). A tight-enough cap to have actually constrained
+    # that case (10-40pt) costs real expectancy: net +0.80R/day (uncapped)
+    # -> +0.68-0.78R/day, worse maxDD at every point in that range (up to
+    # -65.6R vs -50.9R at 30pt). Only very loose caps (50-100pt) roughly
+    # match uncapped (+0.83-0.84R/day) -- but those wouldn't have capped
+    # today's 95.8pt case either, so they don't address the complaint.
+    # Rare far-reaching targets apparently pay for themselves across the
+    # full history (the R from the days they DO get hit outweighs the cost
+    # of the days they don't -- an unreached target isn't a loss, the
+    # position just resolves 'eod' at exit_end same as any other). Kept as
+    # a documented off-by-default option; if the underlying complaint is
+    # revisited, the more promising direction is tightening what counts as
+    # a "liquidity" CANDIDATE in the first place (require a confirmed
+    # structural swing, not the bare min/max of an arbitrary session
+    # window) rather than capping distance after the fact.
     liquidity_tp_ceiling_points: float | None = None
 
     # --- session windows (Kyiv) ---
@@ -242,6 +261,46 @@ class StrategyConfig:
     # the day into a scenario-A trade from the midline toward the opposite boundary
     # (wide common stop + pyramiding). Recovers losing-B days. Off = base untouched.
     b_reversal_to_A: bool = False
+
+    # Confirmation style for the b_reversal_to_A trigger above. False (default,
+    # base untouched) arms the reversal on a bare intrabar low/high TOUCH of mid
+    # (engine.py's original rule) and fills the simulated entry AT mid exactly,
+    # regardless of where that bar closed. True requires the SAME close-based,
+    # two-bar confirmation setups.py::find_setup already uses for the day's
+    # primary A/B detection (a close beyond mid, then the NEXT close still
+    # beyond it) before arming the reversal, and fills at that confirming
+    # bar's close instead of an assumed mid fill.
+    # MOTIVATION (found live 2026-09-16, ALGODEV-42 follow-up): the touch-only
+    # rule armed a same-day recovery leg off a GER40 M1 bar whose low touched
+    # mid to the tenth of a point (25478.9) and closed back at 25486.4 -- 7.5pt
+    # above, near its own high -- the same minute. No real follow-through, yet
+    # the engine (and, since bot/s007_signals.py::plan_now replays this exact
+    # function live, the live bot too) treated it as an armed reversal. The
+    # +91.5R/187-leg/70%-win recovery-leg verdict already documented on
+    # max_recovery_positions above was measured with the touch-only rule, so it
+    # already includes whatever share of these wick-only arms lost -- this flag
+    # tests whether requiring an actual close-based confirmation, as the
+    # primary setup already does, changes that verdict for better or worse.
+    #
+    # TESTED 2026-09-16 (backtest/run_s007_reversal_confirm.py, Dukascopy
+    # 2023-2026, real spread 0.635/side) and REJECTED on the expectancy axis
+    # across every base that enables b_reversal_to_A:
+    #   REVERSAL_S007:                    net +0.5614 -> +0.5384R/day (-4.1%)
+    #   WORKING_S007:                     net +0.5871 -> +0.5636R/day (-4.0%)
+    #   WORKING_S007_NEWSSAFE_MAX8_BE05:  net +1.6513 -> +1.6042R/day (-2.9%)
+    # Confirmation DOES do what it's supposed to: it raises the recovery leg's
+    # own win rate substantially (53-67% -> 60-73%) and cuts the live preset's
+    # maxDD slightly (-19.2 -> -18.9R) with a marginally better worst year
+    # (+173.9 -> +175.7) -- it correctly filters out wick-only noise. But it
+    # ALSO filters out enough genuinely profitable fast V-reversals (ones that
+    # never produce two confirming closes before running to target) that the
+    # net R given up exceeds what the filtered noise cost: on the live preset,
+    # recovery-leg trade count drops 695->564 (-19%) and its total R drops
+    # +121.4->+89.4R (-26%), more than the higher win rate recovers. Kept as a
+    # documented off-by-default option -- not a fix, since the 2026-09-16
+    # incident's own loss was small (-$16.57) and this trades away more upside
+    # than it removes downside on the numbers actually measured.
+    reversal_confirm_close: bool = False
 
     # cap on TOTAL positions in the recovery leg only (first entry + adds); None =
     # base behavior (recovery leg uses max_positions like the primary leg).
