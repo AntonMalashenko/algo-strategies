@@ -185,7 +185,116 @@ def test_ofelia_not_running_after_first_compose_triggers_retry(tmp_path, monkeyp
     hc.check_and_heal()
 
     compose_calls = [c for c in calls if c[1:3] == ["compose", "up"]]
-    assert len(compose_calls) == 2   # main pass + retry
+    # main pass brings up every HEAL_SERVICES entry (ofelia/redis/s007-daemon
+    # as of 2026-09-23, see that constant's own comment) + one retry for
+    # ofelia specifically (the only service this test's fake ps sequence
+    # reports as still down after the main pass).
+    assert len(compose_calls) == len(hc.HEAL_SERVICES) + 1
 
     events = (tmp_path / "HealthcheckTest" / f"events-{time.strftime('%Y-%m-%d')}.jsonl").read_text()
     assert '"kind": "healed"' in events
+
+
+# --- _check_daily_strategy_freshness (found live 2026-09-22: enabling S021
+# fired a false "no cycle in over 36h" alert every 5 minutes from the moment
+# it was enabled -- see the function's own docstring) ------------------------
+
+def _as_db_naive_utc(local_wall_clock):
+    """Local wall-clock -> the naive-UTC shape AccountStrategy actually stores.
+
+    Both timestamps this suite fakes are written as `datetime.utcnow()`
+    (webapp/models.py) and round-trip back tz-naive, which is why
+    podman_healthcheck._to_local_naive adds the host's UTC offset before
+    comparing them against a local naive `now`. Fixtures must therefore be
+    expressed in the DB's shape: passing a local wall-clock value straight
+    through makes that offset silently eat part of the age under test (a
+    "37h old" row reads as 34h in Kyiv) AND makes the outcome depend on the
+    machine's timezone -- the same fixture passes west of UTC and fails east
+    of it.
+    """
+    import datetime
+    return local_wall_clock - datetime.datetime.now().astimezone().utcoffset()
+
+
+def _fake_link(strategy_name, link_id=5, last_cycle_at=None, created_at=None,
+                account_label="ctrader-47939312"):
+    """Callers pass LOCAL wall-clock datetimes; the conversion to the stored
+    naive-UTC shape happens here, once, so no individual test can forget it."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id=link_id,
+        strategy=SimpleNamespace(name=strategy_name),
+        account=SimpleNamespace(label=account_label, id=1),
+        last_cycle_at=_as_db_naive_utc(last_cycle_at) if last_cycle_at else None,
+        created_at=_as_db_naive_utc(created_at) if created_at else None,
+    )
+
+
+def test_freshly_created_link_with_no_cycle_yet_is_not_stale(tmp_path, monkeypatch):
+    import datetime
+    log = _log(tmp_path)
+    monkeypatch.setattr(hc, "LOG", log)
+    now = datetime.datetime(2026, 9, 22, 12, 0)
+    link = _fake_link("S021", last_cycle_at=None, created_at=now - datetime.timedelta(hours=1))
+
+    hc._check_daily_strategy_freshness(now, [link])
+
+    events_file = tmp_path / "HealthcheckTest" / f"events-{time.strftime('%Y-%m-%d')}.jsonl"
+    assert not events_file.exists() or '"kind": "error"' not in events_file.read_text()
+
+
+def test_link_never_run_past_grace_period_is_stale(tmp_path, monkeypatch):
+    import datetime
+    log = _log(tmp_path)
+    monkeypatch.setattr(hc, "LOG", log)
+    now = datetime.datetime(2026, 9, 22, 12, 0)
+    link = _fake_link("S021", last_cycle_at=None,
+                       created_at=now - datetime.timedelta(hours=hc.DAILY_STRATEGY_STALE_HOURS + 1))
+
+    hc._check_daily_strategy_freshness(now, [link])
+
+    events = (tmp_path / "HealthcheckTest" / f"events-{time.strftime('%Y-%m-%d')}.jsonl").read_text()
+    assert '"kind": "error"' in events
+    assert "S021 stale beyond self-heal margin" in events
+
+
+def test_link_with_recent_cycle_is_not_stale_regardless_of_created_at(tmp_path, monkeypatch):
+    import datetime
+    log = _log(tmp_path)
+    monkeypatch.setattr(hc, "LOG", log)
+    now = datetime.datetime(2026, 9, 22, 12, 0)
+    link = _fake_link("S021", last_cycle_at=now - datetime.timedelta(minutes=10),
+                       created_at=now - datetime.timedelta(days=90))
+
+    hc._check_daily_strategy_freshness(now, [link])
+
+    events_file = tmp_path / "HealthcheckTest" / f"events-{time.strftime('%Y-%m-%d')}.jsonl"
+    assert not events_file.exists() or '"kind": "error"' not in events_file.read_text()
+
+
+def test_link_with_old_cycle_is_stale_existing_behavior_preserved(tmp_path, monkeypatch):
+    import datetime
+    log = _log(tmp_path)
+    monkeypatch.setattr(hc, "LOG", log)
+    now = datetime.datetime(2026, 9, 22, 12, 0)
+    link = _fake_link("S009", last_cycle_at=now - datetime.timedelta(hours=hc.DAILY_STRATEGY_STALE_HOURS + 1),
+                       created_at=now - datetime.timedelta(days=90))
+
+    hc._check_daily_strategy_freshness(now, [link])
+
+    events = (tmp_path / "HealthcheckTest" / f"events-{time.strftime('%Y-%m-%d')}.jsonl").read_text()
+    assert '"kind": "error"' in events
+    assert "S009 stale beyond self-heal margin" in events
+
+
+def test_s007_link_is_skipped_by_daily_check_even_when_never_run(tmp_path, monkeypatch):
+    import datetime
+    log = _log(tmp_path)
+    monkeypatch.setattr(hc, "LOG", log)
+    now = datetime.datetime(2026, 9, 22, 12, 0)
+    link = _fake_link("S007", last_cycle_at=None, created_at=now - datetime.timedelta(days=90))
+
+    hc._check_daily_strategy_freshness(now, [link])
+
+    events_file = tmp_path / "HealthcheckTest" / f"events-{time.strftime('%Y-%m-%d')}.jsonl"
+    assert not events_file.exists() or '"kind": "error"' not in events_file.read_text()

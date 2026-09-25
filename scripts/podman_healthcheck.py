@@ -106,45 +106,72 @@ def _compose_env() -> dict:
     return env
 
 
-def _ofelia_running() -> bool:
+# Standing compose services that must survive a `machine stop`+`start` heal
+# cycle -- unlike the per-tick ofelia job-run containers (which the NEXT
+# scheduled minute recreates on its own once ofelia itself is back), these
+# are long-lived services nothing else ever re-launches: `machine stop` kills
+# every container in the VM, and `machine start` does not auto-resume any of
+# them, ofelia included -- only an explicit `compose up -d` brings each back.
+# Found live 2026-09-23: adding the `s007-daemon` service (ALGODEV-45 step 2,
+# containerized that day) without adding it here left it dead (`Exited (137)`,
+# SIGKILL from the machine stop) for 8+ minutes after a heal that correctly
+# restored ofelia/real trading -- `redis` has the exact same exposure (an
+# "optional accelerator" today per docs/DEV_PLANS.md, so its absence did not
+# block trading, but nothing brought it back either). `ofelia` stays FIRST in
+# this list -- it gates real trading, so its own dedicated retry block below
+# still runs regardless of whether the others below succeed.
+HEAL_SERVICES = ("ofelia", "redis", "s007-daemon")
+
+
+def _service_running(name: str) -> bool:
     try:
         proc = subprocess.run(
-            [PODMAN, "ps", "--filter", "name=algo-ofelia", "--format", "{{.Names}}"],
+            [PODMAN, "ps", "--filter", f"name=algo-{name}", "--format", "{{.Names}}"],
             capture_output=True, text=True, timeout=SSH_TIMEOUT_SECONDS)
         return bool(proc.stdout.strip())
     except Exception:
         return False
 
 
+def _ofelia_running() -> bool:
+    return _service_running("ofelia")
+
+
 def _heal(reason: str) -> None:
-    """stop+start the machine, bring ofelia back up, verify. Shared by both
-    failure modes below -- `machine start` on an already-stopped machine is a
-    harmless no-op-ish path (same command either way), so one heal routine
-    covers "clock drifted" and "machine unreachable/stopped" alike.
+    """stop+start the machine, bring the standing services (HEAL_SERVICES)
+    back up, verify. Shared by both failure modes below -- `machine start` on
+    an already-stopped machine is a harmless no-op-ish path (same command
+    either way), so one heal routine covers "clock drifted" and "machine
+    unreachable/stopped" alike.
 
     Each step is independently best-effort: a stuck/failing `machine stop`
     (e.g. it was already stopped and the command itself hangs briefly) must
-    not prevent trying `machine start` right after, and none of these three
-    may ever propagate -- this function's whole job is to be the safe
-    fallback path, so it has to survive the exact subprocess failures
+    not prevent trying `machine start` right after, and none of these may
+    ever propagate -- this function's whole job is to be the safe fallback
+    path, so it has to survive the exact subprocess failures
     (TimeoutExpired, FileNotFoundError, ...) that _vm_epoch() already
     tolerates."""
     LOG.error(reason, exc=RuntimeError(reason))
 
-    for args, timeout, env in (
+    steps = [
         ([PODMAN, "machine", "stop", MACHINE_NAME], MACHINE_STOP_TIMEOUT_SECONDS, None),
         ([PODMAN, "machine", "start", MACHINE_NAME], MACHINE_START_TIMEOUT_SECONDS, None),
-        ([PODMAN, "compose", "up", "-d", "ofelia"], COMPOSE_TIMEOUT_SECONDS, _compose_env()),
-    ):
+    ]
+    for service in HEAL_SERVICES:
+        steps.append(([PODMAN, "compose", "up", "-d", service], COMPOSE_TIMEOUT_SECONDS,
+                      _compose_env()))
+    for args, timeout, env in steps:
         try:
             subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout,
                            env=env)
         except Exception as exc:
             LOG.error(f"heal step {args!r} failed", exc=exc)
 
-    # Retry the compose step alone once with a freshly-resolved socket path --
-    # covers the case where `machine start` itself only settled (bound its
-    # real socket) after the first compose attempt had already raced past it.
+    # Retry ofelia alone once with a freshly-resolved socket path -- covers
+    # the case where `machine start` itself only settled (bound its real
+    # socket) after the first compose attempt had already raced past it.
+    # Only ofelia gets this extra retry: it gates real trading, the others
+    # (redis/s007-daemon) are best-effort and don't warrant the same urgency.
     ofelia_ok = _ofelia_running()
     if not ofelia_ok:
         try:
@@ -155,15 +182,17 @@ def _heal(reason: str) -> None:
             LOG.error("ofelia retry-start failed", exc=exc)
         ofelia_ok = _ofelia_running()
 
+    other_services_ok = {s: _service_running(s) for s in HEAL_SERVICES if s != "ofelia"}
+
     new_vm_epoch = _vm_epoch()
     clock_ok = (new_vm_epoch is not None
                and abs(int(time.time()) - new_vm_epoch) <= DRIFT_THRESHOLD_SECONDS)
-    if clock_ok and ofelia_ok:
+    if clock_ok and ofelia_ok and all(other_services_ok.values()):
         LOG.event("healed")
     else:
         LOG.error("podman machine restart did not fully fix it -- needs manual attention",
                   exc=RuntimeError(f"clock_ok={clock_ok} (new_vm_epoch={new_vm_epoch}) "
-                                   f"ofelia_ok={ofelia_ok}"))
+                                   f"ofelia_ok={ofelia_ok} other_services_ok={other_services_ok}"))
 
 
 DERIBIT_STATE_PATH = ROOT / "data" / "state" / "deribit_snapshot.json"
@@ -236,12 +265,26 @@ def _to_local_naive(ts: datetime.datetime | None) -> datetime.datetime | None:
 def _check_daily_strategy_freshness(now: datetime.datetime, links) -> None:
     """Loose staleness check for once-a-day strategies (everything except
     S007) -- see DAILY_STRATEGY_STALE_HOURS' comment for why the threshold
-    is this generous."""
+    is this generous.
+
+    Found live 2026-09-22: enabling S021 fired this every 5 minutes from the
+    moment it was enabled, hours before its own session window (17:00-23:59
+    Kyiv, see deployment/schedule.yml) had even opened once -- `last is
+    None` was treated as "already over the 36h margin" unconditionally,
+    which is right for a link that HAS run before and then went quiet, but
+    wrong for one that has simply never had its first chance yet. The fix:
+    when there's no last_cycle_at, the clock for the 36h margin starts at
+    `created_at` (when the link was registered/enabled) instead of firing
+    immediately -- same effect as if a "cycle" had implicitly happened at
+    creation time. A link stuck at last_cycle_at=None for the full 36h
+    still alerts, exactly as before; only the first ~36h grace period for a
+    brand-new link is new."""
     for link in links:
         if link.strategy.name == "S007":
             continue
         last = _to_local_naive(link.last_cycle_at)
-        if last is None or (now - last) > datetime.timedelta(hours=DAILY_STRATEGY_STALE_HOURS):
+        reference = last if last is not None else _to_local_naive(link.created_at)
+        if reference is None or (now - reference) > datetime.timedelta(hours=DAILY_STRATEGY_STALE_HOURS):
             LOG.error(
                 f"{link.strategy.name} account_strategy {link.id} "
                 f"({link.account.label or link.account.id}): no cycle in over "
