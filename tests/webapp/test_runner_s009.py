@@ -188,10 +188,11 @@ def test_worker_s009_rejects_non_bybit_account(session, s009_link):
 # --- dispatch table --------------------------------------------------------
 
 def test_strategy_workers_registers_both_strategies():
-    assert set(runner.STRATEGY_WORKERS) == {"S007", "S009", "S011"}
+    assert set(runner.STRATEGY_WORKERS) == {"S007", "S009", "S011", "S021"}
     assert runner.STRATEGY_WORKERS["S009"] is runner._worker_s009
     assert runner.STRATEGY_WORKERS["S007"] is runner._worker_s007
     assert runner.STRATEGY_WORKERS["S011"] is runner._worker_s011
+    assert runner.STRATEGY_WORKERS["S021"] is runner._worker_orb
 
 
 def test_run_worker_dispatches_s009_by_strategy_name(session, s009_link, fake_run_cycle, monkeypatch):

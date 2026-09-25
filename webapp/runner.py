@@ -93,7 +93,9 @@ from webapp.models import Account, AccountStrategy, LogEntry, Position, Strategy
 from webapp.schemas import LogEntryCreate, LogKind, LogLevel
 
 from bot import s007_config as S007_C
+from bot import orb_config as ORB_C
 from bot.s007_paper import run_cycle_for_account as run_s007_cycle
+from bot.orb_signals import run_cycle_for_account as run_orb_cycle
 from bot.symbol_resolver import resolve_symbol
 from utils.trade_logger import StrategyLogger
 from webapp.state_store import DBStateStore
@@ -473,6 +475,110 @@ def _worker_s011(link: AccountStrategy, session, budget_s: float | None) -> int:
     return 0 if ok else 1
 
 
+
+def _worker_orb(link: AccountStrategy, session, budget_s: float | None) -> int:
+    """Run one S021/CTRADER cycle for one (account, strategy) DB row.
+
+    Mirrors _worker_s007's shape closely (same Position-row writes via
+    _open_position_db/_close_position_db, same end-of-cycle sync via
+    _sync_after_cycle -- webapp/sync_positions.py is CTRADER-generic, not
+    S007-specific, see that module's own "Scope: cTrader (S007) only, on
+    purpose" docstring, which is about the BROKER (cTrader vs Bybit), not a
+    hardcoded strategy name; S011 (also CTRADER) opted out of it only
+    because it writes no Position rows at all, which does not apply here).
+
+    The two differences from _worker_s007: S021 has no preset/fx-rate
+    config (bot/orb_config.py's STRATEGY is the single frozen rule set, see
+    strategy-passport-S021.md sec 10 -- "не переоптимизировать"), and it
+    needs no day-scoped settle marker the way S007's `link.status` short-
+    circuit has: S021 is at most 1 position/day by construction, so a
+    normal cycle after the day is done is already cheap
+    (bot/orb_signals.py's decide() returns [] immediately once today's
+    label(s) show label_was_closed) -- no separate "skip, don't even open a
+    broker session" fast path exists yet, unlike S007's; add one later if a
+    tighter tick schedule makes that worth it.
+
+    `link.broker_mode` gates new entries per-link exactly like S009/S011's
+    own gate (see _worker_s011's docstring) -- ADDED 2026-09-22: until this
+    change this worker never read broker_mode at all, so S021's own row
+    sitting at the "off" default had zero actual effect (bot/orb_signals.py
+    ::run_cycle_for_account placed real orders unconditionally). Found and
+    fixed the same day, before any real order had fired (confirmed via that
+    day's events-*.jsonl -- has_levels stayed False all session), so no
+    live-money exposure resulted from the gap. See that function's own
+    docstring for exactly what "off"/"dry"/"execute" now do.
+    """
+    started = time.monotonic()
+    account_strategy_id = link.id
+    acc = link.account
+    strat = link.strategy
+    if acc.broker != "CTRADER":
+        raise SystemExit(
+            f"account_strategy {account_strategy_id} is broker={acc.broker} -- "
+            f"the S021 worker only drives CTRADER accounts")
+    user = acc.user
+
+    broker_mode = link.broker_mode or "off"
+    allow_mainnet = broker_mode == "execute" and acc.env == "live"
+
+    creds = _ctrader_creds(acc)
+
+    logger = StrategyLogger(f"S021-acct{acc.external_account_id or acc.id}",
+                            log_root=str(ROOT / "reports" / "logs"))
+
+    print(f"[runner] S021 cycle starting: account_strategy={link.id} account={acc.id} "
+          f"({acc.label or acc.external_account_id}) user={user.username} broker_mode={broker_mode}")
+    _log_event(session, LogKind.CYCLE_START, message="cycle start", user=user, account=acc,
+              strategy=strat)
+    session.commit()
+
+    # ALGODEV-31-style resolution, same as S007's own -- prefers a verified
+    # broker_asset_symbols row over ORB_C.SYMBOL_CANDIDATES's guess-list;
+    # falls back to that list (logged) if no row is verified yet.
+    symbol_candidates = resolve_symbol(
+        session=session, broker_id=acc.broker_id, asset_symbol=ORB_C.ASSET_SYMBOL,
+        platform=ORB_C.PLATFORM, fallback_candidates=ORB_C.SYMBOL_CANDIDATES)
+
+    result = run_orb_cycle(
+        creds, logger=logger, symbol_candidates=symbol_candidates,
+        risk_pct=link.risk_pct, fixed_lot=link.fixed_lot, use_fixed_lot=link.use_fixed_lot,
+        magic=strat.name, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env)
+
+    for a in result["actions"]:
+        if a["kind"] == "open":
+            _open_position_db(session, acc, strat, a)
+            _log_event(session, LogKind.POSITION_OPEN, message=a["label"], user=user,
+                      account=acc, strategy=strat, cycle_id=result.get("cycle_id"), payload=a)
+        else:
+            _close_position_db(session, acc, strat, a["label"], a["reason"])
+            _log_event(session, LogKind.POSITION_CLOSE, message=a["label"], user=user,
+                      account=acc, strategy=strat, cycle_id=result.get("cycle_id"), payload=a)
+
+    ok = True
+    if result["error"]:
+        link.status = "error"
+        link.last_error = result["error"]
+        _log_event(session, LogKind.ERROR, level=LogLevel.ERROR, message=result["error"],
+                  user=user, account=acc, strategy=strat, cycle_id=result.get("cycle_id"))
+        print(f"[runner] account_strategy {link.id}: ERROR {result['error']}")
+        ok = False
+    else:
+        n_actions = len(result["actions"])
+        mode_label = "shadow" if broker_mode == "off" else broker_mode
+        link.status = f"{mode_label}: {n_actions} action(s)" if n_actions else "idle"
+        link.last_error = None
+        print(f"[runner] account_strategy {link.id}: {n_actions} action(s)")
+    link.last_cycle_at = datetime.now(timezone.utc)
+    _log_event(session, LogKind.CYCLE_END, message="cycle end", user=user, account=acc,
+              strategy=strat, cycle_id=result.get("cycle_id"),
+              payload=dict(actions=len(result["actions"]), error=result["error"]))
+    session.commit()
+    session.close()
+
+    _sync_after_cycle(account_strategy_id, started, budget_s)
+    return 0 if ok else 1
+
+
 # Strategy.name -> worker(link, session, budget_s) -> exit code. The only
 # place a new strategy needs registering; run_worker()/run_coordinator()
 # never need to change for one to be added.
@@ -480,6 +586,7 @@ STRATEGY_WORKERS = {
     "S007": _worker_s007,
     "S009": _worker_s009,
     "S011": _worker_s011,
+    "S021": _worker_orb,
 }
 
 

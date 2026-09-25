@@ -9,6 +9,17 @@
 # set on the ofelia service in docker-compose.yml) -- matches every other
 # schedule in this repo (bot/s007_config.py's TRADE_START/EXIT_END are also
 # local Kyiv time).
+#
+# An entry may opt out of that with an optional `tz:` key (e.g. `tz: UTC`),
+# added 2026-09-22 (scripts/scheduler_tick.py::_effective_now(),
+# decisions-log.md 2026-09-22) for strategies whose OWN session anchor is
+# NOT Kyiv-local (S021's is fixed-EST/UTC) and would otherwise need either a
+# hand-maintained seasonal offset or a padded-wide window to survive Kyiv's
+# own DST twice a year. Every entry without a `tz:` key -- which as of
+# 2026-09-22 is every entry except S021 -- is completely unaffected; don't
+# add `tz:` to S007/S009/S011/watchdog/deribit_snapshot without a reason as
+# strong as S021's (S007 in particular: its Kyiv anchor is a deliberate,
+# zero-drift proxy for Frankfurt/DAX local time, not something to "fix").
 
 strategies:
   # name must match webapp Strategy.name -- dispatched as
@@ -91,6 +102,28 @@ strategies:
   - name: S011
     schedule: "*/15 * * * 1-5"
 
+  # S021 (ORB Nasdaq 100) session is anchored to a FIXED EST clock (UTC-5,
+  # no DST -- strategy-passport-S021.md sec 0/2, ALGODEV-46): 09:30-15:59 EST
+  # is a FIXED 14:30-20:59 UTC window, year-round, never shifting. Unlike
+  # S007 above, there is no Kyiv-Frankfurt DST synchronization to lean on
+  # here (S021 trades a US index, not DAX) -- so rather than either (a)
+  # hand-editing a Kyiv-local cron line at each of Kyiv's own DST transitions
+  # (the still-unsolved problem the deribit_snapshot entry below documents),
+  # or (b) the interim fix used here 2026-09-22..2026-09-22 (a wide
+  # 16:00-23:59 Kyiv-local window sized to cover both DST regimes), this
+  # entry now opts into `tz: UTC` (see file header, scripts/scheduler_tick.py
+  # ::_effective_now(), decisions-log.md 2026-09-22) and states its window
+  # directly in the strategy's own, never-drifting timezone: 14:00-20:59
+  # UTC, i.e. the 30 minutes before session open through session close,
+  # exact and stable forever -- no seasonal padding needed anymore. Cheap
+  # over-polling in the first 30 min is kept anyway as the same harmless
+  # slack S007 uses (bot/orb_signals.py::decide() gates on the latest M1
+  # bar's OWN fixed-EST timestamp, never this container's wall clock, so a
+  # cycle before/after the true session is a no-op either way).
+  - name: S021
+    schedule: "* 14-20 * * 1-5"
+    tz: UTC
+
 # Background jobs unrelated to any single (account, strategy) pair (data
 # refresh, cleanup, ...). `command` is run as-is via subprocess (module path,
 # e.g. "python -m scripts.dump_today_m1"). Empty for now -- populate as
@@ -119,6 +152,30 @@ tasks:
   - name: deribit_snapshot
     command: python -m scripts.fetch_deribit_snapshot
     schedule: "0 19 * * *"
+  # scripts/position_audit.py (2026-09-24, Anton's explicit ask after S021
+  # left a position open overnight -- see that script's own module
+  # docstring for the incident and why S007/S021 specifically are in
+  # scope, S009/S011 are not). Runs shortly BEFORE each strategy's own
+  # session opens and closes anything still open at that moment -- the
+  # script's own safety invariant is "any open position before session
+  # start is stale by construction", so timing this task ahead of the
+  # session open (not just "every morning") is what makes that invariant
+  # true; do not move either entry to fire AFTER its strategy's own
+  # session has started.
+  #
+  # Hardcodes --account-strategy-id (1 for S007, 5 for S021) rather than
+  # dispatching by strategy name like the `strategies:` entries above --
+  # there is exactly one AccountStrategy row for each right now. Revisit
+  # (generalize to "one task per enabled row of this strategy", mirroring
+  # webapp/runner.py's own per-strategy fan-out) if either ever gets a
+  # second account.
+  - name: s007_position_audit
+    command: python -m scripts.position_audit --account-strategy-id 1
+    schedule: "55 9 * * 1-5"          # 09:55 Kyiv, 5min before S007's 10:00 open
+  - name: s021_position_audit
+    command: python -m scripts.position_audit --account-strategy-id 5
+    schedule: "55 13 * * 1-5"         # 13:55 UTC, 5min before S021's 14:00 UTC open
+    tz: UTC
   # ALGODEV-45 step 1: S007 stall watchdog (scripts/s007_watchdog.py). Reads
   # AccountStrategy.last_cycle_at only -- never touches the broker, never
   # kills/restarts anything (there is nothing persistent to manage yet;

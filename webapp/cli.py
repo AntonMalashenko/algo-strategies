@@ -372,7 +372,7 @@ def main():
     p.add_argument("--api-secret", dest="api_secret", default=None)
 
     p = sub.add_parser("add-strategy")
-    p.add_argument("--name", required=True, choices=["S007", "S009", "S011"])
+    p.add_argument("--name", required=True, choices=["S007", "S009", "S011", "S021"])
     p.add_argument("--broker", required=True, choices=["CTRADER", "BYBIT"])
     p.add_argument("--description", default=None)
     p.add_argument("--default-preset", dest="default_preset", default=None)

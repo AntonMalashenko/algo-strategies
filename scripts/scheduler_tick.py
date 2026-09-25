@@ -30,6 +30,7 @@ import shlex
 import subprocess
 import sys
 import time
+import zoneinfo
 from pathlib import Path
 
 import yaml
@@ -69,6 +70,44 @@ def load_schedule(path: Path) -> dict:
         return {"strategies": [], "tasks": []}
     data = yaml.safe_load(path.read_text()) or {}
     return {"strategies": data.get("strategies") or [], "tasks": data.get("tasks") or []}
+
+
+# The container's own wall-clock timezone (see docker-compose.yml's ofelia
+# service TZ=Europe/Kyiv, which every un-tagged schedule.yml entry has always
+# matched against). Deliberately a literal here rather than read from the
+# environment: an entry that opts into `tz:` should convert against a known-
+# correct value even if the container's own TZ var is ever missing or wrong.
+# If docker-compose.yml's TZ ever changes, this constant must change with it.
+CONTAINER_TZ = zoneinfo.ZoneInfo("Europe/Kyiv")
+
+
+def _effective_now(now: datetime.datetime, tz_name: str | None) -> datetime.datetime:
+    """`now` is always naive local (container/Kyiv) wall-clock time -- see
+    tick()'s docstring. An entry with no `tz:` key (tz_name is None) is a
+    total no-op here and matches exactly as it always has -- S007/S009/S011/
+    watchdog/deribit_snapshot are all unaffected by this function existing.
+
+    An entry that sets `tz: <IANA name>` (e.g. "UTC") gets `now` reinterpreted
+    as CONTAINER_TZ-aware, converted into the requested zone, and returned
+    naive again in THAT zone -- so its cron string can be written directly in
+    its own target timezone rather than the container's, and croniter (which
+    only compares naive field values) still matches it correctly.
+
+    Added 2026-09-22 for S021: its session is anchored to a fixed EST/UTC
+    clock that never drifts (strategy-passport-S021.md sec 0/2), but the
+    container's cron clock is Kyiv-local, which DOES drift on Kyiv's own DST
+    twice a year -- see decisions-log.md 2026-09-22 for the fuller writeup of
+    why a wide Kyiv-local window was the interim fix and this is the real
+    one. Deliberately scoped to opt-in per entry: S007's Kyiv anchor is not a
+    bug (Kyiv and Frankfurt/DAX share EU DST dates, so it's a stable,
+    zero-drift proxy for DAX local time -- converting it to UTC would need a
+    hand-maintained seasonal offset instead, trading one drift problem for
+    another), and S009/S011 have no Kyiv dependency left to convert."""
+    if tz_name is None:
+        return now
+    aware = now.replace(tzinfo=CONTAINER_TZ)
+    converted = aware.astimezone(zoneinfo.ZoneInfo(tz_name))
+    return converted.replace(tzinfo=None)
 
 
 def _due(schedule_expr: str, now: datetime.datetime) -> bool:
@@ -141,20 +180,24 @@ def tick(now: datetime.datetime | None = None, schedule_file: Path | None = None
     deployment/schedule.yml. `now` is naive local wall-clock time, matching
     every cron string in schedule.yml (evaluated in the container's local
     TZ, see docker-compose.yml's ofelia service) and every other tick
-    script's convention in this repo."""
+    script's convention in this repo -- UNLESS an entry sets an optional
+    `tz:` key (e.g. `tz: UTC`), in which case its cron string is matched
+    against `now` converted into THAT zone instead (see _effective_now()).
+    Entries with no `tz:` key -- i.e. every entry except S021 as of
+    2026-09-22 -- are completely unaffected."""
     now = now or datetime.datetime.now()
     schedule_file = schedule_file or DEFAULT_SCHEDULE_FILE
     sched = load_schedule(schedule_file)
 
     for s in sched["strategies"]:
         name = s["name"]
-        if _due(s["schedule"], now):
+        if _due(s["schedule"], _effective_now(now, s.get("tz"))):
             _run_item("strategy", name,
                       [sys.executable, "-m", "webapp.runner", "--strategy", name])
 
     for t in sched["tasks"]:
         name = t["name"]
-        if _due(t["schedule"], now):
+        if _due(t["schedule"], _effective_now(now, t.get("tz"))):
             _run_item("task", name, shlex.split(t["command"]))
 
 

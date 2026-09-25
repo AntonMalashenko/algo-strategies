@@ -27,6 +27,7 @@ class Strategy(str, Enum):
     S007 = "S007"
     S009 = "S009"
     S011 = "S011"
+    S021 = "S021"
 
 
 class BrokerMode(str, Enum):

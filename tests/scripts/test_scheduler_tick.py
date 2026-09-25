@@ -106,6 +106,71 @@ def test_tick_empty_schedule_is_a_clean_noop(tmp_path, monkeypatch):
     assert calls == []
 
 
+# --- per-entry tz: override (added 2026-09-22 for S021 -- see
+# _effective_now()'s docstring in scripts/scheduler_tick.py and
+# decisions-log.md 2026-09-22 for why) ------------------------------------
+
+def test_effective_now_no_tz_is_passthrough():
+    now = datetime.datetime(2026, 7, 13, 17, 30)
+    assert st._effective_now(now, None) is now
+
+
+def test_effective_now_converts_kyiv_winter_to_utc():
+    # Monday in January -- Kyiv is EET (UTC+2) in winter.
+    kyiv_now = datetime.datetime(2026, 1, 12, 16, 30)
+    assert st._effective_now(kyiv_now, "UTC") == datetime.datetime(2026, 1, 12, 14, 30)
+
+
+def test_effective_now_converts_kyiv_summer_to_utc():
+    # Monday in July -- Kyiv is EEST (UTC+3) in summer. Same UTC instant as
+    # the winter case above (14:30 UTC) despite a different Kyiv-local hour
+    # -- this is exactly the DST drift `tz:` exists to absorb.
+    kyiv_now = datetime.datetime(2026, 7, 13, 17, 30)
+    assert st._effective_now(kyiv_now, "UTC") == datetime.datetime(2026, 7, 13, 14, 30)
+
+
+def test_tick_dispatches_utc_tz_entry_when_utc_window_matches_in_winter(tmp_path, monkeypatch):
+    schedule = _write_schedule(tmp_path, strategies=[
+        {"name": "S021", "schedule": "* 14-20 * * 1-5", "tz": "UTC"}])
+    calls = []
+    monkeypatch.setattr(st, "_run_item", lambda kind, name, args: calls.append(name))
+
+    kyiv_winter_in_window = datetime.datetime(2026, 1, 12, 16, 30)   # Monday, 14:30 UTC
+    st.tick(now=kyiv_winter_in_window, schedule_file=schedule)
+
+    assert calls == ["S021"]
+
+
+def test_tick_skips_utc_tz_entry_when_kyiv_local_looks_in_range_but_utc_is_not(tmp_path, monkeypatch):
+    # Same Kyiv-local hour (16:30) that is in-window in winter (test above)
+    # is only 13:30 UTC in summer (Kyiv EEST = UTC+3) -- before the 14:30 UTC
+    # session open. Proves the entry is matched in ITS zone, not Kyiv's.
+    schedule = _write_schedule(tmp_path, strategies=[
+        {"name": "S021", "schedule": "* 14-20 * * 1-5", "tz": "UTC"}])
+    calls = []
+    monkeypatch.setattr(st, "_run_item", lambda kind, name, args: calls.append(name))
+
+    kyiv_summer_same_local_hour = datetime.datetime(2026, 7, 13, 16, 30)   # Monday, 13:30 UTC
+    st.tick(now=kyiv_summer_same_local_hour, schedule_file=schedule)
+
+    assert calls == []
+
+
+def test_tick_entry_without_tz_key_is_unaffected_by_feature(tmp_path, monkeypatch):
+    # Sanity: an ordinary (no `tz:`) entry keeps matching Kyiv-local `now`
+    # exactly as before -- S007/S009/S011/watchdog/deribit_snapshot are all
+    # untouched by this feature existing.
+    schedule = _write_schedule(tmp_path, strategies=[
+        {"name": "S007", "schedule": "* 10-16 * * 1-5"}])
+    calls = []
+    monkeypatch.setattr(st, "_run_item", lambda kind, name, args: calls.append(name))
+
+    monday_in_window = datetime.datetime(2026, 8, 10, 10, 30)
+    st.tick(now=monday_in_window, schedule_file=schedule)
+
+    assert calls == ["S007"]
+
+
 # --- _run_item: real subprocess handling (success / non-zero / timeout) ----
 
 def test_run_item_success_does_not_raise(capsys):
