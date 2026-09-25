@@ -98,6 +98,9 @@ mappings as of this writing (extend this list when a new strategy shows up
 | `strategies/gap_fade.py`, `gap_fade`, `s019` | `gap_fade`       |
 | `strategies/s017_elliott.py`, `s017`      | `s017_elliott`      |
 | `strategies/crypto_mtf/`, `crypto_mtf`    | `crypto_mtf`        |
+| `strategies/overnight_drift.py`, `overnight_drift`, `s025` | `overnight_drift` |
+| `strategies/xsect_equity_momentum.py`, `xsect_equity_momentum`, `s027` | `xsect_equity_momentum` |
+| `strategies/eia_calendar.py`, `eia_calendar`, `s026` | `eia_calendar` |
 | `s009`, `bybit` (no clearer match yet)    | `bybit`             |
 
 If a file matches none of these and isn't under `strategies/`, it has no

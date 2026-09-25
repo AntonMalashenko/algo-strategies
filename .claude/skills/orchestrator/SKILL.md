@@ -56,6 +56,22 @@ re-reading a doc you wrote). Sync the docs on the same task if a skill requires 
 respond in the format below. Close the loop: if the work changed code an owned skill
 documents, flag the drift and propose the skill update for consent — don't apply it silently.
 
+## Model routing — which model does which kind of work
+
+Split the work by model so the expensive model is spent only where it pays off:
+
+- **Writing or editing code → Opus.** Any task whose core output is source code — new
+  strategy code, a bot/adapter/utils change, a refactor, wiring into the shared engines,
+  writing tests. Author the code with Opus.
+- **Running commands → Sonnet.** Executing shell commands, running the test suite, dry
+  runner cycles, git operations, backtest/script runs, inspecting output.
+- **Everything else → Sonnet.** Routing, reading code and docs, analysis and diagnosis
+  (`trading-analysis`), research write-ups, documentation, Confluence/Jira updates, planning,
+  answering questions.
+
+In practice: default to Sonnet for the whole loop, and switch to Opus only for the
+code-authoring step of a task that produces code.
+
 ## Skill catalog — what each owns and when to use it
 
 - **`strategy-lifecycle`** — the end-to-end flow of creating/researching/validating/managing

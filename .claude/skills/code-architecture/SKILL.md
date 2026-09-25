@@ -26,10 +26,33 @@ The codebase is a **common foundation reused by every strategy**, with strategy-
 logic layered on top. Do not fork or copy a base engine per strategy; extend or compose it.
 
 - `bot/` — the shared trading runtime:
-  - `ctrader.py` — `CTraderAdapter`, the cTrader Open API base (connect / auth / trendbars /
-    orders / reconcile). **All strategies reuse this.** S007's `ctrader_s007.py` does
+  - `ctrader.py` — `CTraderAdapter`, the LEGACY cTrader Open API base (connect / auth /
+    trendbars / orders / reconcile). S007's `ctrader_s007.py` does
     `class CTraderS007(CTraderAdapter)` and only adds S007-specific symbol/signal glue — the
-    connection, auth, and order plumbing are inherited, not re-written.
+    connection, auth, and order plumbing are inherited, not re-written. Still used by
+    S007/S009/S021; superseded by `clients/ctrader/` (below) for anything new.
+  - `clients/ctrader/` — `CTraderApiClient` + `auth.py`, the cTrader base that strategies
+    are being MIGRATED to. It supersedes `ctrader.py` and differs in two ways that matter:
+    (1) **One session per process, many calls.** A Twisted reactor can only be run once per
+    OS process, and `CTraderAdapter` spends that single run on ONE top-level call — which is
+    why every multi-step flow there had to be hand-written as one `inlineCallbacks` chain.
+    The client runs the reactor once on a daemon thread instead and serves every public
+    method from it via `blockingCallFromThread`, so a whole cycle is plain sequential code
+    inside `with client:`. New operations are added as a `_xxx_step()` returning a Deferred
+    plus a thin public wrapper over `_call` — follow that split, don't add a method that
+    touches the reactor directly.
+    (2) **OAuth2 access-token auto-refresh** (`auth.py`). The refresh is PRE-FLIGHT, before
+    the reactor is touched, never retry-on-failure: a session that dies on an expired token
+    cannot be retried in the same process. The caller passes `on_token_refreshed` to persist
+    the renewed tokens — omitting it means the renewal is forgotten and, once the broker
+    rotates the refresh token, the next cycle renews with a dead one.
+    `auth.py` is the ONLY implementation of the cTrader token endpoints;
+    `scripts/ctrader_oauth.py` is just its human-in-the-loop front end.
+    **Status:** S011 is migrated (`bot/ctrader_s011.py`, which now COMPOSES the client
+    rather than subclassing it — strategy conventions like S011's D1 session-date
+    relabelling stay in the strategy leaf, the client stays neutral). S007/S009/S021 still
+    run on `ctrader.py` and move over one at a time; until then both bases exist on purpose,
+    and a fix to broker protocol behaviour may need applying in both.
   - `risk.py` — `lots_for_risk(...)`, equal-dollar-risk position sizing for lot/point-based
     (cTrader CFD/FX) instruments. Pure math, no broker I/O: the caller (a strategy's `decide`)
     fetches `balance` and `money_per_point_per_lot` once per cycle via the adapter (see
