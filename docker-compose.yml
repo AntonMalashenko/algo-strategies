@@ -46,6 +46,45 @@ services:
     networks:
       - algo
 
+  # ALGODEV-45 step 2: S007 persistent-session OBSERVATION daemon
+  # (scripts/s007_daemon.py) -- containerized 2026-09-23 per Anton's request
+  # (manual `python -m scripts.s007_daemon` each time was not sustainable).
+  # Unlike `worker` above, this IS a genuine standing compose service, not an
+  # Ofelia job-run: the whole point is ONE long-lived cTrader session held
+  # open for hours, not a fresh stateless-tick container per minute. Reuses
+  # the same `algo-worker:latest` image (no separate build) with `command:`
+  # overridden to run the daemon instead of a strategy tick.
+  #
+  # `restart: unless-stopped` deliberately does NOT contradict the script's
+  # own "no auto-reconnect by design" docstring note -- that note is about
+  # the in-process Twisted session never silently retrying mid-run (an
+  # explicit, observable exit instead), not about whether the daemon should
+  # come back at all. A container restart is a coarser, DIFFERENT kind of
+  # resilience -- a fresh process/fresh session, same "stateless restart over
+  # in-process retry-loop complexity" philosophy the rest of this file
+  # already uses -- so it's consistent, not a change to the experiment's own
+  # safety invariant (still read-only, still never places an order, see that
+  # script's SAFETY INVARIANT comment).
+  #
+  # account-strategy-id 1 = S007's only registered AccountStrategy row
+  # (Bybit/cTrader ctrader-47939312, demo) -- hardcoded here the same way
+  # webapp/runner.py's per-strategy dispatch is a property of the deployment,
+  # not read from schedule.yml (this daemon is S007-only by the script's own
+  # design, see its module docstring).
+  s007-daemon:
+    image: algo-worker:latest
+    command: python -m scripts.s007_daemon --account-strategy-id 1
+    restart: unless-stopped
+    environment:
+      - APP_SECRET_KEY=${APP_SECRET_KEY}
+      - APP_DB_URL=sqlite:////app/data/app.db
+      - TZ=Europe/Kyiv
+    volumes:
+      - ${PWD}/data:/app/data:rw
+      - ${PWD}/reports:/app/reports:rw
+    networks:
+      - algo
+
   # Shared Redis -- reachable as `redis://redis:6379` from every job-run
   # worker container (they join the `algo` network via the job-run label
   # below). Deliberately NO `ports:` -- not published to the host (Anton's

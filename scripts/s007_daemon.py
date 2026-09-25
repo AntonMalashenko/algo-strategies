@@ -34,8 +34,15 @@ itself part of what this step needs to prove) but this process does not
 hit the broker at all -- no point burning API calls or log volume for a
 window nothing is supposed to happen in.
 
-Usage (manual only during the observation phase -- NOT wired into
-deployment/schedule.yml or docker-compose.yml):
+Containerized 2026-09-23 as the `s007-daemon` docker-compose service
+(restart: unless-stopped -- see that service's own comment for why this
+does not contradict the "no auto-reconnect" invariant above: a container
+restart is a fresh process/session, not an in-process retry). Still not in
+deployment/schedule.yml -- that file is Ofelia's per-strategy CRON dispatch
+for stateless ticks, which this isn't (one long-lived process, not a fresh
+container per minute).
+
+Usage (manual, e.g. for a one-off run outside the compose service):
     python -m scripts.s007_daemon --account-strategy-id 1
 
 Ctrl+C (SIGINT) or SIGTERM triggers a clean shutdown (stops the internal
