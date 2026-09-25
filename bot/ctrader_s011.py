@@ -1,48 +1,40 @@
-"""cTrader adapter extension for S011 (RSI(2)-portfolio) — adds D1 bars for
-MANY instruments in one session, plus MARKET entry/exit sized from a target
-dollar book, on top of the shared `CTraderAdapter` (bot/ctrader.py).
+"""S011 (RSI(2) portfolio) broker layer — the shared cTrader client plus the
+few conventions that are genuinely S011's own.
 
-Reuses everything from bot.ctrader; only the S011-specific pieces (batched
-multi-symbol daily bars, batched multi-symbol contract metadata, a
-portfolio-shaped `run_live_cycle_multi`) are added here — same "subclass,
-don't fork" pattern bot/ctrader_s007.py already established for S007.
+S011 is the FIRST strategy migrated onto `bot/clients/ctrader/client.py`
+(`CTraderApiClient`). Everything generic — connect/auth, OAuth2 access-token
+refresh, symbol resolution, batched D1 bars, balance, reconcile, contract
+metadata, notional-sized MARKET orders, closes — now lives in that shared
+client and is reused verbatim, so a fix there reaches every strategy that
+follows. The other strategies still run on the legacy `bot/ctrader.py`
+adapter and will be moved over one at a time.
 
-Why S011 needs its OWN single-session flow (can't reuse S007's
-`run_live_cycle`, which fetches exactly one symbol per cycle): S011 trades
-up to 13 instruments from ONE account in ONE daily cycle, and
-`CTraderAdapter._run()` drives the whole thing through one
-`reactor.run()` — a Twisted reactor can only be run once per OS process
-(see webapp/runner.py's module docstring), so fetching each instrument's
-D1 bars via 13 separate top-level calls (13 separate `_run()`s) is not an
-option the way it would be for 13 independent single-symbol cycles in 13
-separate subprocesses. Everything below is chained inside ONE
-`defer.inlineCallbacks` flow, same technique `run_live_cycle`/
-`sync_snapshot` in ctrader_s007.py already use for their own multi-step
-single-session needs.
+What stays here, because it is strategy convention rather than broker
+protocol:
 
-NOTE (as in bot/ctrader.py / ctrader_s007.py): field/enum names follow the
-Open API spec; verify order/volume details against the cTrader UI on the
-first live (`--broker dry`) cycle before ever running `--broker execute`.
+  * the D1 SESSION-DATE relabelling (see D1_SESSION_DATE_ROLL) — the shared
+    client deliberately returns neutral UTC-stamped bars;
+  * the still-forming-bar filter and the "last CLOSED price" used to size
+    orders;
+  * the portfolio-shaped cycle `run_live_cycle_multi`.
+
+Why the whole cycle is ONE session: S011 trades up to 13 instruments from one
+account in one daily cycle, and a Twisted reactor can only be run once per OS
+process. The shared client solves this for good by running the reactor once on
+a background thread and serving every call from it, so the plain sequential
+code below all happens inside a single connect/auth.
+
+NOTE (as in bot/ctrader.py): field/enum names follow the Open API spec; verify
+order/volume details against the cTrader UI on the first live (`--broker dry`)
+cycle before ever running `--broker execute`.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pandas as pd
 
-from bot.ctrader import CTraderAdapter, HAVE_SDK, Protobuf  # reuse shared adapter
-
-if HAVE_SDK:
-    from twisted.internet import defer
-    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-        ProtoOAGetTrendbarsReq, ProtoOANewOrderReq, ProtoOAClosePositionReq,
-        ProtoOAReconcileReq, ProtoOASymbolByIdReq,
-    )
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
-        ProtoOAOrderType, ProtoOATradeSide, ProtoOATrendbarPeriod,
-    )
-
-PRICE_SCALE = 100000.0   # Open API trendbar/price integers = human_price * 1e5
+from bot.clients.ctrader.client import CTraderApiClient
 
 # cTrader D1 trendbars are stamped at the broker-day OPEN (this broker's local
 # midnight -- 21:00 UTC in summer, 22:00 UTC in winter), so a bar stamped
@@ -54,52 +46,34 @@ D1_SESSION_DATE_ROLL = "D"   # pandas ceil() frequency used for that relabelling
                              # roll a broker-day OPEN stamp up to the UTC
                              # midnight that same broker-day CLOSES on
 
+# The bar period S011 trades off. Named so the string never appears inline.
+S011_BAR_PERIOD = "D1"
+# Order bookkeeping sent to the broker, visible in the cTrader UI.
+ORDER_COMMENT = "S011"
 
-class CTraderS011(CTraderAdapter):
-    def __init__(self, creds: dict | None = None, require_account: bool = True):
-        """Same construction contract as CTraderS007 -- creds=None reads
-        .env/accounts.yml single-account resolution; a dict is the explicit
-        multi-account shape (client_id, client_secret, access_token,
-        account_id, host?) the DB-driven runner passes in."""
-        if not HAVE_SDK:
-            raise RuntimeError("pip install ctrader-open-api first")
-        if creds is None:
-            super().__init__(require_account=require_account)
-            return
-        from ctrader_open_api import Client, TcpProtocol, EndPoints
-        self.client_id = creds["client_id"]
-        self.secret = creds["client_secret"]
-        self.token = creds["access_token"]
-        self.account = int(creds.get("account_id") or 0)
-        host = creds.get("host") or EndPoints.PROTOBUF_DEMO_HOST
-        need = [self.client_id, self.secret, self.token]
-        if require_account:
-            need.append(self.account)
-        if not all(need):
-            raise RuntimeError("missing per-account cTrader credentials")
-        self.client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
-        self._result = None
-        self._error = None
-        self._symbols = None
 
-    # ---------- single-session step helpers (assume connected+authed) -------
+class CTraderS011:
+    """Composes `CTraderApiClient` — it does NOT subclass it.
 
-    def _resolve_symbols_step(self, candidates_by_asset: dict[str, tuple[str, ...]]) -> dict:
-        """First matching broker symbol name per asset, from each asset's own
-        candidate-name tuple (mirrors CTraderS007.resolve_symbol, but for many
-        assets at once against the ALREADY-loaded self._symbols, no extra
-        round trip). Assets with no matching broker symbol are simply absent
-        from the returned dict -- the caller decides whether that is fatal
-        (see run_live_cycle_multi, which logs and skips a missing asset
-        rather than failing the whole cycle for the other 11-12)."""
-        up = {n.upper() for n in self._symbols.keys()}
-        resolved = {}
-        for asset, candidates in candidates_by_asset.items():
-            for c in candidates:
-                if c.upper() in up:
-                    resolved[asset] = c
-                    break
-        return resolved
+    The shared client is a complete broker API; S011 adds a date convention
+    and a cycle shape on top, which is composition, not specialisation. That
+    also keeps the client free of any S011 assumption, so the next strategy
+    migrating over inherits nothing strategy-specific.
+    """
+
+    def __init__(self, creds: dict, on_token_refreshed=None):
+        """`creds`: the per-account dict the DB-driven runner builds
+        (client_id, client_secret, access_token, refresh_token?,
+        token_expires_at?, account_id, host?).
+
+        `on_token_refreshed`: called with the renewed credential fields when
+        the client rotates an expired access token, so the caller can persist
+        them. Without it a refresh is forgotten at the end of the cycle -- see
+        webapp/runner.py::_token_persister.
+        """
+        self.client = CTraderApiClient(creds, on_token_refreshed=on_token_refreshed)
+
+    # ---------- S011's D1 date convention ----------
 
     @staticmethod
     def _session_dated_index(utc_open_ts) -> pd.DatetimeIndex:
@@ -117,202 +91,91 @@ class CTraderS011(CTraderAdapter):
         opens_utc = pd.DatetimeIndex(pd.to_datetime(utc_open_ts, utc=True))
         return opens_utc.ceil(D1_SESSION_DATE_ROLL).tz_localize(None)
 
-    def _get_daily_step(self, symbol: str, days: int):
-        """D1 trendbars for ONE symbol, human index/price points (same
-        PRICE_SCALE convention as CTraderS007._get_m1_step, just period=D1).
-        Chained (not top-level `_run`) so many of these can run back to back
-        inside one session -- see run_live_cycle_multi."""
-        req = ProtoOAGetTrendbarsReq()
-        req.ctidTraderAccountId = self.account
-        req.symbolId = self.symbol_id(symbol)
-        req.period = ProtoOATrendbarPeriod.D1
-        now = datetime.now(timezone.utc)
-        req.fromTimestamp = int((now - timedelta(days=days)).timestamp() * 1000)
-        req.toTimestamp = int(now.timestamp() * 1000)
-        d = self.client.send(req)
+    @classmethod
+    def _to_session_dates(cls, bars: pd.DataFrame) -> pd.DataFrame:
+        """Relabel the shared client's UTC-stamped D1 bars to session dates.
 
-        def fin(resp):
-            msg = Protobuf.extract(resp)
-            rows = []
-            for tb in msg.trendbar:
-                lo = tb.low
-                rows.append(dict(ts=tb.utcTimestampInMinutes * 60,
-                                 open=(lo + tb.deltaOpen) / PRICE_SCALE,
-                                 high=(lo + tb.deltaHigh) / PRICE_SCALE,
-                                 low=lo / PRICE_SCALE,
-                                 close=(lo + tb.deltaClose) / PRICE_SCALE))
-            df = pd.DataFrame(rows)
-            if df.empty:
-                return df
-            # D1 bars arrive stamped at the broker-day OPEN, so the raw
-            # timestamp names the PREVIOUS calendar day (and, over a weekend,
-            # up to two days back) relative to the session the bar actually
-            # covers -- see D1_SESSION_DATE_ROLL. Relabel to the session date
-            # (the UTC midnight the broker-day closes on) so every downstream
-            # date comparison -- the paper ledger's `date`, the up-to-date
-            # short-circuit, the stale-feed guard, a reconciliation against
-            # the Yahoo-dated backtest -- talks about the same day the
-            # backtest does. This is still ONE fixed cutover for a
-            # mixed-session universe, NOT each instrument's own exchange
-            # midnight (see bot/s011_paper.py's module docstring for that
-            # tradeoff); relabelling changes only the index, never the OHLC.
-            opens_utc = pd.to_datetime(df.pop("ts"), unit="s", utc=True)
-            df.index = self._session_dated_index(opens_utc)
-            return df.sort_index()
-        d.addCallback(fin)
-        return d
+        The raw timestamp names the PREVIOUS calendar day (and, over a
+        weekend, up to two days back) relative to the session the bar actually
+        covers. Relabelling makes every downstream date comparison -- the
+        paper ledger's `date`, the up-to-date short-circuit, the stale-feed
+        guard, a reconciliation against the Yahoo-dated backtest -- talk about
+        the same day the backtest does. This is still ONE fixed cutover for a
+        mixed-session universe, NOT each instrument's own exchange midnight
+        (see bot/s011_paper.py's module docstring for that tradeoff); it
+        changes only the index, never the OHLC.
+        """
+        if bars.empty:
+            return bars
+        relabelled = bars.copy()
+        relabelled.index = cls._session_dated_index(bars.index)
+        return relabelled.sort_index()
 
     @staticmethod
-    def _drop_forming_bar(df: pd.DataFrame) -> pd.DataFrame:
-        """Drop a still-forming current-UTC-day bar, if `_get_daily_step`
-        returned one (broker D1 feed quirk -- the feed can hand back a last
-        row for TODAY before that day's bar has actually closed). Single
-        source of truth for this filter: bot/s011_paper.py's decide() reuses
-        it for its RSI signal instead of re-deriving the same date
-        comparison, so the signal and the order-sizing price can never
-        silently diverge on which bar counts as "current" again -- see
-        `_last_closed_price`'s docstring for the incident this guards
-        against.
+    def _drop_forming_bar(bars: pd.DataFrame) -> pd.DataFrame:
+        """Drop a still-forming current-UTC-day bar, if the feed returned one
+        (broker D1 quirk -- it can hand back a last row for TODAY before that
+        day's bar has actually closed). Single source of truth for this
+        filter: bot/s011_paper.py's decide() reuses it for its RSI signal
+        instead of re-deriving the same date comparison, so the signal and the
+        order-sizing price can never silently diverge on which bar counts as
+        "current" again -- see `_last_closed_price`'s docstring for the
+        incident this guards against.
 
         (D1 convention: the index this reads is SESSION-dated, not stamped at
         the broker-day open -- see `_session_dated_index` -- so a
         still-forming current session labels as TODAY's UTC date and is what
-        gets dropped here. In practice this broker's `GetTrendbarsReq` only
+        gets dropped here. In practice this broker's trendbar request only
         returns already-closed bars, so this is defence-in-depth.)"""
-        if df.empty:
-            return df
+        if bars.empty:
+            return bars
         today_utc = datetime.now(timezone.utc).date()
-        return df[df.index.date < today_utc] if df.index[-1].date() >= today_utc else df
+        return bars[bars.index.date < today_utc] if bars.index[-1].date() >= today_utc else bars
 
     @classmethod
-    def _last_closed_price(cls, df: pd.DataFrame) -> float | None:
+    def _last_closed_price(cls, bars: pd.DataFrame) -> float | None:
         """Latest CLOSED D1 bar's close -- never a still-forming current-UTC-
         day bar (operates on the session-dated, forming-bar-filtered series;
         see `_session_dated_index` and `_drop_forming_bar`).
-        run_live_cycle_multi's
-        `last_price` used to skip this guard even though it feeds directly
-        into `_place_market_step`'s order sizing -- found live 2026-08-19:
+        run_live_cycle_multi's `last_price` used to skip this guard even
+        though it feeds directly into order sizing -- found live 2026-08-19:
         an incomplete bar's close priced a $1500-target CAC40 order at what
-        was actually a ~$8500 position (~5.7x oversized), invisible in the
-        log because only the (correctly filtered) `bars["close"]` used for
+        was actually a ~$8500 position (~5.7x oversized), invisible in the log
+        because only the (correctly filtered) `bars["close"]` used for
         rsi_close ever got logged, never this one."""
-        bars = cls._drop_forming_bar(df)
-        if bars.empty:
+        closed = cls._drop_forming_bar(bars)
+        if closed.empty:
             return None
-        return float(bars["close"].iloc[-1])
-
-    def _reconcile_step(self):
-        req = ProtoOAReconcileReq()
-        req.ctidTraderAccountId = self.account
-        d = self.client.send(req)
-
-        def fin(resp):
-            msg = Protobuf.extract(resp)
-            out = []
-            for p in msg.position:
-                td = p.tradeData
-                out.append(dict(
-                    position_id=p.positionId,
-                    label=getattr(td, "label", "") or "",
-                    side="buy" if td.tradeSide == ProtoOATradeSide.BUY else "sell",
-                    volume=td.volume,
-                    symbol_id=td.symbolId,
-                ))
-            return out
-        d.addCallback(fin)
-        return d
-
-    def _full_symbols_step(self, symbol_ids: list[int]):
-        """Full ProtoOASymbol (lotSize/digits/min-max-stepVolume) for MANY
-        symbols in ONE request (symbolId is a repeated field on
-        ProtoOASymbolByIdReq -- same trick CTraderS007._lot_sizes_step uses,
-        generalised here to keep the whole ProtoOASymbol, not just lotSize,
-        since S011 also needs `digits` for price rounding and
-        min/max/stepVolume for order sizing across up to 13 instruments)."""
-        if not symbol_ids:
-            return defer.succeed({})
-        req = ProtoOASymbolByIdReq()
-        req.ctidTraderAccountId = self.account
-        for sid in symbol_ids:
-            req.symbolId.append(int(sid))
-        d = self.client.send(req)
-        d.addCallback(self._check_response)
-        d.addCallback(lambda m: {s.symbolId: s for s in m.symbol})
-        return d
-
-    @staticmethod
-    def _check_response(resp):
-        """Same silent-rejection trap CTraderS007._check_response guards
-        against (see that method's docstring) -- reused verbatim rather than
-        re-derived, since it is broker-protocol behaviour, not S007-specific."""
-        msg = Protobuf.extract(resp)
-        name = type(msg).__name__
-        if name in ("ProtoOAErrorRes", "ProtoOAOrderErrorEvent"):
-            raise RuntimeError(f"{msg.errorCode}: {getattr(msg, 'description', '')}")
-        if hasattr(msg, "payloadType") and hasattr(msg, "payload") and not hasattr(msg, "errorCode"):
-            raise RuntimeError(
-                f"unrecognized broker response (payloadType={msg.payloadType}) -- "
-                f"treating as a failure, not assuming success")
-        return msg
-
-    @staticmethod
-    def _volume_from_notional(notional: float, price: float, full_symbol) -> int:
-        """Target dollar notional (in the SYMBOL's own quote currency -- see
-        run_live_cycle_multi's docstring for the currency-conversion caveat
-        this does NOT yet solve) -> Open API volume units, clamped to
-        [minVolume, maxVolume] and rounded to a stepVolume multiple. Mirrors
-        CTraderS007._volume_from_lots's clamping, but starting from a dollar
-        target and a price rather than an already-decided lot count, since
-        S011 sizes positions as `cap_pct * equity` in cash, not in lots."""
-        if price <= 0:
-            return 0
-        volume_lots = notional / (price * full_symbol.lotSize)
-        step = full_symbol.stepVolume or 1
-        raw = volume_lots * 100 * full_symbol.lotSize
-        raw = max(full_symbol.minVolume, min(full_symbol.maxVolume, raw))
-        return int(round(raw / step) * step)
-
-    def _place_market_step(self, symbol: str, side: str, notional: float, price: float,
-                           label: str, full_symbol):
-        req = ProtoOANewOrderReq()
-        req.ctidTraderAccountId = self.account
-        sym = self._symbols[symbol.upper()]
-        req.symbolId = sym.symbolId
-        req.orderType = ProtoOAOrderType.MARKET
-        req.tradeSide = ProtoOATradeSide.BUY if side == "buy" else ProtoOATradeSide.SELL
-        req.volume = self._volume_from_notional(notional, price, full_symbol)
-        req.label = label
-        req.comment = "S011"
-        # No stopLoss/takeProfit -- RSI(2) is deliberately unprotected at the
-        # single-position level, same as strategies/rsi2.py and
-        # strategies/rsi2_portfolio.py (see both modules' docstrings); this
-        # mirrors the backtest, it is not an oversight.
-        d = self.client.send(req)
-        d.addCallback(self._check_response)
-        return d
-
-    def _close_position_step(self, position_id: int, volume: int):
-        req = ProtoOAClosePositionReq()
-        req.ctidTraderAccountId = self.account
-        req.positionId = position_id
-        req.volume = volume
-        d = self.client.send(req)
-        d.addCallback(self._check_response)
-        return d
+        return float(closed["close"].iloc[-1])
 
     # ---------- one session, whole portfolio cycle ----------
+
+    def fetch_session_dated_bars(self, candidates_by_asset: dict[str, tuple[str, ...]],
+                                 history_days: int):
+        """Session-dated D1 bars per asset, in ONE read-only session.
+
+        Returns `(bars_by_asset, resolved, unresolved)`. Shared by the live
+        cycle below and by scripts/s011_check_d1_alignment.py, so the
+        alignment check can never drift from what the live bot actually sees.
+        """
+        with self.client as broker:
+            resolved = broker.resolve_symbols(candidates_by_asset)
+            unresolved = sorted(set(candidates_by_asset) - set(resolved))
+            utc_bars = broker.get_trendbars_many(
+                list(resolved.values()), S011_BAR_PERIOD, history_days)
+            bars_by_asset = {asset: self._to_session_dates(utc_bars[symbol])
+                             for asset, symbol in resolved.items()}
+            return bars_by_asset, resolved, unresolved
 
     def run_live_cycle_multi(self, candidates_by_asset: dict[str, tuple[str, ...]],
                              history_days: int, decide):
         """One connect/auth/work/disconnect session for a full S011 cycle
-        across every resolved asset -- see the module docstring for why this
-        must be a single session/single `reactor.run()`, unlike S007's
-        one-symbol-per-cycle `run_live_cycle`.
+        across every resolved asset.
 
         Resolves every asset's broker symbol, fetches D1 bars + open
         positions + full contract metadata for the resolved set, then calls
           decide(daily_bars: dict[asset, DataFrame], positions: list[dict],
-                 balance: float, symbol_meta: dict[asset, ProtoOASymbol],
+                 balance: float, symbol_meta: dict[asset, dict],
                  last_price: dict[asset, float],
                  resolved: dict[asset, symbol_name]) -> list[action]
         (pure Python, no I/O) where each action is
@@ -322,54 +185,59 @@ class CTraderS011(CTraderAdapter):
           {"resolved", "unresolved", "daily_bars", "positions", "actions",
            "results", "balance"}.
 
+        `decide` runs INSIDE the session, so the target-book decision and the
+        resulting orders happen against the same broker state that was just
+        read -- no second connect/auth, and no window for the book to move in
+        between.
+
         `unresolved` (assets in candidates_by_asset with no broker match) is
         always returned, never silently dropped -- a paper/off cycle should
         still surface "S011 wanted 13 assets, broker only matched 11" so the
-        gap is visible before the demo/dry stage (see decisions-log.md's open
-        item on verifying the S011 universe against this broker's actual
-        symbol list).
+        gap is visible before the demo/dry stage.
+
+        An action the broker rejects is recorded in `results` with its
+        exception and does NOT abort the rest: one closed market must not cost
+        the other 11 instruments their cycle (see bot/s011_paper.py's
+        ALGODEV-34 note for how the caller then reverts that asset's state).
         """
-        def work(done):
-            @defer.inlineCallbacks
-            def flow():
-                yield self._load_symbols()
-                resolved = self._resolve_symbols_step(candidates_by_asset)
-                unresolved = sorted(set(candidates_by_asset) - set(resolved))
+        with self.client as broker:
+            resolved = broker.resolve_symbols(candidates_by_asset)
+            unresolved = sorted(set(candidates_by_asset) - set(resolved))
 
-                daily_bars: dict[str, pd.DataFrame] = {}
-                for asset, symbol in resolved.items():
-                    daily_bars[asset] = yield self._get_daily_step(symbol, history_days)
+            utc_bars = broker.get_trendbars_many(
+                list(resolved.values()), S011_BAR_PERIOD, history_days)
+            daily_bars = {asset: self._to_session_dates(utc_bars[symbol])
+                          for asset, symbol in resolved.items()}
 
-                balance = yield self._get_balance_step()
-                positions = yield self._reconcile_step()
+            balance = broker.get_balance()
+            positions = broker.get_open_positions()
 
-                symbol_ids = [self._symbols[s.upper()].symbolId for s in resolved.values()]
-                by_id = yield self._full_symbols_step(symbol_ids)
-                symbol_meta = {asset: by_id[self._symbols[symbol.upper()].symbolId]
-                              for asset, symbol in resolved.items()
-                              if self._symbols[symbol.upper()].symbolId in by_id}
-                last_price = {asset: price for asset, df in daily_bars.items()
-                             if (price := self._last_closed_price(df)) is not None}
+            details_by_symbol = broker.get_symbols_details(list(resolved.values()))
+            symbol_meta = {asset: details_by_symbol[symbol.upper()]
+                           for asset, symbol in resolved.items()
+                           if symbol.upper() in details_by_symbol}
+            last_price = {asset: price for asset, bars in daily_bars.items()
+                          if (price := self._last_closed_price(bars)) is not None}
 
-                actions = decide(daily_bars, positions, balance, symbol_meta, last_price, resolved)
+            actions = decide(daily_bars, positions, balance, symbol_meta,
+                             last_price, resolved)
 
-                results = []
-                for a in actions:
-                    try:
-                        if a["kind"] == "open":
-                            r = yield self._place_market_step(
-                                a["symbol"], a["side"], a["notional"],
-                                last_price[a["asset"]], a["label"],
-                                symbol_meta[a["asset"]])
-                        else:
-                            r = yield self._close_position_step(a["position_id"], a["volume"])
-                        results.append(dict(action=a, result=r, error=None))
-                    except Exception as e:
-                        results.append(dict(action=a, result=None, error=e))
+            results = []
+            for action in actions:
+                try:
+                    if action["kind"] == "open":
+                        outcome = broker.place_market_order(
+                            action["symbol"], action["side"],
+                            notional=action["notional"],
+                            notional_price=last_price[action["asset"]],
+                            label=action["label"], comment=ORDER_COMMENT)
+                    else:
+                        outcome = broker.close_position(action["position_id"],
+                                                        action["volume"])
+                    results.append(dict(action=action, result=outcome, error=None))
+                except Exception as error:
+                    results.append(dict(action=action, result=None, error=error))
 
-                return dict(resolved=resolved, unresolved=unresolved, daily_bars=daily_bars,
-                            positions=positions, actions=actions, results=results, balance=balance)
-
-            d = flow()
-            d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
-        return self._run(work)
+            return dict(resolved=resolved, unresolved=unresolved, daily_bars=daily_bars,
+                        positions=positions, actions=actions, results=results,
+                        balance=balance)

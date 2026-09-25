@@ -244,7 +244,8 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
                           allow_mainnet: bool = False, env: str | None = None,
                           history_days: int = HISTORY_DAYS,
                           candidates: dict[str, tuple[str, ...]] | None = None,
-                          ledger_file: Path | None = None) -> dict:
+                          ledger_file: Path | None = None,
+                          on_token_refreshed=None) -> dict:
     """One S011 daily cycle for an arbitrary account -- same
     never-raises / cycle_start-cycle_end-always-paired contract as
     bot/s009_paper.py::run_cycle_for_account, for the same reason (a future
@@ -272,6 +273,12 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
     `reports/paper_s011/ledger.csv` is a single-account-CLI artifact and a
     shared file across accounts would collide, exactly the S009 collision
     fixed 2026-08-08). `run_once` passes its own `LEDGER_FILE`.
+
+    `on_token_refreshed`: called with the renewed cTrader credential fields
+    when the broker client rotates an expired OAuth2 access token, so the
+    caller can persist them (webapp/runner.py::_token_persister). Passing
+    None still refreshes for THIS cycle -- the renewal is simply forgotten
+    afterwards, which is only safe for one-off CLI runs.
 
     Stale broker feed: when the newest D1 bar `decide` can see is BEHIND
     `_expected_last_closed_trading_date()`, the cycle is a logged no-op --
@@ -340,7 +347,7 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
         # documented "never raises" contract (see docstring above).
         from bot.ctrader_s011 import CTraderS011
 
-        client = CTraderS011(creds=creds)
+        client = CTraderS011(creds=creds, on_token_refreshed=on_token_refreshed)
         cand = candidates or CTRADER_SYMBOL_CANDIDATES
         # Captured by `decide` below via closure; `decide` runs INSIDE
         # run_live_cycle_multi's single session, so the target-book decision

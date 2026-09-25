@@ -38,6 +38,10 @@ def ctrader_credentials(username: str | None = None) -> dict[str, str | int | No
         client_id=yml.get("client_id") or cred("CTRADER_CLIENT_ID"),
         client_secret=yml.get("client_secret") or cred("CTRADER_CLIENT_SECRET"),
         access_token=yml.get("access_token") or cred("CTRADER_ACCESS_TOKEN"),
+        # OAuth2 refresh material -- optional, so a config that predates
+        # auto-refresh keeps working on its current access token alone.
+        refresh_token=yml.get("refresh_token") or cred("CTRADER_REFRESH_TOKEN"),
+        token_expires_at=yml.get("token_expires_at") or cred("CTRADER_TOKEN_EXPIRES_AT"),
         account_id=yml.get("account_id") or cred("CTRADER_ACCOUNT_ID"),
         host=cred("CTRADER_HOST"),
     )

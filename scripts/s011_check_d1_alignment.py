@@ -33,7 +33,9 @@ import pandas as pd
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
-from bot.ctrader_s011 import CTraderS011, HAVE_SDK                  # noqa: E402
+from bot.clients.ctrader.client import HAVE_SDK                     # noqa: E402
+from bot.config import ctrader_credentials                          # noqa: E402
+from bot.ctrader_s011 import CTraderS011                            # noqa: E402
 from bot.s011_paper import (                                        # noqa: E402
     CTRADER_SYMBOL_CANDIDATES, DEPLOY_UNIVERSE, HISTORY_DAYS,
 )
@@ -42,32 +44,6 @@ from strategies.rsi2 import BASELINE_RSI2, rsi2_signal              # noqa: E402
 SESSIONS_SHOWN = 20   # rows printed per asset; the FETCH window stays
                       # HISTORY_DAYS so RSI(2)'s trend_sma(200) is warmed up
                       # and `rsi2_held` is the real signal, not a warmup NaN
-
-
-class _D1AlignmentProbe(CTraderS011):
-    """Read-only subclass: one session, D1 bars for many symbols, nothing
-    else. Reuses the adapter's own `_load_symbols` / `_resolve_symbols_step`
-    / `_get_daily_step` (and therefore `_session_dated_index`) so this script
-    can never drift from what the live bot actually sees."""
-
-    def fetch_session_dated_bars(self, candidates_by_asset: dict[str, tuple[str, ...]],
-                                 days: int) -> tuple[dict[str, pd.DataFrame], dict[str, str], list[str]]:
-        from twisted.internet import defer
-
-        def work(done):
-            @defer.inlineCallbacks
-            def flow():
-                yield self._load_symbols()
-                resolved = self._resolve_symbols_step(candidates_by_asset)
-                unresolved = sorted(set(candidates_by_asset) - set(resolved))
-                bars_by_asset: dict[str, pd.DataFrame] = {}
-                for asset, symbol in resolved.items():
-                    bars_by_asset[asset] = yield self._get_daily_step(symbol, days)
-                return bars_by_asset, resolved, unresolved
-
-            d = flow()
-            d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
-        return self._run(work)
 
 
 def _load_backtest_universe() -> dict[str, pd.DataFrame]:
@@ -146,7 +122,7 @@ def main() -> None:
         sys.exit(f"unknown asset(s): {unknown} -- pick from {list(DEPLOY_UNIVERSE)}")
     candidates = {a: CTRADER_SYMBOL_CANDIDATES[a] for a in assets}
 
-    probe = _D1AlignmentProbe()
+    probe = CTraderS011(creds=ctrader_credentials())
     broker_bars, resolved, unresolved = probe.fetch_session_dated_bars(
         candidates, args.history_days)
     if unresolved:

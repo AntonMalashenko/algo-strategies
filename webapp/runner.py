@@ -148,6 +148,39 @@ def _close_position_db(session, acc: Account, strat: Strategy, label: str, reaso
         pos.closed_at = datetime.now(timezone.utc)
 
 
+def _ctrader_creds(acc: Account) -> dict:
+    """The cTrader credential dict every worker hands to the broker layer.
+
+    One implementation instead of a copy per worker, so a new credential
+    field (e.g. the OAuth2 refresh material) reaches all strategies at once.
+    """
+    creds_row = acc.credentials
+    return dict(
+        client_id=creds_row.get("client_id"),
+        client_secret=creds_row.get("client_secret"),
+        access_token=creds_row.get("access_token"),
+        refresh_token=creds_row.get("refresh_token"),
+        token_expires_at=creds_row.get("token_expires_at"),
+        account_id=int(acc.external_account_id) if acc.external_account_id else None,
+        host=acc.broker_host)
+
+
+def _token_persister(session, acc: Account):
+    """Callback the cTrader client invokes after renewing an access token.
+
+    Without it the refresh would be forgotten at the end of the cycle and the
+    next one would refresh again -- and, once the broker rotates the refresh
+    token, would refresh with a dead one. Committed immediately: a later crash
+    in the same cycle must not lose the new token.
+    """
+    def persist(refreshed: dict) -> None:
+        acc.credentials = {**acc.credentials, **refreshed}
+        session.commit()
+        print(f"[runner] account {acc.id}: cTrader access token refreshed, "
+              f"valid until {refreshed.get('token_expires_at')}")
+    return persist
+
+
 def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
     """Run one S007/CTRADER cycle for one (account, strategy) DB row.
 
@@ -197,11 +230,7 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
         session.close()
         return 0
 
-    creds_row = acc.credentials
-    creds = dict(client_id=creds_row.get("client_id"), client_secret=creds_row.get("client_secret"),
-                access_token=creds_row.get("access_token"),
-                account_id=int(acc.external_account_id) if acc.external_account_id else None,
-                host=acc.broker_host)
+    creds = _ctrader_creds(acc)
 
     logger = StrategyLogger(f"S007-acct{acc.external_account_id or acc.id}",
                             log_root=str(ROOT / "reports" / "logs"))
@@ -403,11 +432,7 @@ def _worker_s011(link: AccountStrategy, session, budget_s: float | None) -> int:
     broker_mode = link.broker_mode or "off"
     allow_mainnet = broker_mode == "execute" and acc.env == "live"
 
-    creds_row = acc.credentials
-    creds = dict(client_id=creds_row.get("client_id"), client_secret=creds_row.get("client_secret"),
-                access_token=creds_row.get("access_token"),
-                account_id=int(acc.external_account_id) if acc.external_account_id else None,
-                host=acc.broker_host)
+    creds = _ctrader_creds(acc)
     logger = StrategyLogger(f"S011-acct{acc.external_account_id or acc.id}",
                             log_root=str(ROOT / "reports" / "logs"))
     state = DBStateStore(link.id, session)
@@ -421,7 +446,8 @@ def _worker_s011(link: AccountStrategy, session, budget_s: float | None) -> int:
     # ledger_file omitted on purpose -- DB path, see run_cycle_for_account docstring
     result = run_s011_cycle(
         account_key=acc.label or f"acct{acc.id}", creds=creds, cfg=DEPLOY, state=state,
-        logger=logger, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env)
+        logger=logger, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env,
+        on_token_refreshed=_token_persister(session, acc))
 
     ok = True
     if result["error"]:

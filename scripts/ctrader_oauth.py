@@ -38,26 +38,33 @@ this can't be done headlessly):
     python -m scripts.ctrader_oauth exchange --code PASTE_CODE_HERE \
         --redirect-uri http://localhost/
 
-    # exchange prints the new token(s) and asks before overwriting
+    # exchange prints the new tokens. --write updates
     # configs/accounts.yml's CTRADER.ACCESS_TOKEN in place (that file is
-    # gitignored -- see .gitignore:31 -- never committed).
+    # gitignored -- see .gitignore:31 -- never committed); --db-account
+    # updates the encrypted credentials of one webapp Account, which is what
+    # the live runner actually reads.
+
+Storing the refresh token is what lets the bot renew its own access token
+from then on (bot/clients/ctrader/auth.py), so the CH_ACCESS_TOKEN_INVALID
+outage that cost S011 2026-09-21..22 cannot repeat. Prefer --db-account for
+any account the runner drives.
+
+The OAuth2 protocol itself lives in bot/clients/ctrader/auth.py -- this
+script is only the human-in-the-loop front end for it, so there is exactly
+one implementation of the token endpoints.
 """
 from __future__ import annotations
 
 import argparse
 import re
 import sys
-import urllib.parse
 from pathlib import Path
-
-import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from bot import config as C  # noqa: E402
+from bot.clients.ctrader import auth  # noqa: E402
 
-AUTH_URL = "https://id.ctrader.com/my/settings/openapi/grantingaccess/"
-TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 ACCOUNTS_YML = ROOT / "configs" / "accounts.yml"
 
 
@@ -71,53 +78,79 @@ def _creds() -> dict:
 
 def cmd_auth_url(args: argparse.Namespace) -> None:
     creds = _creds()
-    qs = urllib.parse.urlencode({
-        "client_id": creds["client_id"],
-        "redirect_uri": args.redirect_uri,
-        "scope": "trading",
-        "product": "web",
-    })
-    print(f"{AUTH_URL}?{qs}")
+    print(auth.authorization_url(creds["client_id"], args.redirect_uri))
     print("\nOpen this URL, log in, approve -- then copy the `code` query "
           "param from the redirect URL (the page itself can 404, that's fine). "
           "The authorization code expires in 1 minute -- run `exchange` right away.")
 
 
-def cmd_exchange(args: argparse.Namespace) -> None:
-    creds = _creds()
-    resp = requests.get(TOKEN_URL, params={
-        "grant_type": "authorization_code",
-        "code": args.code,
-        "redirect_uri": args.redirect_uri,
-        "client_id": creds["client_id"],
-        "client_secret": creds["client_secret"],
-    }, headers={"Accept": "application/json"}, timeout=20)
-    body = resp.json()
-    if resp.status_code != 200 or "accessToken" not in body or body.get("errorCode"):
-        print(f"Token exchange failed (HTTP {resp.status_code}): {body}", file=sys.stderr)
-        raise SystemExit(1)
+def _write_accounts_yml(old_token: str, new_token: str) -> None:
+    """Replace the ACCESS_TOKEN value in configs/accounts.yml in place.
 
-    access_token = body["accessToken"]
-    refresh_token = body.get("refreshToken")
-    print(f"access_token:  {access_token}")
-    if refresh_token:
-        print(f"refresh_token: {refresh_token}  (not currently used by bot/ctrader.py -- "
-              f"no auto-refresh wired up, this is FYI/future use only)")
-
-    if not args.write:
-        print("\n(--write not passed -- configs/accounts.yml left untouched)")
-        return
-
+    Only the access token: accounts.yml is the single-account CLI path, and
+    bot/config.py reads REFRESH_TOKEN/TOKEN_EXPIRES_AT from it only if they
+    are already present, so adding them is a manual edit by design (we do
+    not want this script inventing YAML structure in a hand-maintained file).
+    """
     text = ACCOUNTS_YML.read_text()
-    old_token = str(creds["access_token"])
     pattern = re.compile(r"(ACCESS_TOKEN:\s*)" + re.escape(old_token))
-    new_text, n = pattern.subn(r"\g<1>" + access_token, text, count=1)
-    if n != 1:
+    new_text, replacements = pattern.subn(r"\g<1>" + new_token, text, count=1)
+    if replacements != 1:
         print(f"\nCould not find the old ACCESS_TOKEN value in {ACCOUNTS_YML} to replace "
-              f"(expected exactly 1 match, found {n}) -- update it manually.", file=sys.stderr)
+              f"(expected exactly 1 match, found {replacements}) -- update it manually.",
+              file=sys.stderr)
         raise SystemExit(1)
     ACCOUNTS_YML.write_text(new_text)
     print(f"\nWrote new access_token into {ACCOUNTS_YML}")
+
+
+def _write_db_account(account_id: int, bundle: auth.TokenBundle) -> None:
+    """Store the whole bundle in one webapp Account's encrypted credentials.
+
+    This is the path that matters for a scheduled bot: the runner reads
+    credentials from the DB, and persisting the refresh token here is what
+    enables unattended renewal from the next cycle onward.
+    """
+    from webapp.db import get_session
+    from webapp.models import Account
+
+    session = get_session()
+    try:
+        account = session.get(Account, account_id)
+        if account is None:
+            raise SystemExit(f"no Account with id={account_id} in the database")
+        if account.broker != "CTRADER":
+            raise SystemExit(f"Account id={account_id} is broker={account.broker}, not CTRADER")
+        account.credentials = {**account.credentials, **bundle.as_credentials()}
+        session.commit()
+        print(f"\nStored access + refresh token for Account id={account_id} "
+              f"({account.label or account.external_account_id}), "
+              f"valid until {bundle.expires_at.isoformat()}")
+    finally:
+        session.close()
+
+
+def cmd_exchange(args: argparse.Namespace) -> None:
+    creds = _creds()
+    try:
+        bundle = auth.exchange_authorization_code(
+            creds["client_id"], creds["client_secret"],
+            code=args.code, redirect_uri=args.redirect_uri)
+    except auth.TokenRefreshError as error:
+        print(f"Token exchange failed: {error}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print(f"access_token:  {bundle.access_token}")
+    print(f"refresh_token: {bundle.refresh_token}")
+    print(f"expires_at:    {bundle.expires_at.isoformat()}")
+
+    if args.db_account is not None:
+        _write_db_account(args.db_account, bundle)
+    if args.write:
+        _write_accounts_yml(str(creds["access_token"]), bundle.access_token)
+    if args.db_account is None and not args.write:
+        print("\n(neither --db-account nor --write passed -- nothing was stored; "
+              "the refresh token above is what enables auto-renewal, so store it)")
 
 
 if __name__ == "__main__":
@@ -133,6 +166,9 @@ if __name__ == "__main__":
     p2.add_argument("--redirect-uri", required=True)
     p2.add_argument("--write", action="store_true",
                      help="overwrite configs/accounts.yml's ACCESS_TOKEN in place")
+    p2.add_argument("--db-account", type=int,
+                     help="webapp Account id whose encrypted credentials to update "
+                          "(the path the scheduled runner actually reads)")
     p2.set_defaults(func=cmd_exchange)
 
     args = ap.parse_args()

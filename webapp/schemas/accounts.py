@@ -27,6 +27,15 @@ class CtraderCredentials(BaseModel):
     client_id: str = Field(min_length=1)
     client_secret: str = Field(min_length=1)
     access_token: str = Field(min_length=1)
+    # OAuth2 refresh material, written back by the runner whenever the client
+    # renews the access token. Optional because accounts authorised before
+    # auto-refresh existed only have an access token, and must keep running
+    # until they are re-authorised.
+    refresh_token: str | None = None
+    # ISO-8601 UTC instant at which access_token expires. Absent means
+    # "unknown", which the client deliberately treats as already expired so it
+    # refreshes once and records a real expiry from then on.
+    token_expires_at: str | None = None
 
 
 class BybitCredentials(BaseModel):

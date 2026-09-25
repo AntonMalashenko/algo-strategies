@@ -139,12 +139,18 @@ def add_account(request: Request, broker: str = Form(...), env: str = Form(...),
                 external_account_id: str = Form(""), label: str = Form(""),
                 broker_host: str = Form(""), initial_balance: str = Form(""),
                 client_id: str = Form(""), client_secret: str = Form(""), access_token: str = Form(""),
+                refresh_token: str = Form(""),
                 api_key: str = Form(""), api_secret: str = Form(""),
                 db=Depends(get_db)):
     u = current_user(request, db)
     if not u:
         return _redirect("/login")
-    creds = (dict(client_id=client_id, client_secret=client_secret, access_token=access_token)
+    # refresh_token is optional on purpose: an account can be added with only
+    # an access token (it just cannot auto-renew until one is stored -- see
+    # scripts/ctrader_oauth.py --db-account). token_expires_at is not asked
+    # for; the client records it on the first refresh.
+    creds = (dict(client_id=client_id, client_secret=client_secret,
+                  access_token=access_token, refresh_token=refresh_token or None)
              if broker == Broker.CTRADER.value
              else dict(api_key=api_key, api_secret=api_secret))
     try:
