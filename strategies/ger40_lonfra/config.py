@@ -50,10 +50,72 @@ class StrategyConfig:
 
     # --- stop ---
     # 'mid_range'  : wide common non-trailing stop (B->mid 0.5, A->opposite bound)
-    # 'last_swing' : per-position stop behind last confirmed swing (trails)
+    # 'last_swing' : per-position stop behind last confirmed swing (trails).
+    #                TESTED 2026-09-23 against the CURRENT live TP logic
+    #                (tp_mode="liquidity") -- REJECTED, see
+    #                last_swing_buffer_points' comment below for the numbers.
     # 'prev_swing' : behind the previous swing (a bit wider)
     # 'prev_fvg'   : behind last opposite 1M FVG zone (wider)
     stop_mode: str = "mid_range"
+
+    # last_swing_buffer_points (2026-09-23, Anton: "стоп меняем с mid_range на
+    # last_swing, чтобы не вставать стопом ровно на хвосте свинга"):
+    # stop_mode="last_swing" places each position's stop EXACTLY at the last
+    # confirmed structural swing extreme (L["last_sl"]/L["last_sh"]) -- a wick
+    # that merely retouches that precise level (without breaking structure)
+    # stops the position out anyway. This buffer pushes the stop this many RAW
+    # engine points further AWAY from entry (deeper, more risk): last_sl -
+    # buffer for a long, last_sh + buffer for a short -- same "make it a few
+    # points past the raw level" idea as breakeven_offset_points above, applied
+    # to the stop side instead of the breakeven side.
+    # Only meaningful when stop_mode="last_swing" (pick_stop applies it only to
+    # the swing candidate itself, never to the mid_range/range_stop fallback
+    # used when the swing level is unavailable/invalid that bar -- a wide
+    # fallback stop doesn't need a wick buffer). 0.0 (default) == the exact
+    # swing-extreme stop, base untouched.
+    # TESTED 2026-09-23 (Anton's request; backtest/run_s007_last_swing_stop.py,
+    # Dukascopy 2023-06-26..2026-08-11) -- REJECTED, decisively, not a close
+    # call. Base for the comparison: the LIVE preset
+    # (WORKING_S007_NEWSSAFE_MAX8_BE05_OFF2), stop_mode switched from
+    # mid_range to last_swing with the buffer swept 0/1/2/3/5pt, TP and
+    # everything else held fixed. Gate 2 net (real spread 0.635/side):
+    #   mid_range (current live)         net +1.6287R/day  maxDD  -17.0R  worst_yr +159.1
+    #   last_swing buf=0.0               net +0.0053R/day  maxDD -153.2R  worst_yr  -90.9
+    #   last_swing buf=1.0 (best of 5)   net +0.0720R/day  maxDD -136.5R  worst_yr  -89.1
+    #   last_swing buf=2.0               net +0.0247R/day  maxDD -141.2R  worst_yr  -91.4
+    #   last_swing buf=3.0               net +0.0378R/day  maxDD -134.9R  worst_yr  -76.6
+    #   last_swing buf=5.0               net -0.0142R/day  maxDD -133.1R  worst_yr  -70.3
+    # Every last_swing variant loses >95% of net R/day vs mid_range (best case
+    # buf=1.0 at +0.072 vs +1.629), multiplies maxDD 8-9x, and turns 2023/2024
+    # net-negative outright (2023 -2..-34R, 2024 -70..-91R per buffer, vs
+    # mid_range's +174/+329) while mid_range is positive every year. Already
+    # visible gross (Gate 1, no spread): mid_range +2.034R/day vs last_swing's
+    # best +0.620R/day -- this is not a costs artifact.
+    # DIRECT ANSWER to "does the new stop get hit more or less often":
+    # last_swing stops MORE, not less -- 78-82% of positions across the sweep
+    # vs mid_range's 69.5% (+441 to +641 more stopped positions out of ~5050-
+    # 5068 total). Mechanism: last_swing is a TIGHT per-position stop right
+    # behind that position's own most recent structural swing, so ordinary
+    # pyramiding-leg retracement (the pullback that arms the NEXT add, by
+    # design -- see sec 6 do_pyramid) routinely tags the stop of an already-
+    # open add before the trend resumes; mid_range's wide, shared, non-
+    # trailing stop (0.5 or the opposite boundary) simply isn't there to hit
+    # on a normal pullback. This reproduces, on the current live TP logic for
+    # the first time, the same verdict strategy-spec-S007.md sec 4/11 already
+    # recorded for individual per-position stops in general ("ALL worse than
+    # the common stop, from ~0/-180R DD to -1.0R/-833R DD") -- last_swing was
+    # the one individual-stop mode already in this engine but never actually
+    # benchmarked against tp_mode="liquidity" (its only prior use was
+    # REF_PYRAMID_DUKA, a byte-for-byte regression reproduction on
+    # tp_mode="range", not a profitability read); this closes that gap.
+    # Within the last_swing family itself, buf=1.0 is the least-bad value on
+    # both Gate 1 and Gate 2 (small, non-monotonic effect -- buf=5.0 is worse
+    # than buf=3.0 despite being further from 0.0), but this does not rescue
+    # it: even the best buffer is a ~96% expectancy cut against the live stop.
+    # No preset added for this -- REJECTED outright, nothing here is a
+    # deployment candidate. stop_mode stays "mid_range" everywhere in this
+    # file; 0.0 (default) == base untouched.
+    last_swing_buffer_points: float = 0.0
 
     # move a position's own stop to its own entry (breakeven) once price has
     # moved cfg.breakeven_at_r * that position's OWN risk (|entry-stop0| at

@@ -26,14 +26,22 @@ from .structure import structure_levels
 BE_OFFSET_MIN_GAP_POINTS = 1.0
 
 
-def pick_stop(mode, t, entry, up, L, range_stop):
+def pick_stop(mode, t, entry, up, L, range_stop, last_swing_buffer_points=0.0):
     def ok(v):
         return (not np.isnan(v)) and ((up and v < entry) or ((not up) and v > entry))
 
     if mode == "mid_range":
         return range_stop
     if mode == "last_swing":
-        chain = [L["last_sl"][t] if up else L["last_sh"][t]]
+        # last_swing_buffer_points (see StrategyConfig): push the stop this
+        # many points further AWAY from entry than the raw swing extreme, so
+        # a wick that only retouches the exact level doesn't tag the stop.
+        # Applied to the swing candidate only -- NOT to the range_stop
+        # fallback a few lines down, which is a different (already wide) stop.
+        lvl = L["last_sl"][t] if up else L["last_sh"][t]
+        if ok(lvl):
+            return lvl - last_swing_buffer_points if up else lvl + last_swing_buffer_points
+        return range_stop
     elif mode == "prev_swing":
         chain = [L["prev_sl"][t] if up else L["prev_sh"][t],
                  L["last_sl"][t] if up else L["last_sh"][t]]
@@ -128,7 +136,8 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
     additive/diagnostic: exit_idx feeds no R/cost calculation, so this cannot
     change any existing backtest number."""
     n = len(closes)
-    stop0 = pick_stop(cfg.stop_mode, start_idx, e_price, up, L, range_stop)
+    stop0 = pick_stop(cfg.stop_mode, start_idx, e_price, up, L, range_stop,
+                      last_swing_buffer_points=cfg.last_swing_buffer_points)
     if buffer > 0 and abs(e_price - stop0) < buffer:
         return None, False
     positions = [dict(entry=e_price, stop=stop0, status="open", exit=None,
@@ -243,7 +252,8 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
                             and abs(lvl - armed_price) < swing_buffer):
                         armed = False  # ignore micro-CHoCH; wait for a fresh pullback+break
                     elif (up and c < tp) or ((not up) and c > tp):
-                        st = pick_stop(cfg.stop_mode, t, c, up, L, range_stop)
+                        st = pick_stop(cfg.stop_mode, t, c, up, L, range_stop,
+                                       last_swing_buffer_points=cfg.last_swing_buffer_points)
                         if buffer > 0 and abs(c - st) < buffer:
                             continue
                         positions.append(dict(entry=c, stop=st, status="open",

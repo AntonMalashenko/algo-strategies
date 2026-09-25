@@ -33,6 +33,13 @@ from scripts.s007_tick import (  # noqa: E402
     _has_event_today, _parse_status_line, in_session, run_cycle, tick,
 )
 from utils.trade_logger import StrategyLogger  # noqa: E402
+from bot import s007_config as S007_C  # noqa: E402
+
+# in_session()'s window is derived from the live config, not restated here --
+# EXIT_END tracks the deployed preset's exit_end (it moved 16:59 -> 14:24 when
+# S007 went news-safe), and a hardcoded hour in this suite silently rots into
+# a false failure the next time that value changes.
+_LAST_SESSION_HOUR = int(S007_C.EXIT_END.split(":")[0])
 
 
 def _dt(y, m, d, hh, mm):
@@ -59,11 +66,11 @@ def test_in_session_false_before_trade_start():
 
 
 def test_in_session_true_at_exit_end_hour():
-    assert in_session(_dt(2026, 7, 22, 16, 59)) is True    # EXIT_END="16:59"
+    assert in_session(_dt(2026, 7, 22, _LAST_SESSION_HOUR, 59)) is True
 
 
 def test_in_session_false_after_exit_end_hour():
-    assert in_session(_dt(2026, 7, 22, 17, 0)) is False
+    assert in_session(_dt(2026, 7, 22, _LAST_SESSION_HOUR + 1, 0)) is False
 
 
 # --- _has_event_today ---------------------------------------------------------
