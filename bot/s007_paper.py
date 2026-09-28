@@ -173,56 +173,26 @@ def check():
     print(f"OK: symbol resolved to '{sym}'. Connection + auth working.")
 
 
-def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, fixed_lot: float,
-                          use_fixed_lot: bool, magic: str, logger: StrategyLogger,
-                          symbol_candidates=None, history_days: int | None = None,
-                          daily_risk_cap_pct: float | None = None, fx_rate: float | None = None,
-                          stop_flag_active=None, initial_balance: float | None = None) -> dict:
-    """One S007 reconcile cycle for an arbitrary account, reusing the exact
-    decide()/reconcile logic `live()` below uses for the single .env/
-    accounts.yml-configured account -- so a DB-registered multi-account run
-    (webapp/runner.py) and the original single-account CLI can never drift
-    apart into two competing implementations of the same trading rules.
+def make_decide(*, preset: str, magic: str, risk_pct: float, fixed_lot: float,
+                use_fixed_lot: bool, daily_risk_cap_pct: float, fx_rate: float,
+                initial_balance: float | None, logger: StrategyLogger,
+                stop_flag_active, cid: str, status_info: dict):
+    """Build the pure decision step used by EVERY S007 execution path.
 
-    `creds`: same shape CTraderS007(creds=...) expects (client_id,
-    client_secret, access_token, account_id, host), or None to fall back to
-    CTraderAdapter's own .env/accounts.yml single-account resolution (what
-    `live()` below still does, unchanged).
+    Extracted from run_cycle_for_account (2026-09-25) so a second, non-order-
+    placing consumer -- the paper-trading daemon (scripts/s007_daemon.py,
+    ALGODEV-45 step 3) -- can run the byte-identical decision logic instead of
+    reimplementing it. The returned closure is unchanged in behaviour: what
+    used to be captured from the enclosing cycle is now passed in explicitly,
+    and `status_info` is still the caller-owned dict decide() writes the
+    cycle's day_done/in_window/filtered/manual_stop verdict into.
 
-    symbol_candidates/history_days/daily_risk_cap_pct/fx_rate default to
-    bot.s007_config (C) when omitted -- override only where a specific
-    account genuinely differs (none do yet). stop_flag_active defaults to
-    "never stopped" (no per-account manual kill-switch file exists yet;
-    the module-level STOP_FLAG below is single-account-only by design).
-
-    `initial_balance` (ALGODEV-37): the fixed number decide()'s $ risk cap
-    is computed against -- webapp/runner.py::_worker_s007 passes the DB's
-    AccountStrategy.initial_balance (never the broker's live balance) so
-    the cap is one stable value all day, not something that (before this)
-    got smaller as the day's losses reduced the broker-reported balance,
-    letting daily_risk_cap_pct silently mean less risk budget than
-    intended after a losing stretch. None (the live()/CLI default, no DB
-    row) falls back to the broker's live balance, unchanged from before.
-
-    Returns dict(cycle_id, actions, error, day_done, in_window, filtered,
-    manual_stop) -- actions is a list of dicts, each one of
-    {kind: "open", label, side, entry, sl, tp, is_add, volume_lots},
-    {kind: "close", label, reason} or
-    {kind: "amend", label, sl, prev_sl} (ALGODEV-37 breakeven stop move).
-    `error` is None on success or a short
-    repr() of the exception that ended the cycle early.
+    Keeping ONE decide() is the same single-source-of-truth rule that made
+    run_cycle_for_account itself shared between the CLI and the DB-driven
+    runner (see its docstring): the live bot, the backtest engine reused via
+    plan_now, and the paper daemon must never drift into competing
+    implementations of the same trading rules.
     """
-    from bot.ctrader_s007 import CTraderS007
-    symbol_candidates = symbol_candidates or C.SYMBOL_CANDIDATES
-    history_days = history_days or C.HISTORY_DAYS
-    daily_risk_cap_pct = C.DAILY_RISK_CAP_PCT if daily_risk_cap_pct is None else daily_risk_cap_pct
-    fx_rate = C.EUR_TO_USD_FX_RATE_APPROX if fx_rate is None else fx_rate
-    stop_flag_active = stop_flag_active or (lambda: False)
-
-    cid = logger.cycle_start(mode="live", preset=preset)
-    actions_taken: list[dict] = []
-    status_info: dict = {}
-
     def decide(symbol, m1, broker_positions, balance, money_per_point_per_lot,
                closed_deals=None):
         """Pure decision step (no I/O): plan_now() + diff against what the
@@ -551,6 +521,64 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                                 sl=amend_sl, tp=p.get("take_profit"),
                                 prev_sl=cur_sl))
         return out
+    return decide
+
+
+def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, fixed_lot: float,
+                          use_fixed_lot: bool, magic: str, logger: StrategyLogger,
+                          symbol_candidates=None, history_days: int | None = None,
+                          daily_risk_cap_pct: float | None = None, fx_rate: float | None = None,
+                          stop_flag_active=None, initial_balance: float | None = None) -> dict:
+    """One S007 reconcile cycle for an arbitrary account, reusing the exact
+    decide()/reconcile logic `live()` below uses for the single .env/
+    accounts.yml-configured account -- so a DB-registered multi-account run
+    (webapp/runner.py) and the original single-account CLI can never drift
+    apart into two competing implementations of the same trading rules.
+
+    `creds`: same shape CTraderS007(creds=...) expects (client_id,
+    client_secret, access_token, account_id, host), or None to fall back to
+    CTraderAdapter's own .env/accounts.yml single-account resolution (what
+    `live()` below still does, unchanged).
+
+    symbol_candidates/history_days/daily_risk_cap_pct/fx_rate default to
+    bot.s007_config (C) when omitted -- override only where a specific
+    account genuinely differs (none do yet). stop_flag_active defaults to
+    "never stopped" (no per-account manual kill-switch file exists yet;
+    the module-level STOP_FLAG below is single-account-only by design).
+
+    `initial_balance` (ALGODEV-37): the fixed number decide()'s $ risk cap
+    is computed against -- webapp/runner.py::_worker_s007 passes the DB's
+    AccountStrategy.initial_balance (never the broker's live balance) so
+    the cap is one stable value all day, not something that (before this)
+    got smaller as the day's losses reduced the broker-reported balance,
+    letting daily_risk_cap_pct silently mean less risk budget than
+    intended after a losing stretch. None (the live()/CLI default, no DB
+    row) falls back to the broker's live balance, unchanged from before.
+
+    Returns dict(cycle_id, actions, error, day_done, in_window, filtered,
+    manual_stop) -- actions is a list of dicts, each one of
+    {kind: "open", label, side, entry, sl, tp, is_add, volume_lots},
+    {kind: "close", label, reason} or
+    {kind: "amend", label, sl, prev_sl} (ALGODEV-37 breakeven stop move).
+    `error` is None on success or a short
+    repr() of the exception that ended the cycle early.
+    """
+    from bot.ctrader_s007 import CTraderS007
+    symbol_candidates = symbol_candidates or C.SYMBOL_CANDIDATES
+    history_days = history_days or C.HISTORY_DAYS
+    daily_risk_cap_pct = C.DAILY_RISK_CAP_PCT if daily_risk_cap_pct is None else daily_risk_cap_pct
+    fx_rate = C.EUR_TO_USD_FX_RATE_APPROX if fx_rate is None else fx_rate
+    stop_flag_active = stop_flag_active or (lambda: False)
+
+    cid = logger.cycle_start(mode="live", preset=preset)
+    actions_taken: list[dict] = []
+    status_info: dict = {}
+
+    decide = make_decide(
+        preset=preset, magic=magic, risk_pct=risk_pct, fixed_lot=fixed_lot,
+        use_fixed_lot=use_fixed_lot, daily_risk_cap_pct=daily_risk_cap_pct,
+        fx_rate=fx_rate, initial_balance=initial_balance, logger=logger,
+        stop_flag_active=stop_flag_active, cid=cid, status_info=status_info)
 
     # CTraderS007() is constructed OUTSIDE the try below, deliberately: its
     # __init__ loads credentials before any broker call. A malformed

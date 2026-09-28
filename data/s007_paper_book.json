@@ -1,0 +1,79 @@
+{
+  "balance": 9041.760354075002,
+  "initial_balance": 9185.23,
+  "money_per_point_per_lot": 114.27000000000001,
+  "next_position_id": 900000005,
+  "positions": {},
+  "closed": [
+    {
+      "label": "S007:2026-09-28:0",
+      "position_id": 900000000,
+      "side": "buy",
+      "entry_price": 25490.4,
+      "exit_price": 25431.5,
+      "volume_lots": 0.01,
+      "stop_loss": 25431.5,
+      "take_profit": 25532.299999999996,
+      "opened_ts": "2026-09-28 10:01:00",
+      "reason": "stop_loss",
+      "pnl": -67.31,
+      "balance_after": 9117.92
+    },
+    {
+      "label": "S007:2026-09-28:3",
+      "position_id": 900000001,
+      "side": "sell",
+      "entry_price": 25431.5,
+      "exit_price": 25429.5,
+      "volume_lots": 0.01,
+      "stop_loss": 25429.5,
+      "take_profit": 25397.9,
+      "opened_ts": "2026-09-28 10:04:00",
+      "reason": "stop_loss",
+      "pnl": 2.29,
+      "balance_after": 9120.21
+    },
+    {
+      "label": "S007:2026-09-28:36",
+      "position_id": 900000003,
+      "side": "buy",
+      "entry_price": 25438.4,
+      "exit_price": 25431.5,
+      "volume_lots": 0.028917686594038258,
+      "stop_loss": 25431.5,
+      "take_profit": 25532.299999999996,
+      "opened_ts": "2026-09-28 10:36:00",
+      "reason": "stop_loss",
+      "pnl": -22.8,
+      "balance_after": 9097.41
+    },
+    {
+      "label": "S007:2026-09-28:40",
+      "position_id": 900000004,
+      "side": "buy",
+      "entry_price": 25440.9,
+      "exit_price": 25440.9,
+      "volume_lots": 0.021173745468630635,
+      "stop_loss": 25440.9,
+      "take_profit": 25532.299999999996,
+      "opened_ts": "2026-09-28 10:40:00",
+      "reason": "stop_loss",
+      "pnl": 0.0,
+      "balance_after": 9097.41
+    },
+    {
+      "label": "S007:2026-09-28:21",
+      "position_id": 900000002,
+      "side": "sell",
+      "entry_price": 25416.4,
+      "exit_price": 25465.1,
+      "volume_lots": 0.01,
+      "stop_loss": 25465.1,
+      "take_profit": 25397.9,
+      "opened_ts": "2026-09-28 10:21:00",
+      "reason": "stop_loss",
+      "pnl": -55.65,
+      "balance_after": 9041.76
+    }
+  ]
+}

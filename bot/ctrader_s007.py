@@ -889,4 +889,14 @@ class CTraderS007(CTraderAdapter):
         return dict(symbol=symbol, balance=balance,
                     n_bars=len(m1), last_bar=str(m1.index[-1]) if len(m1) else None,
                     n_positions=len(positions), n_closed_deals=len(closed_deals),
-                    lot_size=full_symbol.lotSize, timings=timings)
+                    lot_size=full_symbol.lotSize, timings=timings,
+                    # Raw payload for ALGODEV-45 step 3's paper daemon, which
+                    # has to feed the real m1/lotSize into decide(). Kept
+                    # alongside (not instead of) the summary counts above so
+                    # the existing step-2 shadow logging is unchanged, and
+                    # deliberately NOT logged by the caller -- a DataFrame in
+                    # events-<date>.jsonl would be unreadable and enormous.
+                    # Adding data to a READ result cannot make this method any
+                    # less read-only: there is still no path from here to any
+                    # order-sending call.
+                    m1=m1, positions=positions, closed_deals=closed_deals)

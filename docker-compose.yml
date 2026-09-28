@@ -66,6 +66,16 @@ services:
   # safety invariant (still read-only, still never places an order, see that
   # script's SAFETY INVARIANT comment).
   #
+  # ALGODEV-45 step 3 (2026-09-25): the daemon now runs with `--paper`, i.e.
+  # it executes the REAL strategy decisions against a VIRTUAL book
+  # (data/s007_paper_book.json, on the bind mount below so it survives the
+  # restarts this policy will cause) and records the trades under
+  # reports/logs/S007-paper/. The safety invariant is unchanged: still no
+  # code path from this container to a broker order -- the paper book stands
+  # in for the broker, and tests/test_s007_paper_book.py asserts that as a
+  # test, not as a comment. Drop the flag to go back to the step-2 read-only
+  # observer.
+  #
   # account-strategy-id 1 = S007's only registered AccountStrategy row
   # (Bybit/cTrader ctrader-47939312, demo) -- hardcoded here the same way
   # webapp/runner.py's per-strategy dispatch is a property of the deployment,
@@ -73,7 +83,7 @@ services:
   # design, see its module docstring).
   s007-daemon:
     image: algo-worker:latest
-    command: python -m scripts.s007_daemon --account-strategy-id 1
+    command: python -m scripts.s007_daemon --account-strategy-id 1 --paper
     restart: unless-stopped
     environment:
       - APP_SECRET_KEY=${APP_SECRET_KEY}
