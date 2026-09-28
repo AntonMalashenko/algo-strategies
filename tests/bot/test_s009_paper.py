@@ -515,3 +515,60 @@ def test_wallet_equity_timeout_skips_broker_block_without_failing_the_cycle(tmp_
     sync_fail = [e for e in _read_events(tmp_path) if e["kind"] == "broker_sync_failed"]
     assert len(sync_fail) == 1
     assert sync_fail[0]["call"] == "wallet_equity"
+
+
+# --- target sizing: nearest-step rounding + sub-minimum target logging ----
+
+def test_coarse_step_leg_rounds_to_nearest_instead_of_vanishing(tmp_path):
+    """Live 2026-09-28: SUIUSDT (qty_step=10) wanted +8.9 units while short
+    20; flooring the target to 0 made the cycle buy only 20 (flat) and the
+    +3.9% long leg never existed. Nearest-step rounding targets +10."""
+    client = _FakeReconcileClient(
+        positions={"SUIUSDT": -20.0}, prices={"SUIUSDT": 1.262},
+        instruments={"SUIUSDT": _instr(qty_step=10.0, min_qty=10.0, min_notional=5.0)})
+    plan = s009.reconcile_to_target(client, {"SUIUSDT": 0.0388}, equity=289.0,
+                                    log=_log(tmp_path), cid="c1", execute=True)
+    assert client.placed == [("SUIUSDT", "Buy", 30.0)]
+    assert plan[0]["target_qty"] == 10.0
+
+
+def test_exact_step_multiple_target_is_not_under_rounded_by_float_noise(tmp_path):
+    """24.2 / 0.1 == 241.99999999999997 -- flooring gave 24.1 (the 2026-08-09
+    ATOM dust class of bug); the target must be exactly 24.2."""
+    client = _FakeReconcileClient(
+        positions={}, prices={"ATOMUSDT": 1.0},
+        instruments={"ATOMUSDT": _instr(qty_step=0.1, min_qty=0.1, min_notional=0.0)})
+    s009.reconcile_to_target(client, {"ATOMUSDT": 0.242}, equity=100.0,
+                             log=_log(tmp_path), cid="c1", execute=True)
+    assert client.placed == [("ATOMUSDT", "Buy", 24.2)]
+
+
+def test_sub_minimum_target_is_logged_even_when_the_delta_is_large(tmp_path):
+    """A leg whose target is below the exchange minimum used to be logged
+    only when the delta was small too -- reversing a large opposite position
+    into it went through silently. It must emit skip_min_qty and still
+    close the old position (the target really is flat)."""
+    client = _FakeReconcileClient(
+        positions={"SUIUSDT": -20.0}, prices={"SUIUSDT": 1.262},
+        instruments={"SUIUSDT": _instr(qty_step=10.0, min_qty=10.0, min_notional=5.0)})
+    s009.reconcile_to_target(client, {"SUIUSDT": 0.01}, equity=289.0,   # ~2.3 units -> 0
+                             log=_log(tmp_path), cid="c1", execute=True)
+    assert client.placed == [("SUIUSDT", "Buy", 20.0)]
+    skips = [e for e in _read_events(tmp_path) if e["kind"] == "skip_min_qty"]
+    assert len(skips) == 1
+    assert skips[0]["symbol"] == "SUIUSDT" and skips[0]["cur_qty"] == -20.0
+
+
+# --- cycle mode label ------------------------------------------------------
+
+@pytest.mark.parametrize("broker, expected", [("off", "paper-shadow"), ("dry", "dry")])
+def test_cycle_mode_label_reflects_the_broker_mode(tmp_path, fake_bybit, broker, expected):
+    s009.run_cycle_for_account(
+        account_key="acct-a", creds={"api_key": "k", "api_secret": "s"}, cfg=s009.DEPLOY,
+        state=_store(tmp_path), logger=_log(tmp_path), do_fetch=False, drop_forming=False,
+        broker=broker)
+    events = _read_events(tmp_path)
+    start = next(e for e in events if e["kind"] == "cycle_start")
+    end = next(e for e in events if e["kind"] == "cycle_end")
+    assert start["mode"] == expected
+    assert end["status"].startswith(f"{expected}:")

@@ -149,6 +149,7 @@ REFRESH_LOOKBACK_DAYS = 45          # window pulled each refresh (covers lb7 + v
 
 POLL_MINUTES_DEFAULT = 20           # loop wake-up interval
 LOOP_SLEEP_CHUNK_SEC = 5            # sleep granularity so SIGTERM is honoured quickly
+QTY_DECIMALS = 8                    # float-noise cleanup for step-rounded order quantities
 
 _STOP = {"flag": False}             # set by signal handlers to end the loop
 
@@ -312,6 +313,19 @@ def _floor_step(x: float, step: float) -> float:
     return math.floor(abs(x) / step) * step
 
 
+def _round_step(x: float, step: float) -> float:
+    """|x| rounded to the NEAREST multiple of `step` (not floored).
+
+    Used for target sizing: flooring biased every leg under its weight and,
+    on a coarse step, wiped a leg out entirely -- live 2026-09-28 SUIUSDT
+    (qty_step=10) wanted 8.9 units, floored to 0, so the cycle closed the
+    old short and left the +3.9% long unopened, with no skip event logged.
+    Also immune to the IEEE-754 under-round `_floor_step` has on exact
+    multiples (24.2/0.1 == 241.99999999999997), which matters for the delta
+    of two step multiples."""
+    return round(round(abs(x) / step) * step, QTY_DECIMALS)
+
+
 def _verify_after_timeout(client, sym: str, qty_before: float, log, cid: str) -> None:
     """ALGODEV-20: after a `close_position`/`place_market` call raises (most
     commonly a network read timeout — the request may have reached Bybit and
@@ -405,8 +419,24 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
                 _verify_after_timeout(client, sym, cur, log, cid)
             continue
 
-        tgt_qty = math.copysign(_floor_step(w * equity / price, inst.qty_step), w) if w else 0.0
+        tgt_qty = math.copysign(_round_step(w * equity / price, inst.qty_step), w) if w else 0.0
         delta = tgt_qty - cur
+        # A wanted leg (w != 0) whose TARGET is below the exchange's min order
+        # size/value is a real gap on a small account (e.g. BTC's ~$65+ min
+        # notional can exceed this leg's whole target allocation at
+        # equity=$50) -- surface it instead of silently dropping the leg, so a
+        # thin book isn't mistaken for "target == actual". Checked on the
+        # target itself, not only when the delta is small: the 2026-09-28
+        # SUIUSDT leg was reversed from -20 to a sub-minimum target with a
+        # large delta and never logged a skip.
+        if w and (abs(tgt_qty) < inst.min_qty or abs(tgt_qty) * price < inst.min_notional):
+            min_notional = round(max(inst.min_qty * price, inst.min_notional), 2)
+            log.event("skip_min_qty", cycle=cid, symbol=sym, target_weight=w,
+                      target_notional=round(w * equity, 2), min_qty=inst.min_qty,
+                      min_notional=min_notional, price=price, cur_qty=cur)
+            print(f"  SKIP {sym}: target notional ${w * equity:.2f} < exchange min "
+                  f"${min_notional:.2f} (min_qty={inst.min_qty}, min_notional={inst.min_notional}) "
+                  f"— leg not opened")
         # Two INDEPENDENT exchange floors, not one: min_qty is a unit-count
         # minimum, min_notional (Bybit's own separate $5-ish floor) is a
         # dollar-value minimum -- a delta can clear the first and still fail
@@ -415,22 +445,9 @@ def reconcile_to_target(client, target_book: dict, equity: float, log, cid, exec
         # rejected live (error 110094) on every cycle for the same legs.
         delta_notional = abs(delta) * price
         if abs(delta) < inst.min_qty or delta_notional < inst.min_notional:
-            # A wanted leg (w != 0) that rounds to less than the exchange's min
-            # order size/value is a real gap on a small account (e.g. BTC's
-            # ~$65+ min notional can exceed this leg's whole target allocation
-            # at equity=$50) — surface it instead of silently dropping the
-            # leg, so a thin book isn't mistaken for "target == actual".
-            if w and (abs(tgt_qty) < inst.min_qty or abs(tgt_qty) * price < inst.min_notional):
-                min_notional = round(max(inst.min_qty * price, inst.min_notional), 2)
-                log.event("skip_min_qty", cycle=cid, symbol=sym, target_weight=w,
-                          target_notional=round(w * equity, 2), min_qty=inst.min_qty,
-                          min_notional=min_notional, price=price)
-                print(f"  SKIP {sym}: target notional ${w * equity:.2f} < exchange min "
-                      f"${min_notional:.2f} (min_qty={inst.min_qty}, min_notional={inst.min_notional}) "
-                      f"— leg not opened")
             continue
         side = "Buy" if delta > 0 else "Sell"
-        qty = round(_floor_step(delta, inst.qty_step), 8)
+        qty = _round_step(delta, inst.qty_step)
         if qty < inst.min_qty or qty * price < inst.min_notional:
             continue
         rec = {"symbol": sym, "side": side, "qty": qty, "ref_price": price,
@@ -520,7 +537,11 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg,
     Returns dict(booked, target, equity, broker_orders, error, date,
     latest_net_ret, broker_env, broker_plan).
     """
-    cid = logger.cycle_start(mode="paper-shadow", account=account_key, fetched=do_fetch)
+    # "paper-shadow" only when nothing reaches the broker; otherwise the real
+    # broker mode, so an executing account's log doesn't read as paper-only
+    # (same convention as bot/s011_paper.py).
+    mode_label = "paper-shadow" if broker == "off" else broker
+    cid = logger.cycle_start(mode=mode_label, account=account_key, fetched=do_fetch)
     booked = 0
     target: dict = {}
     equity = None
@@ -661,7 +682,7 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg,
         logger.error("S009 cycle failed", exc=e, cycle=cid)
         error = repr(e)[:500]
 
-    logger.cycle_end(cid, status=f"paper-shadow: {len(target)} positions, {booked} day(s) booked, "
+    logger.cycle_end(cid, status=f"{mode_label}: {len(target)} positions, {booked} day(s) booked, "
                                f"broker={broker} orders={len(broker_plan)}",
                     equity=equity)
     return dict(booked=booked, target=target, equity=equity, broker_orders=len(broker_plan),

@@ -41,6 +41,11 @@ BASE_URLS = {
 RECV_WINDOW = "5000"
 CATEGORY = "linear"
 
+# recent_fill_price polling: executions of a just-filled market order show up
+# in /v5/execution/list only shortly after /v5/order/create returns.
+FILL_LOOKUP_ATTEMPTS = 5
+FILL_LOOKUP_DELAY_S = 0.5
+
 
 @dataclass
 class Instrument:
@@ -145,17 +150,33 @@ class BybitExec:
         return Instrument(symbol, float(lot["qtyStep"]), float(lot["minOrderQty"]), float(pf["tickSize"]),
                           float(lot.get("minNotionalValue") or 0.0))
 
-    def recent_fill_price(self, symbol: str, order_id: str) -> float | None:
-        """Average execution price for an order id (for slippage measurement)."""
-        try:
-            res = self._get("/v5/execution/list", {"category": self.category, "symbol": symbol, "limit": 50})
-        except Exception:
-            return None
-        px, qty = 0.0, 0.0
-        for e in res.get("list", []):
-            if e.get("orderId") == order_id:
-                q = float(e["execQty"]); px += float(e["execPrice"]) * q; qty += q
-        return (px / qty) if qty > 0 else None
+    def recent_fill_price(self, symbol: str, order_id: str, *,
+                          attempts: int = FILL_LOOKUP_ATTEMPTS,
+                          delay_s: float = FILL_LOOKUP_DELAY_S,
+                          sleep=time.sleep) -> float | None:
+        """Average execution price for an order id (for slippage measurement).
+
+        Polls, because a market order's executions are NOT readable the
+        instant /v5/order/create returns: live S009 logged fill=None on 157 of
+        187 fills (2026-08-31..09-28), yet re-querying the same order ids
+        later returned every execution. A single immediate read was just
+        racing Bybit's own execution indexing. Filters by `orderId` server
+        side instead of scanning the symbol's last 50 executions."""
+        for attempt in range(attempts):
+            if attempt:
+                sleep(delay_s)
+            try:
+                res = self._get("/v5/execution/list", {"category": self.category, "symbol": symbol,
+                                                       "orderId": order_id})
+            except Exception:
+                continue
+            px, qty = 0.0, 0.0
+            for e in res.get("list", []):
+                if e.get("orderId") == order_id:
+                    q = float(e["execQty"]); px += float(e["execPrice"]) * q; qty += q
+            if qty > 0:
+                return px / qty
+        return None
 
     # ---- writes -----------------------------------------------------------
     def place_market(self, symbol: str, side: str, qty: float) -> dict:
