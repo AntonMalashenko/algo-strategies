@@ -24,12 +24,19 @@ import pandas as pd
 from bot.ctrader_s011 import CTraderS011
 
 
-def _bars(closes: list[float], last_is_today: bool) -> pd.DataFrame:
+# A fixed weekday afternoon: the broker day (closes 21:00/22:00 UTC) is still
+# running, so the session labelled with today's date is the forming one.
+# Pinned rather than read from the clock -- the old helper used the real UTC
+# date and these tests would have failed if run between 22:00 and 24:00 UTC.
+NOW = datetime(2026, 9, 24, 15, 0, tzinfo=timezone.utc)
+
+
+def _bars(closes: list[float], last_is_today: bool, now: datetime = NOW) -> pd.DataFrame:
     """Session-dated daily bars -- the shape `_get_daily_step` now returns
     after `_session_dated_index`: tz-naive, normalised to UTC midnight, one
     row per session, oldest..newest. The last row is either today's
     still-forming session or yesterday's closed one."""
-    today_utc = pd.Timestamp(datetime.now(timezone.utc).date())
+    today_utc = pd.Timestamp(now.date())
     n = len(closes)
     last_session = today_utc if last_is_today else today_utc - timedelta(days=1)
     idx = pd.DatetimeIndex([last_session - timedelta(days=i) for i in range(n - 1, -1, -1)])
@@ -89,18 +96,18 @@ class TestSessionDatedIndex:
 
 def test_drop_forming_bar_removes_only_todays_row():
     df = _bars([100.0, 200.0, 999999.0], last_is_today=True)
-    out = CTraderS011._drop_forming_bar(df)
+    out = CTraderS011._drop_forming_bar(df, NOW)
     assert list(out["close"]) == [100.0, 200.0]
 
 
 def test_drop_forming_bar_is_a_noop_when_last_bar_already_closed():
     df = _bars([100.0, 200.0], last_is_today=False)
-    out = CTraderS011._drop_forming_bar(df)
+    out = CTraderS011._drop_forming_bar(df, NOW)
     assert list(out["close"]) == [100.0, 200.0]
 
 
 def test_drop_forming_bar_handles_empty_df():
-    out = CTraderS011._drop_forming_bar(pd.DataFrame())
+    out = CTraderS011._drop_forming_bar(pd.DataFrame(), NOW)
     assert out.empty
 
 
@@ -108,16 +115,48 @@ def test_last_closed_price_skips_a_forming_todays_bar():
     """The live bug: without this guard, a still-forming bar's (possibly
     anomalous) close would price the order instead of the last real close."""
     df = _bars([100.0, 200.0, 999999.0], last_is_today=True)
-    assert CTraderS011._last_closed_price(df) == 200.0
+    assert CTraderS011._last_closed_price(df, NOW) == 200.0
 
 
 def test_last_closed_price_uses_last_close_when_nothing_is_forming():
     df = _bars([100.0, 200.0], last_is_today=False)
-    assert CTraderS011._last_closed_price(df) == 200.0
+    assert CTraderS011._last_closed_price(df, NOW) == 200.0
 
 
 def test_last_closed_price_returns_none_for_empty_or_all_forming():
-    assert CTraderS011._last_closed_price(pd.DataFrame()) is None
+    assert CTraderS011._last_closed_price(pd.DataFrame(), NOW) is None
     # a single bar for "today" and nothing else -- all forming, nothing closed
     df = _bars([999999.0], last_is_today=True)
-    assert CTraderS011._last_closed_price(df) is None
+    assert CTraderS011._last_closed_price(df, NOW) is None
+
+
+# --- 2026-09-29: the session that has JUST closed is not "forming" ---------
+#
+# Live every weeknight 2026-09-15..09-29: between the broker close (22:00 UTC)
+# and UTC midnight the newest bar is labelled with today's UTC date but is
+# already CLOSED; the old date-only filter dropped it, the stale-D1-feed guard
+# fired ~8 times and the decision slipped to 00:00 UTC.
+
+def test_session_that_just_closed_is_kept_after_the_broker_close():
+    after_close = datetime(2026, 9, 24, 22, 30, tzinfo=timezone.utc)
+    df = _bars([100.0, 200.0], last_is_today=True, now=after_close)   # last = 2026-09-24
+    assert list(CTraderS011._drop_forming_bar(df, after_close)["close"]) == [100.0, 200.0]
+    assert CTraderS011._last_closed_price(df, after_close) == 200.0
+
+
+def test_next_session_opened_at_the_broker_midnight_is_still_dropped():
+    """After the close the broker has already opened the next session,
+    labelled tomorrow -- that one IS forming."""
+    after_close = datetime(2026, 9, 24, 22, 30, tzinfo=timezone.utc)
+    idx = pd.DatetimeIndex(["2026-09-23", "2026-09-24", "2026-09-25"])
+    df = pd.DataFrame({"close": [100.0, 200.0, 999999.0]}, index=idx)
+    assert list(CTraderS011._drop_forming_bar(df, after_close)["close"]) == [100.0, 200.0]
+
+
+def test_crypto_weekend_session_is_kept_once_closed():
+    """Crypto prints weekend sessions; Saturday's closes at the Saturday broker
+    midnight and must be usable on Sunday like any other day."""
+    sunday = datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc)
+    idx = pd.DatetimeIndex(["2026-09-25", "2026-09-26", "2026-09-27"])
+    df = pd.DataFrame({"close": [1.0, 2.0, 999999.0]}, index=idx)
+    assert list(CTraderS011._drop_forming_bar(df, sunday)["close"]) == [1.0, 2.0]

@@ -98,10 +98,7 @@ LEDGER_FILE = STATE_DIR / "ledger.csv"
 
 HISTORY_DAYS = 400   # >= trend_sma(200) + a comfortable margin for RSI/SMA warmup
 
-BROKER_DAY_CLOSE_UTC_HOUR = 22   # cTrader D1 closes at the broker's midnight:
-                                 # 21:00 UTC summer / 22:00 UTC winter -- use the
-                                 # later so we never treat a day's bar as available
-                                 # before it has actually closed
+from bot.s011_session import BROKER_DAY_CLOSE_UTC_HOUR, drop_forming_bar  # noqa: E402
 
 # cycle_end status marker + event name when the broker D1 feed lags the calendar
 STALE_FEED_STATUS = "stale-d1-feed"
@@ -399,19 +396,13 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
                 # drop_forming reasoning, applied per-instrument since D1 bar
                 # completeness can differ across FX/index/crypto instruments
                 # on this broker) before computing today's decided position.
-                # Same filter as CTraderS011._drop_forming_bar (kept inline
-                # here rather than called through the client so this signal
-                # computation has no dependency on it -- see that method's
-                # docstring for the live incident that made run_live_cycle_
-                # multi's OWN order-sizing price apply this guard too). Both
-                # now work on SESSION-dated bars (CTraderS011.
-                # _session_dated_index relabels each D1 bar from its
-                # broker-day OPEN stamp to the date the session closes on),
-                # so "today's UTC date" here means the session still forming
-                # right now -- the comparison below is unchanged and still
-                # correct under that labelling.
-                today_utc = datetime.now(timezone.utc).date()
-                bars = df[df.index.date < today_utc] if df.index[-1].date() >= today_utc else df
+                # The SAME filter run_live_cycle_multi's order-sizing price
+                # uses (bot/s011_session.py, shared so the signal and the
+                # sizing price can never disagree on which bar is current --
+                # see CTraderS011._last_closed_price for the 2026-08-19
+                # incident). It works on SESSION-dated bars and keeps the
+                # session that has just closed at the broker's midnight.
+                bars = drop_forming_bar(df)
                 if len(bars) < 2:
                     continue
                 pos = rsi2_signal(bars, BASELINE_RSI2)

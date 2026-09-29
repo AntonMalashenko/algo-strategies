@@ -30,11 +30,12 @@ cycle before ever running `--broker execute`.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pandas as pd
 
 from bot.clients.ctrader.client import CTraderApiClient
+from bot.s011_session import drop_forming_bar
 
 # cTrader D1 trendbars are stamped at the broker-day OPEN (this broker's local
 # midnight -- 21:00 UTC in summer, 22:00 UTC in winter), so a bar stamped
@@ -112,28 +113,22 @@ class CTraderS011:
         return relabelled.sort_index()
 
     @staticmethod
-    def _drop_forming_bar(bars: pd.DataFrame) -> pd.DataFrame:
-        """Drop a still-forming current-UTC-day bar, if the feed returned one
-        (broker D1 quirk -- it can hand back a last row for TODAY before that
-        day's bar has actually closed). Single source of truth for this
-        filter: bot/s011_paper.py's decide() reuses it for its RSI signal
-        instead of re-deriving the same date comparison, so the signal and the
-        order-sizing price can never silently diverge on which bar counts as
-        "current" again -- see `_last_closed_price`'s docstring for the
-        incident this guards against.
+    def _drop_forming_bar(bars: pd.DataFrame, now: datetime | None = None) -> pd.DataFrame:
+        """Drop a still-forming session's bar, if the feed returned one
+        (broker D1 quirk -- it can hand back the current session before it has
+        closed). Delegates to bot/s011_session.py::drop_forming_bar, the ONE
+        definition bot/s011_paper.py's decide() also uses for its RSI signal,
+        so the signal and the order-sizing price can never silently diverge on
+        which bar counts as "current" -- see `_last_closed_price`'s docstring
+        for the incident this guards against.
 
-        (D1 convention: the index this reads is SESSION-dated, not stamped at
-        the broker-day open -- see `_session_dated_index` -- so a
-        still-forming current session labels as TODAY's UTC date and is what
-        gets dropped here. In practice this broker's trendbar request only
-        returns already-closed bars, so this is defence-in-depth.)"""
-        if bars.empty:
-            return bars
-        today_utc = datetime.now(timezone.utc).date()
-        return bars[bars.index.date < today_utc] if bars.index[-1].date() >= today_utc else bars
+        (D1 convention: the index this reads is SESSION-dated -- see
+        `_session_dated_index` -- so a bar is forming until its broker-day
+        close, not until the UTC date changes.)"""
+        return drop_forming_bar(bars, now)
 
     @classmethod
-    def _last_closed_price(cls, bars: pd.DataFrame) -> float | None:
+    def _last_closed_price(cls, bars: pd.DataFrame, now: datetime | None = None) -> float | None:
         """Latest CLOSED D1 bar's close -- never a still-forming current-UTC-
         day bar (operates on the session-dated, forming-bar-filtered series;
         see `_session_dated_index` and `_drop_forming_bar`).
@@ -143,7 +138,7 @@ class CTraderS011:
         was actually a ~$8500 position (~5.7x oversized), invisible in the log
         because only the (correctly filtered) `bars["close"]` used for
         rsi_close ever got logged, never this one."""
-        closed = cls._drop_forming_bar(bars)
+        closed = cls._drop_forming_bar(bars, now)
         if closed.empty:
             return None
         return float(closed["close"].iloc[-1])
