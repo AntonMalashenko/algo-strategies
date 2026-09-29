@@ -38,7 +38,7 @@ from pathlib import Path
 import pandas as pd
 
 from bot import s007_config as C
-from bot.risk import lots_for_risk
+from bot.risk import FALLBACK_MIN_LOT, lots_for_risk
 from bot.s007_signals import plan_now
 from utils.trade_logger import StrategyLogger
 
@@ -194,7 +194,7 @@ def make_decide(*, preset: str, magic: str, risk_pct: float, fixed_lot: float,
     implementations of the same trading rules.
     """
     def decide(symbol, m1, broker_positions, balance, money_per_point_per_lot,
-               closed_deals=None):
+               closed_deals=None, broker_min_lot=None):
         """Pure decision step (no I/O): plan_now() + diff against what the
         broker already has open, sized to equal dollar risk per position.
         Runs inside the single cTrader session (see CTraderS007.run_live_cycle)
@@ -389,8 +389,12 @@ def make_decide(*, preset: str, magic: str, risk_pct: float, fixed_lot: float,
                 if use_fixed_lot:
                     lot = fixed_lot
                 else:
+                    # ALGODEV-55: floor at the broker's REAL minimum (live
+                    # minVolume, bot/risk.py::broker_min_lot). fixed_lot is
+                    # the fixed-size mode's size only, never a floor.
                     lot = lots_for_risk(risk_amount, stop_distance,
-                                        money_per_point_per_lot, min_lot=fixed_lot)
+                                        money_per_point_per_lot,
+                                        min_lot=broker_min_lot or FALLBACK_MIN_LOT)
                 # ALGODEV-37 + 2026-09-02 fix: $ gate, alongside (not instead
                 # of) the count cap above. spent_risk_today is the whole
                 # day's budget consumption -- open positions (broker fill
@@ -524,11 +528,63 @@ def make_decide(*, preset: str, magic: str, risk_pct: float, fixed_lot: float,
     return decide
 
 
+BROKER_MODE_OFF = "off"          # webapp.schemas.enums.BrokerMode values, repeated
+BROKER_MODE_DRY = "dry"          # here so bot/ never imports from webapp/
+BROKER_MODE_EXECUTE = "execute"
+
+
+def _gate_new_risk(decide, *, broker_mode: str, account_limits, magic: str,
+                   fx_rate: float, logger: StrategyLogger, cid: str):
+    """Wrap decide() with the two ALGODEV-55 gates on NEW risk only.
+
+    A wrapper rather than a change inside make_decide(): make_decide() is
+    shared byte-for-byte with the paper daemon (scripts/s007_daemon.py),
+    which has no broker and no account, so neither gate belongs there. See
+    run_cycle_for_account's docstring for what each gate does."""
+    from bot.account_guard import check_new_risk
+
+    def gated(symbol, m1, broker_positions, balance, money_per_point_per_lot,
+              closed_deals=None, broker_min_lot=None):
+        actions = decide(symbol, m1, broker_positions, balance, money_per_point_per_lot,
+                         closed_deals=closed_deals, broker_min_lot=broker_min_lot)
+        mpp = money_per_point_per_lot * fx_rate      # same USD conversion decide() applies
+        open_risk = sum(
+            (p["volume"] / 100.0) * abs(p["price"] - p["stop_loss"]) * fx_rate
+            for p in broker_positions
+            if p["label"].startswith(magic) and p.get("price") and p.get("stop_loss"))
+        out = []
+        for a in actions:
+            if a["kind"] != "place":
+                out.append(a)
+                continue
+            new_risk = a["volume_lots"] * abs(a["entry"] - a["sl"]) * mpp
+            verdict = check_new_risk(account_limits, balance=balance,
+                                     closed_deals=closed_deals, open_risk=open_risk,
+                                     new_risk=new_risk)
+            if not verdict.allowed:
+                logger.event("skip_account_guard", cycle=cid, label=a["label"],
+                             reason=verdict.reason, **verdict.details)
+                continue
+            if broker_mode == BROKER_MODE_EXECUTE:
+                open_risk += new_risk
+                out.append(a)
+            elif broker_mode == BROKER_MODE_DRY:
+                logger.order(a["label"], "place_market", cycle=cid, result="dry-run",
+                             request=dict(symbol=symbol, side=a["side"], sl=a["sl"],
+                                          tp=a["tp"], lot=a["volume_lots"],
+                                          new_risk=new_risk))
+            # BROKER_MODE_OFF (or anything unknown): drop silently -- fail closed
+        return out
+    return gated
+
+
 def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, fixed_lot: float,
                           use_fixed_lot: bool, magic: str, logger: StrategyLogger,
                           symbol_candidates=None, history_days: int | None = None,
                           daily_risk_cap_pct: float | None = None, fx_rate: float | None = None,
-                          stop_flag_active=None, initial_balance: float | None = None) -> dict:
+                          stop_flag_active=None, initial_balance: float | None = None,
+                          broker_mode: str = BROKER_MODE_EXECUTE,
+                          account_limits=None, on_token_refreshed=None) -> dict:
     """One S007 reconcile cycle for an arbitrary account, reusing the exact
     decide()/reconcile logic `live()` below uses for the single .env/
     accounts.yml-configured account -- so a DB-registered multi-account run
@@ -536,9 +592,14 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     apart into two competing implementations of the same trading rules.
 
     `creds`: same shape CTraderS007(creds=...) expects (client_id,
-    client_secret, access_token, account_id, host), or None to fall back to
-    CTraderAdapter's own .env/accounts.yml single-account resolution (what
-    `live()` below still does, unchanged).
+    client_secret, access_token, account_id, host, refresh_token?,
+    token_expires_at?), or None to fall back to CTraderAdapter's own
+    .env/accounts.yml single-account resolution (what `live()` below still
+    does, unchanged).
+
+    `on_token_refreshed`: persists a renewed cTrader access token (ALGODEV-48)
+    -- see CTraderAdapter.__init__. webapp/runner.py passes one that writes
+    the account's encrypted DB credentials.
 
     symbol_candidates/history_days/daily_risk_cap_pct/fx_rate default to
     bot.s007_config (C) when omitted -- override only where a specific
@@ -554,6 +615,22 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     letting daily_risk_cap_pct silently mean less risk budget than
     intended after a losing stretch. None (the live()/CLI default, no DB
     row) falls back to the broker's live balance, unchanged from before.
+
+    `broker_mode` (ALGODEV-55): the webapp AccountStrategy.broker_mode gate,
+    same vocabulary as S009/S011/S021 ("off"/"dry"/"execute"). Only NEW
+    risk (decide()'s "place" actions) is gated: "off" drops them silently,
+    "dry" logs each one as an order with result="dry-run" and drops it,
+    "execute" (the default -- every caller before this ticket placed real
+    orders unconditionally, and the CLI still does) sends them. Closes and
+    breakeven amends always run: they only ever react to a position that is
+    already real at the broker, which must never be abandoned.
+
+    `account_limits` (ALGODEV-55): optional bot.account_guard.AccountLimits
+    for a prop-style account -- each "place" that survived decide()'s own
+    per-strategy caps is additionally checked against the account-level
+    daily/max loss guard (see that module) and dropped with a
+    `skip_account_guard` event if it would breach it. None = no guard,
+    behaviour unchanged.
 
     Returns dict(cycle_id, actions, error, day_done, in_window, filtered,
     manual_stop) -- actions is a list of dicts, each one of
@@ -579,6 +656,8 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
         use_fixed_lot=use_fixed_lot, daily_risk_cap_pct=daily_risk_cap_pct,
         fx_rate=fx_rate, initial_balance=initial_balance, logger=logger,
         stop_flag_active=stop_flag_active, cid=cid, status_info=status_info)
+    decide = _gate_new_risk(decide, broker_mode=broker_mode, account_limits=account_limits,
+                            magic=magic, fx_rate=fx_rate, logger=logger, cid=cid)
 
     # CTraderS007() is constructed OUTSIDE the try below, deliberately: its
     # __init__ loads credentials before any broker call. A malformed
@@ -586,7 +665,7 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     # get swallowed into the per-cycle except below and silently re-logged
     # every minute forever. Real incident 2026-07-29, see
     # tests/configs/test_accounts_yaml.py and decisions-log.md.
-    api = CTraderS007(creds=creds)
+    api = CTraderS007(creds=creds, on_token_refreshed=on_token_refreshed)
     error = None
     try:
         cyc = api.run_live_cycle(symbol_candidates, history_days, decide)

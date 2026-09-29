@@ -76,6 +76,15 @@ REFRESH_LEEWAY_S = 3600
 FALLBACK_EXPIRES_IN_S = 3600
 
 
+# Leading text of the TokenRefreshError messages that mean "the stored
+# credentials themselves are dead" (as opposed to a transient transport
+# hiccup). Used to build those messages below AND by
+# `needs_human_reauth` to recognise them later in a logged `last_error`,
+# so the two can never drift apart.
+TOKEN_REQUEST_FAILED_PREFIX = "cTrader token request failed"
+NO_REFRESH_TOKEN_PREFIX = "no refresh_token stored for this account"
+
+
 class TokenRefreshError(RuntimeError):
     """The token endpoint refused to mint or renew a token.
 
@@ -156,6 +165,51 @@ def is_expired_token_error(error: BaseException | str) -> bool:
     return EXPIRED_TOKEN_ERROR_CODE in str(error)
 
 
+def needs_human_reauth(error: BaseException | str) -> bool:
+    """True when `error` means no amount of retrying will fix the account:
+    the access token was rejected as expired, or the token endpoint refused
+    the refresh (revoked grant, wrong client secret) or had nothing to
+    refresh with. Every such case ends in a human running
+    `scripts/ctrader_oauth.py ... --db-account <id>` once, so a monitor can
+    alert on it immediately instead of waiting to see if it clears itself.
+    """
+    text = str(error)
+    return (is_expired_token_error(text)
+            or TOKEN_REQUEST_FAILED_PREFIX in text
+            or NO_REFRESH_TOKEN_PREFIX in text)
+
+
+def refresh_if_needed(creds: dict, *, leeway_s: int = REFRESH_LEEWAY_S,
+                      now: datetime | None = None) -> TokenBundle | None:
+    """The ONE pre-flight decision every cTrader session makes, whichever
+    base it runs on (`CTraderApiClient`, the legacy `CTraderAdapter`, or the
+    webapp's central locked refresh in `webapp/ctrader_tokens.py`).
+
+    `creds` is a credentials dict (client_id, client_secret, access_token,
+    refresh_token?, token_expires_at?). Returns the renewed bundle when a
+    refresh happened -- the caller MUST persist `bundle.as_credentials()`,
+    since the broker may have rotated the refresh token -- or None when
+    nothing had to (or could) be done:
+
+      * the token is still valid for longer than `leeway_s`;
+      * there is no access token at all (the caller's own "missing
+        credentials" check reports that better);
+      * there is no refresh token to renew with. Not fatal: the current
+        token may still work (every account authorised before refresh
+        tokens were stored is in this state), so the session is allowed to
+        try and the broker's own verdict gets reported.
+
+    Raises TokenRefreshError when the token endpoint refuses the renewal.
+    """
+    bundle = TokenBundle.from_credentials(creds)
+    if bundle is None or not bundle.needs_refresh(now=now, leeway_s=leeway_s):
+        return None
+    if not bundle.refresh_token:
+        return None
+    return refresh_access_token(creds.get("client_id"), creds.get("client_secret"),
+                                bundle.refresh_token)
+
+
 def authorization_url(client_id: str, redirect_uri: str, *,
                       scope: str = DEFAULT_SCOPE,
                       product: str = DEFAULT_PRODUCT) -> str:
@@ -199,7 +253,7 @@ def refresh_access_token(client_id: str, client_secret: str,
     """
     if not refresh_token:
         raise TokenRefreshError(
-            "no refresh_token stored for this account -- re-authorise once via "
+            f"{NO_REFRESH_TOKEN_PREFIX} -- re-authorise once via "
             "`python -m scripts.ctrader_oauth auth-url ...` to obtain one")
     bundle = _request_token({
         "grant_type": GRANT_REFRESH_TOKEN,
@@ -233,7 +287,7 @@ def _request_token(params: dict) -> TokenBundle:
 
     if response.status_code != 200 or body.get("errorCode") or "accessToken" not in body:
         raise TokenRefreshError(
-            f"cTrader token request failed (HTTP {response.status_code}, "
+            f"{TOKEN_REQUEST_FAILED_PREFIX} (HTTP {response.status_code}, "
             f"grant_type={params.get('grant_type')}): "
             f"{body.get('errorCode') or body.get('description') or body}")
 

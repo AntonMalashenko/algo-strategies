@@ -96,9 +96,11 @@ from bot import s007_config as S007_C
 from bot import orb_config as ORB_C
 from bot.s007_paper import run_cycle_for_account as run_s007_cycle
 from bot.orb_signals import run_cycle_for_account as run_orb_cycle
+from bot.account_guard import AccountLimits, DEFAULT_DAY_RESET_TZ
 from bot.symbol_resolver import resolve_symbol
 from utils.trade_logger import StrategyLogger
 from webapp.state_store import DBStateStore
+from webapp.ctrader_tokens import ctrader_creds, fresh_ctrader_creds, token_persister
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -152,35 +154,39 @@ def _close_position_db(session, acc: Account, strat: Strategy, label: str, reaso
 
 def _ctrader_creds(acc: Account) -> dict:
     """The cTrader credential dict every worker hands to the broker layer.
+    Thin alias of webapp/ctrader_tokens.py::ctrader_creds (the one
+    implementation, shared with the position sync / audit / daemon)."""
+    return ctrader_creds(acc)
 
-    One implementation instead of a copy per worker, so a new credential
-    field (e.g. the OAuth2 refresh material) reaches all strategies at once.
-    """
-    creds_row = acc.credentials
-    return dict(
-        client_id=creds_row.get("client_id"),
-        client_secret=creds_row.get("client_secret"),
-        access_token=creds_row.get("access_token"),
-        refresh_token=creds_row.get("refresh_token"),
-        token_expires_at=creds_row.get("token_expires_at"),
-        account_id=int(acc.external_account_id) if acc.external_account_id else None,
-        host=acc.broker_host)
+
+def _fresh_ctrader_creds(session, acc: Account) -> dict:
+    """`_ctrader_creds` with the access token refreshed first when it is
+    close to expiry -- centrally, under a per-account lock, so S007 and S021
+    workers ticking on the SAME account in the same minute never race each
+    other's refresh-token rotation (ALGODEV-48, see ctrader_tokens.py)."""
+    return fresh_ctrader_creds(session, acc)
+
+
+def _account_limits(acc: Account) -> AccountLimits | None:
+    """The account-level loss guard for this account (ALGODEV-55,
+    bot/account_guard.py), or None when the account has no guard configured
+    (every pre-migration-008 account) or no initial_balance to measure
+    against -- in which case the strategies trade exactly as before."""
+    if not acc.initial_balance or (acc.guard_daily_loss_pct is None
+                                   and acc.guard_max_loss_pct is None):
+        return None
+    return AccountLimits(initial_balance=acc.initial_balance,
+                         daily_loss_pct=acc.guard_daily_loss_pct,
+                         max_loss_pct=acc.guard_max_loss_pct,
+                         day_reset_tz=acc.day_reset_tz or DEFAULT_DAY_RESET_TZ)
 
 
 def _token_persister(session, acc: Account):
-    """Callback the cTrader client invokes after renewing an access token.
-
-    Without it the refresh would be forgotten at the end of the cycle and the
-    next one would refresh again -- and, once the broker rotates the refresh
-    token, would refresh with a dead one. Committed immediately: a later crash
-    in the same cycle must not lose the new token.
-    """
-    def persist(refreshed: dict) -> None:
-        acc.credentials = {**acc.credentials, **refreshed}
-        session.commit()
-        print(f"[runner] account {acc.id}: cTrader access token refreshed, "
-              f"valid until {refreshed.get('token_expires_at')}")
-    return persist
+    """Callback the cTrader broker layer invokes after renewing an access
+    token (the per-session pre-flight backstop). Alias of
+    webapp/ctrader_tokens.py::token_persister -- writes the renewed pair
+    back to the account's encrypted credentials and commits immediately."""
+    return token_persister(session, acc)
 
 
 def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
@@ -232,7 +238,7 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
         session.close()
         return 0
 
-    creds = _ctrader_creds(acc)
+    creds = _fresh_ctrader_creds(session, acc)
 
     logger = StrategyLogger(f"S007-acct{acc.external_account_id or acc.id}",
                             log_root=str(ROOT / "reports" / "logs"))
@@ -256,7 +262,14 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
     result = run_s007_cycle(
         creds, preset=preset, risk_pct=link.risk_pct, fixed_lot=link.fixed_lot,
         use_fixed_lot=link.use_fixed_lot, magic=strat.name, logger=logger,
-        symbol_candidates=symbol_candidates, initial_balance=link.initial_balance)
+        symbol_candidates=symbol_candidates, initial_balance=link.initial_balance,
+        daily_risk_cap_pct=link.daily_risk_cap_pct,
+        # ALGODEV-55: S007 now honours broker_mode like every other worker
+        # (before, it placed real orders whatever the row said -- the only
+        # S007 row at the time, id=1, was already "execute").
+        broker_mode=link.broker_mode or "off",
+        account_limits=_account_limits(acc),
+        on_token_refreshed=_token_persister(session, acc))
 
     for a in result["actions"]:
         if a["kind"] == "open":
@@ -434,7 +447,7 @@ def _worker_s011(link: AccountStrategy, session, budget_s: float | None) -> int:
     broker_mode = link.broker_mode or "off"
     allow_mainnet = broker_mode == "execute" and acc.env == "live"
 
-    creds = _ctrader_creds(acc)
+    creds = _fresh_ctrader_creds(session, acc)
     logger = StrategyLogger(f"S011-acct{acc.external_account_id or acc.id}",
                             log_root=str(ROOT / "reports" / "logs"))
     state = DBStateStore(link.id, session)
@@ -521,7 +534,7 @@ def _worker_orb(link: AccountStrategy, session, budget_s: float | None) -> int:
     broker_mode = link.broker_mode or "off"
     allow_mainnet = broker_mode == "execute" and acc.env == "live"
 
-    creds = _ctrader_creds(acc)
+    creds = _fresh_ctrader_creds(session, acc)
 
     logger = StrategyLogger(f"S021-acct{acc.external_account_id or acc.id}",
                             log_root=str(ROOT / "reports" / "logs"))
@@ -542,7 +555,10 @@ def _worker_orb(link: AccountStrategy, session, budget_s: float | None) -> int:
     result = run_orb_cycle(
         creds, logger=logger, symbol_candidates=symbol_candidates,
         risk_pct=link.risk_pct, fixed_lot=link.fixed_lot, use_fixed_lot=link.use_fixed_lot,
-        magic=strat.name, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env)
+        magic=strat.name, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env,
+        daily_risk_cap_pct=link.daily_risk_cap_pct, initial_balance=link.initial_balance,
+        account_limits=_account_limits(acc),
+        on_token_refreshed=_token_persister(session, acc))
 
     for a in result["actions"]:
         if a["kind"] == "open":

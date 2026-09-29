@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
+from bot.risk import broker_min_lot
 from bot.ctrader import CTraderAdapter, HAVE_SDK, Protobuf  # reuse S004 adapter
 
 if HAVE_SDK:
@@ -35,19 +36,24 @@ PRICE_SCALE = 100000.0   # Open API trendbar/price integers = human_price * 1e5
 
 
 class CTraderS007(CTraderAdapter):
-    def __init__(self, creds: dict | None = None, require_account: bool = True):
+    def __init__(self, creds: dict | None = None, require_account: bool = True,
+                 on_token_refreshed=None):
         """creds=None -> read from .env (single-account mode, same as S004).
         creds dict -> explicit per-account credentials (multi-account runner):
-        {client_id, client_secret, access_token, account_id, host?}."""
+        {client_id, client_secret, access_token, account_id, host?,
+         refresh_token?, token_expires_at?}.
+        `on_token_refreshed`: see CTraderAdapter.__init__ (ALGODEV-48)."""
         if not HAVE_SDK:
             raise RuntimeError("pip install ctrader-open-api first")
         if creds is None:
-            super().__init__(require_account=require_account)
+            super().__init__(require_account=require_account,
+                             on_token_refreshed=on_token_refreshed)
             return
         self.client_id = creds["client_id"]
         self.secret = creds["client_secret"]
         self.token = creds["access_token"]
         self.account = int(creds.get("account_id") or 0)
+        self._init_token_refresh(creds, on_token_refreshed)
         host = creds.get("host") or EndPoints.PROTOBUF_DEMO_HOST
         need = [self.client_id, self.secret, self.token]
         if require_account:
@@ -667,7 +673,8 @@ class CTraderS007(CTraderAdapter):
                 money_per_point_per_lot = full_symbol.lotSize
 
                 actions = decide(symbol, m1, positions, balance, money_per_point_per_lot,
-                                 closed_deals=closed_deals)
+                                 closed_deals=closed_deals,
+                                 broker_min_lot=broker_min_lot(full_symbol))
                 # decide() is pure Python (no I/O, see its own docstring) --
                 # timed anyway so a slow cycle can be told apart from "the
                 # engine itself is slow" vs. "the network/broker is slow"
@@ -769,6 +776,10 @@ class CTraderS007(CTraderAdapter):
         the process, not silently paper over itself.
         """
         from twisted.internet import reactor
+        # Same pre-flight as _run (ALGODEV-48). The daemon also refreshes
+        # centrally with a day-long leeway before constructing this adapter
+        # (scripts/s007_daemon.py), because this session then stays open.
+        self._ensure_fresh_token()
         self._session_timings = {}
         self._persistent_stopped = False
         t_start = time.monotonic()
@@ -890,6 +901,9 @@ class CTraderS007(CTraderAdapter):
                     n_bars=len(m1), last_bar=str(m1.index[-1]) if len(m1) else None,
                     n_positions=len(positions), n_closed_deals=len(closed_deals),
                     lot_size=full_symbol.lotSize, timings=timings,
+                    # ALGODEV-55: the paper daemon sizes with the same live
+                    # broker minimum as the live path (bot/risk.py).
+                    broker_min_lot=broker_min_lot(full_symbol),
                     # Raw payload for ALGODEV-45 step 3's paper daemon, which
                     # has to feed the real m1/lotSize into decide(). Kept
                     # alongside (not instead of) the summary counts above so

@@ -60,7 +60,7 @@ import logging
 import pandas as pd
 
 from bot import orb_config as C
-from bot.risk import lots_for_risk
+from bot.risk import FALLBACK_MIN_LOT, lots_for_risk
 from strategies.orb_intraday.engine import compute_adr14, compute_daily_sessions
 
 
@@ -209,7 +209,10 @@ def run_cycle_for_account(creds: dict | None, *, logger, symbol_candidates=None,
                           risk_pct: float | None = None,
                           fixed_lot: float | None = None, use_fixed_lot: bool | None = None,
                           magic: str = C.MAGIC, broker: str = "off",
-                          allow_mainnet: bool = False, env: str | None = None) -> dict:
+                          allow_mainnet: bool = False, env: str | None = None,
+                          daily_risk_cap_pct: float | None = None,
+                          initial_balance: float | None = None,
+                          account_limits=None, on_token_refreshed=None) -> dict:
     """One S021 cycle for an arbitrary account -- mirrors
     bot.s007_paper.run_cycle_for_account's shape/contract (same creds shape,
     same kind of return) so webapp/runner.py can drive both the same way.
@@ -241,6 +244,20 @@ def run_cycle_for_account(creds: dict | None, *, logger, symbol_candidates=None,
     `history_days` was an M1 window covering both -- see bot/ctrader_orb.py's
     module docstring for why that never worked live (broker bar cap).
 
+    ALGODEV-55 risk gates on the fresh entry (case 2), checked BEFORE the
+    broker-mode gate so "dry" shows exactly what "execute" would do:
+      - `daily_risk_cap_pct`: this strategy's own daily budget, % of
+        `initial_balance` (AccountStrategy.initial_balance) or of live
+        balance when that is None. S021 takes at most one entry a day, so
+        this reduces to "one leg's risk must fit the budget" -- a guard
+        against a mis-set risk_pct / min-lot floor overshoot, not a limiter
+        in normal operation. None = no cap (behaviour before this ticket).
+      - `account_limits`: bot.account_guard.AccountLimits, the account-level
+        daily/max loss guard shared with every strategy on the account.
+        Uses the closing deals run_live_cycle_orb now fetches. None = off.
+    Only one leg's risk counts: the two resting stops are mutually exclusive
+    by design (the sibling is cancelled on the first fill -- case 3/4).
+
     Returns dict(cycle_id, actions, error) -- actions is a list of
     {kind: "open", label, side, entry, sl, tp, is_add, volume_lots} (from a
     detected resting-order fill) or {kind: "close", label, reason} --
@@ -250,6 +267,7 @@ def run_cycle_for_account(creds: dict | None, *, logger, symbol_candidates=None,
     logged (logger.order) but never reach `actions` -- a resting order is
     not a DB Position row, only a filled one is.
     """
+    from bot.account_guard import check_new_risk
     from bot.ctrader_orb import CTraderORB
 
     symbol_candidates = symbol_candidates or C.SYMBOL_CANDIDATES
@@ -268,7 +286,8 @@ def run_cycle_for_account(creds: dict | None, *, logger, symbol_candidates=None,
                              ("dry" if broker == "dry" else "shadow"))
     actions_taken: list[dict] = []
 
-    def decide(symbol, m1, m15, positions, orders, balance, money_per_point_per_lot):
+    def decide(symbol, m1, m15, positions, orders, balance, money_per_point_per_lot,
+               closed_deals=None, broker_min_lot=None):
         cfg = C.STRATEGY
         levels = _levels_for_today(m1, m15, cfg)
         # Tell "no anchor yet" (normal: weekend, bot started late) apart from
@@ -381,9 +400,27 @@ def run_cycle_for_account(creds: dict | None, *, logger, symbol_candidates=None,
         if cfg.session_open <= now_t <= cfg.entry_cutoff:
             risk_amount = balance * risk_pct / 100.0
             lot = (fixed_lot if use_fixed_lot else
-                  lots_for_risk(risk_amount, stop_dist, money_per_point_per_lot, min_lot=fixed_lot))
+                  # ALGODEV-55: floor at the broker's real minimum volume
+                  # (bot/risk.py::broker_min_lot); fixed_lot is never a floor
+                  lots_for_risk(risk_amount, stop_dist, money_per_point_per_lot,
+                                min_lot=broker_min_lot or FALLBACK_MIN_LOT))
             logger.event("size", cycle=cid, long_label=long_label, short_label=short_label,
                          U=U, L=L, stop_dist=stop_dist, lot=lot, risk_amount=risk_amount)
+            new_risk = lot * stop_dist * money_per_point_per_lot
+            if daily_risk_cap_pct is not None:
+                cap_base = initial_balance if initial_balance is not None else balance
+                risk_cap = cap_base * daily_risk_cap_pct / 100.0
+                if new_risk > risk_cap:
+                    logger.event("skip_risk_cap", cycle=cid, label=long_label,
+                                 new_risk=new_risk, risk_cap=risk_cap)
+                    return []
+            verdict = check_new_risk(account_limits, balance=balance,
+                                     closed_deals=closed_deals, open_risk=0.0,
+                                     new_risk=new_risk)
+            if not verdict.allowed:
+                logger.event("skip_account_guard", cycle=cid, label=long_label,
+                             reason=verdict.reason, **verdict.details)
+                return []
             entry_orders = [
                 dict(kind="place_stop", label=long_label, side="buy",
                     stop=U, sl=U - stop_dist, volume_lots=lot),
@@ -409,7 +446,9 @@ def run_cycle_for_account(creds: dict | None, *, logger, symbol_candidates=None,
     # malformed credential/config must crash this process loudly, not get
     # swallowed and silently re-logged every minute forever (decisions-log.md
     # 2026-07-29).
-    api = CTraderORB(creds=creds)
+    # on_token_refreshed: persists a renewed cTrader access token
+    # (ALGODEV-48), same contract as bot/s007_paper.py's run_cycle_for_account.
+    api = CTraderORB(creds=creds, on_token_refreshed=on_token_refreshed)
     error = None
     try:
         cyc = api.run_live_cycle_orb(symbol_candidates, history_days, today_days, decide)

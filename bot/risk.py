@@ -17,6 +17,37 @@ from __future__ import annotations
 # divide by ~0 and produce an absurd lot size, so we floor to min_lot instead.
 MIN_STOP_POINTS = 0.5
 
+# Open API volume is in 1/100 of a unit, and this codebase's "lot" is
+# raw = lots * VOLUME_PER_LOT_UNIT * lotSize (see CTraderS007._volume_from_lots)
+# -- so bot lot 0.01 == 1 cTrader lot for an index CFD with lotSize=100.
+VOLUME_PER_LOT_UNIT = 100
+
+# Sizing floor used ONLY when the broker's own minimum is unknown for a cycle
+# (symbol metadata missing -- in practice tests and fakes; every real cTrader
+# cycle has it). 0.01 bot lot = 1 contract, the value AccountStrategy.fixed_lot
+# used to double as before ALGODEV-55 -- kept here, NOT on the account/strategy
+# link, because an order-size minimum is a property of the broker's
+# instrument, not of how a strategy is sized on an account.
+FALLBACK_MIN_LOT = 0.01
+
+
+def broker_min_lot(full_symbol) -> float | None:
+    """The broker's real minimum order size for this instrument, in THIS
+    codebase's lot units (ALGODEV-55, 2026-09-29).
+
+    Used as the floor of risk-based sizing instead of AccountStrategy.fixed_lot,
+    which was only ever a guess at that minimum and turned out 10-100x too big
+    (fixed_lot=0.01 = 1 contract; live minVolume: FTMO 0.01 contract, IC Markets
+    0.1 contract -- so a $50-risk S021 trade was floored to $192). Read live
+    from the broker's own ProtoOASymbol every cycle, never stored, so a
+    contract-spec change on the broker side cannot desync it. None when the
+    symbol metadata lacks it (callers then fall back to fixed_lot)."""
+    min_volume = getattr(full_symbol, "minVolume", None)
+    lot_size = getattr(full_symbol, "lotSize", None)
+    if not min_volume or not lot_size:
+        return None
+    return min_volume / (VOLUME_PER_LOT_UNIT * lot_size)
+
 
 def lots_for_risk(risk_amount: float, stop_distance_points: float,
                    money_per_point_per_lot: float, min_lot: float) -> float:

@@ -84,6 +84,11 @@ DEFAULT_TICK_INTERVAL_S = 60
 PAPER_BOOK_PATH = ROOT / "data" / "s007_paper_book.json"
 PAPER_STRATEGY_NAME = "S007-paper"
 
+# Renew the cTrader access token at startup if it would expire within this
+# window (ALGODEV-48): the persistent session lives for hours, so the per-
+# minute workers' leeway is far too short here. One day covers a session.
+DAEMON_TOKEN_LEEWAY_S = 24 * 3600
+
 
 def _load_creds_and_config(account_strategy_id: int) -> dict:
     """One read of everything needed to start: broker credentials (fixed
@@ -103,13 +108,13 @@ def _load_creds_and_config(account_strategy_id: int) -> dict:
                 f"account_strategy {account_strategy_id} is strategy "
                 f"{link.strategy.name!r}, not S007 -- this daemon is S007-only")
         acc = link.account
-        creds_row = acc.credentials
+        # ALGODEV-48: central, locked refresh with a DAY-long leeway -- this
+        # process opens one session and keeps it, so the token must outlive
+        # the session, not just the next minute. A restart (container
+        # `restart: unless-stopped`) re-runs this and picks up a fresh pair.
+        from webapp.ctrader_tokens import fresh_ctrader_creds
         return dict(
-            creds=dict(client_id=creds_row.get("client_id"),
-                      client_secret=creds_row.get("client_secret"),
-                      access_token=creds_row.get("access_token"),
-                      account_id=int(acc.external_account_id) if acc.external_account_id else None,
-                      host=acc.broker_host),
+            creds=fresh_ctrader_creds(session, acc, leeway_s=DAEMON_TOKEN_LEEWAY_S),
             account_label=acc.label or acc.external_account_id,
             enabled=link.enabled,
             preset=link.preset,
@@ -247,7 +252,8 @@ def main() -> None:
             out = run_paper_cycle(book, symbol=summary["symbol"], m1=m1,
                                   logger=logger, preset=preset,
                                   money_per_point_per_lot=summary["lot_size"],
-                                  initial_balance=book.initial_balance)
+                                  initial_balance=book.initial_balance,
+                                  broker_min_lot=summary.get("broker_min_lot"))
             book.save(PAPER_BOOK_PATH)
             return out
         except Exception as exc:  # noqa: BLE001 -- see docstring

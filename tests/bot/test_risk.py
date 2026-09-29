@@ -74,3 +74,27 @@ def test_realistic_ger40_shape_hypothetical_wide_stop_floors_to_min_lot():
     risk_amount = balance * 0.25 / 100.0
     lots = lots_for_risk(risk_amount, 250.0, money_per_point_per_lot=114.3, min_lot=0.01)
     assert lots == 0.01
+
+
+# --- ALGODEV-55: broker's real minimum volume as the sizing floor -----------
+from types import SimpleNamespace
+
+from bot.risk import broker_min_lot
+
+
+def test_broker_min_lot_converts_open_api_volume_to_bot_lots():
+    # live 2026-09-29: FTMO GER40.cash/US100.cash lotSize=100 minVolume=1 (0.01 contract),
+    # IC Markets DE40/USTEC lotSize=100 minVolume=10 (0.1 contract)
+    assert broker_min_lot(SimpleNamespace(lotSize=100, minVolume=1)) == 0.0001
+    assert broker_min_lot(SimpleNamespace(lotSize=100, minVolume=10)) == 0.001
+
+
+def test_broker_min_lot_unknown_metadata_is_none():
+    assert broker_min_lot(SimpleNamespace(lotSize=100, minVolume=0)) is None
+    assert broker_min_lot(SimpleNamespace()) is None
+
+
+def test_real_minimum_lets_a_small_risk_trade_size_exactly():
+    # S021 on FTMO: $50 risk, 192-pt stop, $100/pt per bot lot -> 0.0026 lots, not 0.01
+    lots = lots_for_risk(50.0, 192.0, 100.0, min_lot=0.0001)
+    assert abs(lots * 192.0 * 100.0 - 50.0) < 1e-9

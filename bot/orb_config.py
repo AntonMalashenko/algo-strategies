@@ -44,7 +44,13 @@ SYMBOL_CANDIDATES = ["US100", "NAS100", "USTEC", "NAS100.cash", "US100.cash", "N
 # bot/symbol_resolver.py::resolve_symbol() looks up. No Asset row is assumed
 # to exist yet -- resolve_symbol() falls back to SYMBOL_CANDIDATES (logged
 # at WARNING) when it doesn't, so this is safe before any DB seeding.
-ASSET_SYMBOL = "NAS100"
+# ALGODEV-55 (2026-09-29): was "NAS100", which matches NO row in the seeded
+# `assets` table -- Nasdaq 100 is canonicalised there as "NASDAQ" (asset
+# id 6, shared with S011; IC Markets' verified ticker USTEC hangs off it).
+# With "NAS100" the resolver could never find a verified symbol and always
+# fell back to SYMBOL_CANDIDATES. Same instrument, so the IC Markets demo
+# account resolves to the same ticker it already traded (USTEC).
+ASSET_SYMBOL = "NASDAQ"
 PLATFORM = "CTRADER"
 
 # --- sizing ---

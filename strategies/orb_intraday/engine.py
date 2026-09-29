@@ -42,7 +42,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import OrbConfig
+from .config import OrbConfig, REVERSAL_MODES, REV_FADE, REV_SAR, REV_FLIP_OPPOSITE, REV_FLIP_OPEN
 
 # histdata.com's DAT_ASCII_NSXUSD_M1_*.csv files are timestamped in a fixed
 # UTC-5 (EST) clock year-round, never DST-adjusted (matching
@@ -108,6 +108,7 @@ class Trade:
     gross_pts: float
     net_pts: float
     be_moved: bool = False    # True if cfg.breakeven_at_r triggered on this trade (always False for ORB_BASE)
+    leg: int = 1              # 1 = primary trade; 2 = reversal leg (cfg.reversal_mode; never for ORB_BASE)
 
 
 def _day_session(day_bars: pd.DataFrame, d: pd.Timestamp, cfg: OrbConfig) -> pd.DataFrame | None:
@@ -156,7 +157,39 @@ def compute_adr14(daily: pd.DataFrame, cfg: OrbConfig) -> pd.Series:
     return out
 
 
+def _run_reversal_leg(sess: pd.DataFrame, start_ts: pd.Timestamp, direction: str,
+                      entry_price: float, stop_dist: float) -> tuple[pd.Timestamp, float, str, float]:
+    """Simulate one reversal leg from start_ts (inclusive -- the flip/stop bar itself is checked
+    for the new leg's stop, conservative) to session close. Returns (exit_time, exit_price,
+    exit_reason, stop_price). Fixed stop, no TP, time exit at the last session bar."""
+    stop_price = (entry_price - stop_dist) if direction == "long" else (entry_price + stop_dist)
+    rest = sess.loc[sess.index >= start_ts]
+    for ts, bar in rest.iterrows():
+        if direction == "long" and bar["low"] <= stop_price:
+            return ts, stop_price, "stop", stop_price
+        if direction == "short" and bar["high"] >= stop_price:
+            return ts, stop_price, "stop", stop_price
+    return rest.index[-1], rest["close"].iloc[-1], "time", stop_price
+
+
+def _stop_reason(be_moved: bool, trail_moved: bool) -> str:
+    if trail_moved:
+        return "trail"
+    return "breakeven" if be_moved else "stop"
+
+
+def _opposite(direction: str) -> str:
+    return "short" if direction == "long" else "long"
+
+
 def simulate(m1: pd.DataFrame, cfg: OrbConfig) -> list[Trade]:
+    if cfg.reversal_mode is not None:
+        if cfg.reversal_mode not in REVERSAL_MODES:
+            raise ValueError(f"unknown reversal_mode {cfg.reversal_mode!r}")
+        if cfg.breakeven_at_r is not None:
+            raise ValueError("reversal_mode and breakeven_at_r are not combinable")
+        if cfg.trail_adr_mult is not None or cfg.stop_on_close or cfg.time_stop_minutes is not None:
+            raise ValueError("reversal_mode is not combinable with trail/close/time stop variants")
     daily = compute_daily_sessions(m1, cfg)
     adr14 = compute_adr14(daily, cfg)
     dates_norm = m1.index.normalize()
@@ -196,6 +229,8 @@ def simulate(m1: pd.DataFrame, cfg: OrbConfig) -> list[Trade]:
             continue
 
         entry_price = U if direction == "long" else L
+        if cfg.reversal_mode == REV_FADE:
+            direction = _opposite(direction)   # trade against the breakout, at the touched band
         stop_dist = cfg.stop_adr_mult * adr
         stop_price = (entry_price - stop_dist) if direction == "long" else (entry_price + stop_dist)
 
@@ -210,26 +245,86 @@ def simulate(m1: pd.DataFrame, cfg: OrbConfig) -> list[Trade]:
         current_stop = stop_price
         be_moved = False
 
+        # Reversal modifier (default off -- cfg.reversal_mode is None for ORB_BASE, so
+        # flip_level stays None and the flip check below never fires).
+        rev_cutoff_ts = pd.Timestamp.combine(d.date(), cfg.reversal_cutoff or cfg.entry_cutoff)
+        flip_level = None
+        if cfg.reversal_mode == REV_FLIP_OPPOSITE:
+            flip_level = L if direction == "long" else U
+        elif cfg.reversal_mode == REV_FLIP_OPEN:
+            flip_level = O
+
+        # Stop-variant modifiers (all default off for ORB_BASE -- see config.py field comments).
+        trail_dist = cfg.trail_adr_mult * adr if cfg.trail_adr_mult is not None else None
+        trail_moved = False
+        best_px = entry_price
+        time_stop_ts = (entry_time + pd.Timedelta(minutes=cfg.time_stop_minutes)
+                        if cfg.time_stop_minutes is not None else None)
+        time_stop_done = False
+
         rest = sess.loc[sess.index >= entry_time]
         exit_time, exit_price, exit_reason = rest.index[-1], rest["close"].iloc[-1], "time"
         for ts, bar in rest.iterrows():
+            if flip_level is not None and ts <= rev_cutoff_ts and (
+                    (direction == "long" and bar["low"] <= flip_level)
+                    or (direction == "short" and bar["high"] >= flip_level)):
+                exit_time, exit_price, exit_reason = ts, flip_level, "flip"
+                break
             if direction == "long":
-                if bar["low"] <= current_stop:
-                    exit_time, exit_price, exit_reason = ts, current_stop, ("breakeven" if be_moved else "stop")
+                stop_probe = bar["close"] if cfg.stop_on_close else bar["low"]
+                if stop_probe <= current_stop:
+                    fill = bar["close"] if cfg.stop_on_close else current_stop
+                    exit_time, exit_price, exit_reason = ts, fill, _stop_reason(be_moved, trail_moved)
                     break
                 if be_trigger is not None and not be_moved and bar["high"] >= be_trigger:
                     current_stop, be_moved = entry_price, True
             else:
-                if bar["high"] >= current_stop:
-                    exit_time, exit_price, exit_reason = ts, current_stop, ("breakeven" if be_moved else "stop")
+                stop_probe = bar["close"] if cfg.stop_on_close else bar["high"]
+                if stop_probe >= current_stop:
+                    fill = bar["close"] if cfg.stop_on_close else current_stop
+                    exit_time, exit_price, exit_reason = ts, fill, _stop_reason(be_moved, trail_moved)
                     break
                 if be_trigger is not None and not be_moved and bar["low"] <= be_trigger:
                     current_stop, be_moved = entry_price, True
+            # Time-stop modifier (default off): one check, on the first bar at/after
+            # entry + time_stop_minutes -- exit at that bar's close if the trade is not in profit.
+            if time_stop_ts is not None and not time_stop_done and ts >= time_stop_ts:
+                time_stop_done = True
+                in_profit = bar["close"] > entry_price if direction == "long" else bar["close"] < entry_price
+                if not in_profit:
+                    exit_time, exit_price, exit_reason = ts, bar["close"], "time_stop"
+                    break
+            # Trailing-stop modifier (default off): ratchet AFTER this bar's stop check, so a
+            # new level only applies from the next bar (no same-bar high-then-low optimism).
+            if trail_dist is not None:
+                if direction == "long":
+                    best_px = max(best_px, bar["high"])
+                    if best_px - trail_dist > current_stop:
+                        current_stop, trail_moved = best_px - trail_dist, True
+                else:
+                    best_px = min(best_px, bar["low"])
+                    if best_px + trail_dist < current_stop:
+                        current_stop, trail_moved = best_px + trail_dist, True
 
         gross = (exit_price - entry_price) if direction == "long" else (entry_price - exit_price)
         cost = entry_price * cfg.cost_bps_roundtrip / 10_000.0
         trades.append(Trade(d, direction, entry_time, entry_price, stop_price,
                              exit_time, exit_price, exit_reason, adr, gross, gross - cost, be_moved))
+
+        rev_start = None
+        if exit_reason == "flip":
+            rev_start = exit_time
+        elif cfg.reversal_mode == REV_SAR and exit_reason == "stop" and exit_time <= rev_cutoff_ts:
+            rev_start = exit_time
+        if rev_start is not None:
+            r_dir = _opposite(direction)
+            r_entry = exit_price
+            r_exit_time, r_exit_price, r_reason, r_stop = _run_reversal_leg(
+                sess, rev_start, r_dir, r_entry, stop_dist)
+            r_gross = (r_exit_price - r_entry) if r_dir == "long" else (r_entry - r_exit_price)
+            r_cost = r_entry * cfg.cost_bps_roundtrip / 10_000.0
+            trades.append(Trade(d, r_dir, rev_start, r_entry, r_stop, r_exit_time, r_exit_price,
+                                 r_reason, adr, r_gross, r_gross - r_cost, False, leg=2))
     return trades
 
 

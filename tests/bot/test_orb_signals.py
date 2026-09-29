@@ -112,7 +112,7 @@ def broker(tmp_path):
     logger = StrategyLogger("S021-test", log_root=str(tmp_path), console=False)
 
     def run_cycle(broker_mode="off"):
-        with patch("bot.ctrader_orb.CTraderORB", lambda creds=None: _FakeAPI(state)):
+        with patch("bot.ctrader_orb.CTraderORB", lambda creds=None, **_kw: _FakeAPI(state)):
             return run_cycle_for_account(None, logger=logger, symbol_candidates=["US100"],
                                          history_days=30, broker=broker_mode)
 

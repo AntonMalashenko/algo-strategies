@@ -11,6 +11,15 @@ run-every-15-minutes model (no long-lived process needed).
 
 Verify credentials with:  python -m bot.paper --check
 
+Access-token auto-refresh (ALGODEV-48): every session first makes sure the
+OAuth2 access token is still valid and renews it headlessly through
+`bot.clients.ctrader.auth` when it is close to expiry -- the same pre-flight
+decision (`auth.refresh_if_needed`) the newer `bot/clients/ctrader/` client
+makes, so S007/S021 (still on this adapter, see ALGODEV-49) get exactly the
+behaviour S011 got. It has to run BEFORE `reactor.run()`: the refresh is
+blocking HTTP, and a session that died on an expired token cannot be retried
+in the same process. Pass `on_token_refreshed` to persist the renewed pair.
+
 NOTE: message/field names follow the official Open API spec; small
 adjustments may be needed against the installed SDK version — debug
 interactively on first run.
@@ -24,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from bot import config as C
+from bot.clients.ctrader import auth
 
 try:
     from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
@@ -45,7 +55,12 @@ class CTraderAdapter:
     """Synchronous facade over the async SDK: each public method queues the
     work and runs the reactor until done. One instance per bot cycle."""
 
-    def __init__(self, require_account: bool = True):
+    def __init__(self, require_account: bool = True, on_token_refreshed=None):
+        """`on_token_refreshed(fields: dict)` is called with the renewed
+        access_token / refresh_token / token_expires_at whenever the pre-
+        flight refresh fired, so the caller can persist them. Omitting it
+        is not fatal for one cycle, but once the broker rotates the refresh
+        token an unpersisted renewal leaves the stored one dead."""
         if not HAVE_SDK:
             raise RuntimeError("pip install ctrader-open-api first")
         creds = C.ctrader_credentials()
@@ -53,6 +68,7 @@ class CTraderAdapter:
         self.secret = creds["client_secret"]
         self.token = creds["access_token"]
         self.account = int(creds["account_id"] or 0)
+        self._init_token_refresh(creds, on_token_refreshed)
         host = creds["host"] or EndPoints.PROTOBUF_DEMO_HOST
         need = [self.client_id, self.secret, self.token]
         if require_account:
@@ -74,6 +90,49 @@ class CTraderAdapter:
         # separately from the actual trading-data round trips.
         self._session_timings: dict = {}
 
+    # ---------- token refresh (ALGODEV-48) ----------
+
+    def _init_token_refresh(self, creds: dict, on_token_refreshed=None) -> None:
+        """Remember the OAuth2 refresh material. Shared by this __init__ and
+        subclasses that build themselves from an explicit creds dict
+        (CTraderS007(creds=...)), so both construction paths refresh alike."""
+        self.refresh_token = creds.get("refresh_token")
+        self.token_expires_at = creds.get("token_expires_at")
+        self.on_token_refreshed = on_token_refreshed
+
+    def _ensure_fresh_token(self) -> None:
+        """Pre-flight: renew the access token if it is expired or nearly so.
+
+        Must run before the reactor starts (see the module docstring). A
+        no-op for an adapter built without the refresh attributes (e.g. a
+        test double that skipped __init__), and when the token is still
+        valid -- the DB-driven runner normally refreshes centrally, under a
+        per-account lock, before constructing the adapter at all
+        (webapp/ctrader_tokens.py), which makes this the backstop for
+        long-lived processes and the single-account CLI paths.
+        Raises auth.TokenRefreshError when the broker refuses the renewal.
+        """
+        if not hasattr(self, "refresh_token"):
+            return
+        refreshed = auth.refresh_if_needed({
+            "client_id": self.client_id,
+            "client_secret": self.secret,
+            "access_token": self.token,
+            "refresh_token": self.refresh_token,
+            "token_expires_at": self.token_expires_at,
+        })
+        if refreshed is None:
+            return
+        self.token = refreshed.access_token
+        self.refresh_token = refreshed.refresh_token
+        self.token_expires_at = refreshed.expires_at.isoformat()
+        if self.on_token_refreshed is not None:
+            self.on_token_refreshed(refreshed.as_credentials())
+        else:
+            print("[ctrader] access token refreshed but NOT persisted (no "
+                  "on_token_refreshed callback) -- the stored refresh token may "
+                  "now be stale; store the new pair via scripts/ctrader_oauth.py")
+
     # ---------- session plumbing ----------
 
     def _run(self, work, auth_account: bool = True):
@@ -83,6 +142,7 @@ class CTraderAdapter:
         account list before the account id is known."""
         from twisted.internet import reactor
 
+        self._ensure_fresh_token()
         self._result, self._error = None, None
         self._session_timings = {}
         finished = threading.Event()

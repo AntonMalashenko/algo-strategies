@@ -176,6 +176,14 @@ tasks:
     command: python -m scripts.position_audit --account-strategy-id 5
     schedule: "55 13 * * 1-5"         # 13:55 UTC, 5min before S021's 14:00 UTC open
     tz: UTC
+  # ALGODEV-55: FTMO account ftmo-17211983 (account 5) -- same audits, its own links
+  - name: s007_ftmo_position_audit
+    command: python -m scripts.position_audit --account-strategy-id 6
+    schedule: "56 9 * * 1-5"          # 09:56 Kyiv, offset 1min from the IC Markets audit
+  - name: s021_ftmo_position_audit
+    command: python -m scripts.position_audit --account-strategy-id 7
+    schedule: "56 13 * * 1-5"         # 13:56 UTC
+    tz: UTC
   # ALGODEV-45 step 1: S007 stall watchdog (scripts/s007_watchdog.py). Reads
   # AccountStrategy.last_cycle_at only -- never touches the broker, never
   # kills/restarts anything (there is nothing persistent to manage yet;

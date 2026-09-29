@@ -49,6 +49,7 @@ class FakeCTraderS007E2E:
     """
 
     def __init__(self, creds=None, require_account=True, *,
+                 on_token_refreshed=None,
                  balance: float = 10_000.0, money_per_point_per_lot: float = 114.3,
                  slippage_points: float = 0.0):
         self.creds = creds
@@ -159,7 +160,7 @@ def fake(monkeypatch):
     (e.g. C5's two-accounts case) construct their own FakeCTraderS007E2E
     directly and DON'T use this fixture."""
     f = FakeCTraderS007E2E()
-    fake_mod = types.SimpleNamespace(CTraderS007=lambda creds=None, require_account=True: f)
+    fake_mod = types.SimpleNamespace(CTraderS007=lambda creds=None, require_account=True, **_kw: f)
     monkeypatch.setitem(sys.modules, "bot.ctrader_s007", fake_mod)
     return f
 
@@ -169,7 +170,7 @@ def install_fake(monkeypatch, fake_broker: FakeCTraderS007E2E) -> None:
     (C-layer, multi-account) that build their own fake instance(s) instead of
     using the `fake` fixture."""
     fake_mod = types.SimpleNamespace(
-        CTraderS007=lambda creds=None, require_account=True: fake_broker)
+        CTraderS007=lambda creds=None, require_account=True, **_kw: fake_broker)
     monkeypatch.setitem(sys.modules, "bot.ctrader_s007", fake_mod)
 
 

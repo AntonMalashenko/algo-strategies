@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import scripts.podman_healthcheck as hc  # noqa: E402
@@ -298,3 +300,86 @@ def test_s007_link_is_skipped_by_daily_check_even_when_never_run(tmp_path, monke
 
     events_file = tmp_path / "HealthcheckTest" / f"events-{time.strftime('%Y-%m-%d')}.jsonl"
     assert not events_file.exists() or '"kind": "error"' not in events_file.read_text()
+
+
+# ---------------------------------------------------------------------------
+# ALGODEV-48 track 2: alert on links whose cycles tick but keep failing
+# (status="error" / last_error) -- how S011 sat on an expired cTrader token
+# for ~34h on 2026-09-21..22 without a single alert.
+# ---------------------------------------------------------------------------
+
+import datetime as _dt  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+EXPIRED_TOKEN_ERROR = ("RuntimeError: cTrader error: account auth failed: "
+                       "CH_ACCESS_TOKEN_INVALID: Access token expired")
+
+
+class _RecordingLog:
+    def __init__(self):
+        self.errors = []
+
+    def error(self, message, exc=None):
+        self.errors.append(message)
+
+
+def _link(link_id=3, *, status="error", last_error="TRADING_BAD_VOLUME", strategy="S011"):
+    return SimpleNamespace(id=link_id, status=status, last_error=last_error,
+                           last_cycle_at=None, strategy=SimpleNamespace(name=strategy),
+                           account=SimpleNamespace(id=7, label="ctrader-x"))
+
+
+@pytest.fixture
+def link_errors(tmp_path, monkeypatch):
+    log = _RecordingLog()
+    monkeypatch.setattr(hc, "LOG", log)
+    monkeypatch.setattr(hc, "LINK_ERROR_STATE_PATH", tmp_path / "link_errors.json")
+    return log
+
+
+T0 = _dt.datetime(2026, 9, 29, 12, 0, tzinfo=_dt.timezone.utc)
+
+
+def _at(minutes):
+    return T0 + _dt.timedelta(minutes=minutes)
+
+
+def test_expired_token_alerts_on_first_sighting(link_errors):
+    hc._check_link_errors([_link(last_error=EXPIRED_TOKEN_ERROR)], now_utc=T0)
+    assert len(link_errors.errors) == 1
+    assert "CH_ACCESS_TOKEN_INVALID" in link_errors.errors[0]
+    assert "--db-account 7" in link_errors.errors[0]     # tells the human what to run
+
+
+def test_ordinary_error_waits_for_the_streak(link_errors):
+    hc._check_link_errors([_link()], now_utc=_at(0))
+    hc._check_link_errors([_link()], now_utc=_at(10))
+    assert link_errors.errors == []
+    hc._check_link_errors([_link()], now_utc=_at(hc.LINK_ERROR_ALERT_AFTER_MINUTES))
+    assert len(link_errors.errors) == 1
+
+
+def test_recovery_resets_the_streak(link_errors):
+    hc._check_link_errors([_link()], now_utc=_at(0))
+    hc._check_link_errors([_link(status="idle", last_error=None)], now_utc=_at(10))
+    hc._check_link_errors([_link()], now_utc=_at(25))      # a NEW streak starts here
+    assert link_errors.errors == []
+
+
+def test_persisting_error_realerts_only_after_the_throttle(link_errors):
+    hc._check_link_errors([_link(last_error=EXPIRED_TOKEN_ERROR)], now_utc=_at(0))
+    hc._check_link_errors([_link(last_error=EXPIRED_TOKEN_ERROR)], now_utc=_at(5))
+    hc._check_link_errors([_link(last_error=EXPIRED_TOKEN_ERROR)], now_utc=_at(30))
+    assert len(link_errors.errors) == 1
+    hc._check_link_errors([_link(last_error=EXPIRED_TOKEN_ERROR)],
+                          now_utc=_at(hc.LINK_ERROR_REALERT_MINUTES))
+    assert len(link_errors.errors) == 2
+
+
+def test_healthy_links_and_every_broker_are_covered(link_errors):
+    """Not cTrader-specific: a Bybit (S009) link that keeps failing alerts too."""
+    links = [_link(1, status="idle", last_error=None),
+             _link(2, strategy="S009", last_error="bybit: 10003 invalid api key")]
+    hc._check_link_errors(links, now_utc=_at(0))
+    hc._check_link_errors(links, now_utc=_at(hc.LINK_ERROR_ALERT_AFTER_MINUTES))
+    assert len(link_errors.errors) == 1 and "S009" in link_errors.errors[0]

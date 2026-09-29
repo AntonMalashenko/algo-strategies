@@ -39,6 +39,8 @@ accounts.yml
 .claude/settings.local.json
 data/app.db
 data/app.db.bak-*
+# one-off Fernet-encrypted OAuth hand-off blobs (scripts/seed_ftmo_account.py)
+data/*.enc
 data/state/
 # ALGODEV-45 step 1: scripts/s007_watchdog.py runtime artifacts -- the
 # sentinel alert file and its dedupe-state, not source.

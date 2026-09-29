@@ -22,6 +22,10 @@
 #   scripts/podman_restart.sh              # restart the stack as-is
 #   scripts/podman_restart.sh --rebuild    # rebuild algo-worker:latest first, then restart
 #
+# Step 3 brings back every standing service (ofelia, s007-daemon, redis),
+# then verifies s007-daemon is actually Up -- the script exits non-zero if
+# it is not, so a dead paper daemon can't hide behind a "done".
+#
 # The cleanup step at the end always runs, regardless of --rebuild -- not
 # an option. ofelia's job-run containers are meant to self-delete
 # (ofelia.job-run.dispatch.delete=true, docker-compose.yml) but a host
@@ -67,6 +71,8 @@ fi
 # if the machine is ever renamed, update both places by hand.
 MACHINE_NAME="podman-machine-default"
 WORKER_IMAGE="algo-worker:latest"
+DAEMON_SERVICE="s007-daemon"   # docker-compose.yml service name
+DAEMON_FAILED=0
 
 echo "=== 1/4: podman machine ($MACHINE_NAME) ==="
 STATE="unknown"
@@ -88,7 +94,48 @@ else
 fi
 
 echo "=== 3/4: restarting the compose stack ==="
-"$PODMAN" compose up -d --force-recreate ofelia
+# Same socket pitfall scripts/podman_healthcheck.py::_compose_env documents:
+# `machine start` may bind a per-start temp socket instead of the default
+# one, and `podman compose` (docker-compose underneath) only finds it via
+# DOCKER_HOST. Read the actual bound path instead of assuming the default.
+SOCK_PATH="$("$PODMAN" machine inspect "$MACHINE_NAME" 2>/dev/null \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["ConnectionInfo"]["PodmanSocket"]["Path"])' 2>/dev/null || true)"
+# Only when that socket really exists: found 2026-09-29, `machine inspect`
+# kept reporting the per-start temp path after a restart had bound the
+# default /var/run/docker.sock instead, and forcing DOCKER_HOST to the
+# missing path made compose fail ("Cannot connect to the Docker daemon").
+# In that case fall back to the default socket explicitly: left unset,
+# `podman compose` injects the same stale path itself.
+DEFAULT_DOCKER_SOCK="/var/run/docker.sock"
+if [ -n "$SOCK_PATH" ] && [ -S "$SOCK_PATH" ]; then
+  export DOCKER_HOST="unix://$SOCK_PATH"
+elif [ -S "$DEFAULT_DOCKER_SOCK" ]; then
+  export DOCKER_HOST="unix://$DEFAULT_DOCKER_SOCK"
+fi
+
+# Standing services, same list as scripts/podman_healthcheck.py::
+# HEAL_SERVICES -- nothing else re-launches them after a machine restart
+# (`machine start` resumes no container). ofelia and s007-daemon are
+# force-recreated so a --rebuild actually reaches them (a long-lived
+# container keeps running its OLD image until recreated); recreating the
+# daemon mid-session is safe -- it places no broker order and its paper
+# book is persisted under data/. redis is only brought up, never recreated.
+"$PODMAN" compose up -d --force-recreate ofelia s007-daemon
+"$PODMAN" compose up -d redis
+
+# Found live 2026-09-29: after a machine restart the daemon was gone
+# entirely and nothing reported it -- check it explicitly instead of
+# trusting compose's exit code.
+DAEMON_STATE="$("$PODMAN" ps -a --filter "label=com.docker.compose.service=$DAEMON_SERVICE" \
+  --format '{{.Status}}' | head -n 1)"
+case "$DAEMON_STATE" in
+  Up*) echo "$DAEMON_SERVICE: $DAEMON_STATE" ;;
+  *)
+    echo "ERROR: $DAEMON_SERVICE is not running (state: '${DAEMON_STATE:-absent}') --" \
+         "check \`$PODMAN logs\` for it and reports/logs/S007-paper/" >&2
+    DAEMON_FAILED=1
+    ;;
+esac
 
 echo "=== 4/4: cleaning up leftover $WORKER_IMAGE containers (mandatory, always runs) ==="
 # NOTE: "status=dead" deliberately omitted -- found live 2026-08-21, this
@@ -99,11 +146,17 @@ echo "=== 4/4: cleaning up leftover $WORKER_IMAGE containers (mandatory, always 
 # genuinely wedged "dead" container (rare -- host OOM-kills mid-run) will
 # just need `podman rm -f` by hand until/unless this podman version adds
 # support back.
+#
+# The s007-daemon service runs FROM the same $WORKER_IMAGE, so an exited
+# daemon (e.g. SIGKILLed by a machine stop) matches the same filter as a
+# stranded job-run container -- it is excluded here: it is a standing
+# service to restart (step 3), not leftover to delete.
 STALE_IDS="$("$PODMAN" ps -a \
   --filter "ancestor=$WORKER_IMAGE" \
   --filter "status=created" \
   --filter "status=exited" \
-  -q)"
+  --format '{{.ID}} {{index .Labels "com.docker.compose.service"}}' \
+  | awk -v keep="$DAEMON_SERVICE" '$2 != keep {print $1}')"
 if [ -n "$STALE_IDS" ]; then
   echo "$STALE_IDS" | xargs "$PODMAN" rm -f
   N="$(echo "$STALE_IDS" | wc -l | tr -d ' ')"
@@ -115,3 +168,4 @@ fi
 echo
 echo "=== done -- current stack state ==="
 "$PODMAN" compose ps
+exit "$DAEMON_FAILED"

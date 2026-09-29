@@ -249,12 +249,14 @@ def sync_account_strategy(session, link: AccountStrategy,
 
     from bot.ctrader_s007 import CTraderS007   # local: no SDK needed to import
 
-    creds_row = acc.credentials
-    api = CTraderS007(creds=dict(
-        client_id=creds_row.get("client_id"), client_secret=creds_row.get("client_secret"),
-        access_token=creds_row.get("access_token"),
-        account_id=int(acc.external_account_id) if acc.external_account_id else None,
-        host=acc.broker_host))
+    from webapp.ctrader_tokens import fresh_ctrader_creds, token_persister
+
+    # ALGODEV-48: same central, locked token refresh as the trading workers
+    # (this sync runs as its own subprocess right after them, on the same
+    # account) -- it used to pass only the bare access token, so it could
+    # neither refresh nor survive a token the worker had just rotated.
+    api = CTraderS007(creds=fresh_ctrader_creds(session, acc),
+                      on_token_refreshed=token_persister(session, acc))
 
     snap = api.sync_snapshot(days=days)
     n = apply_snapshot(session, acc, strat, snap)

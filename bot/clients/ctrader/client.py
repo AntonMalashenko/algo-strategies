@@ -276,21 +276,18 @@ class CTraderApiClient(BaseClient):
         missing/unknown expiry counts as "expired", so the first cycle after
         this feature ships refreshes once and records a real expiry.
         """
-        bundle = auth.TokenBundle.from_credentials({
+        # The decision itself lives in auth.refresh_if_needed so this client
+        # and the legacy bot/ctrader.py adapter can never disagree on when a
+        # token is "nearly expired" or on what to do without a refresh token.
+        refreshed = auth.refresh_if_needed({
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "token_expires_at": self.token_expires_at,
         })
-        if bundle is None or not bundle.needs_refresh():
+        if refreshed is None:
             return
-        if not self.refresh_token:
-            # Nothing to refresh WITH. Not fatal: the current token may still
-            # work (this is also the state of every account authorised before
-            # refresh tokens were stored), so let the session attempt auth and
-            # report the broker's own verdict.
-            return
-        refreshed = auth.refresh_access_token(
-            self.client_id, self.client_secret, self.refresh_token)
         self.access_token = refreshed.access_token
         self.refresh_token = refreshed.refresh_token
         self.token_expires_at = refreshed.expires_at.isoformat()

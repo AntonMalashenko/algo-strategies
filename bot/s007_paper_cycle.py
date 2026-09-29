@@ -38,7 +38,8 @@ def run_paper_cycle(book: PaperBook, *, symbol: str, m1, logger: StrategyLogger,
                     use_fixed_lot: bool | None = None,
                     daily_risk_cap_pct: float | None = None,
                     fx_rate: float | None = None,
-                    initial_balance: float | None = None) -> dict:
+                    initial_balance: float | None = None,
+                    broker_min_lot: float | None = None) -> dict:
     """Run one full paper cycle against `book` and return a summary dict.
 
     `money_per_point_per_lot` is the RAW, quote-currency value the broker
@@ -77,7 +78,8 @@ def run_paper_cycle(book: PaperBook, *, symbol: str, m1, logger: StrategyLogger,
         stop_flag_active=lambda: False, cid=cid, status_info=status_info)
 
     actions = decide(symbol, m1, book.as_broker_positions(), book.balance,
-                     money_per_point_per_lot, closed_deals=_as_closed_deals(book))
+                     money_per_point_per_lot, closed_deals=_as_closed_deals(book),
+                     broker_min_lot=broker_min_lot)
 
     # 3. Apply to the virtual book instead of sending anything.
     last_bar_ts = m1.index[-1] if len(m1) else None

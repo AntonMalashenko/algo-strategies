@@ -65,7 +65,11 @@ def _make_link(Session, *, external_account_id="1", risk_pct=0.25, fixed_lot=0.0
     s.flush()
     link = AccountStrategy(account_id=acc.id, strategy_id=strat.id, enabled=True, status="idle",
                            risk_pct=risk_pct, fixed_lot=fixed_lot, use_fixed_lot=use_fixed_lot,
-                           initial_balance=initial_balance)
+                           initial_balance=initial_balance,
+                           # ALGODEV-55: the S007 worker now honours broker_mode
+                           # (default "off" = no new orders); these tests model
+                           # a live-executing link.
+                           broker_mode="execute")
     s.add(link)
     s.commit()
     link_id = link.id
@@ -74,7 +78,7 @@ def _make_link(Session, *, external_account_id="1", risk_pct=0.25, fixed_lot=0.0
 
 
 def install_fake_by_account(monkeypatch, brokers_by_account_id: dict):
-    def _ctor(creds=None, require_account=True):
+    def _ctor(creds=None, require_account=True, **_kw):
         return brokers_by_account_id[creds["account_id"]]
     fake_mod = types.SimpleNamespace(CTraderS007=_ctor)
     monkeypatch.setitem(sys.modules, "bot.ctrader_s007", fake_mod)

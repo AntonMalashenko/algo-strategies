@@ -103,6 +103,32 @@ launchd S007 job to the Docker/Ofelia path.
   (`--account-strategy-id`), `list`.
 - `app.py` — the FastAPI dashboard, see "Web UI" below.
 
+## Risk settings in the DB (ALGODEV-55, migration 008)
+
+Per-account and per-(account, strategy) risk knobs live in the DB, not in
+code, so a new (e.g. prop-firm) account is configured with the CLI alone:
+
+- `Account.guard_daily_loss_pct` / `guard_max_loss_pct` (% of
+  `Account.initial_balance`) + `day_reset_tz` -- our own account-wide loss
+  guard, enforced by `bot/account_guard.py` before every NEW entry of every
+  strategy on the account (S007 and S021 today). It only blocks new risk;
+  open positions keep their own stop-loss. NULL = off (all pre-008 accounts).
+- `Account.evaluation_phase` / `profit_target_pct` -- prop bookkeeping,
+  informational only. The firm's own hard limits live on the `brokers` row.
+- `AccountStrategy.daily_risk_cap_pct` -- the strategy's daily risk budget on
+  that account; NULL = config default (S007 `DAILY_RISK_CAP_PCT`, S021 none).
+- `AccountStrategy.broker_mode` is now honoured by the S007 worker too
+  (`off`/`dry`/`execute`); before, S007 placed real orders regardless.
+
+```
+python -m webapp.cli set-account-risk --account-id 5 --daily-loss-pct 4 --max-loss-pct 8 \
+    --day-reset-tz Europe/Prague
+python -m webapp.cli set-strategy-risk --account-strategy-id 6 --risk 0.25 \
+    --daily-risk-cap-pct 2 --broker-mode execute      # "none" clears a value
+```
+The FTMO account itself (broker row, account, S007/S021 links, verified
+symbols) was created by the idempotent `scripts/seed_ftmo_account.py`.
+
 ## Environment
 ```
 APP_SECRET_KEY=<long random string>     # REQUIRED — derives the Fernet key for credentials_enc

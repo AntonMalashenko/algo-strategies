@@ -163,6 +163,27 @@ class Account(Base):
     # nowhere correct to live.
     initial_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # --- account-level risk limits (ALGODEV-55, migration 008) -------------
+    # OUR OWN buffered limits for the whole account, enforced by
+    # bot/account_guard.py before every new entry of every strategy on the
+    # account (variant A: new risk is blocked, open positions are left to
+    # their own stop-losses). Percent of `initial_balance` above, the same
+    # convention prop firms use -- set them a notch TIGHTER than the firm's
+    # hard limit (Broker.daily_loss_cap_pct / max_drawdown_pct), e.g. 4% vs
+    # FTMO's 5%. NULL = check off; an account with neither set (every
+    # pre-008 account) trades exactly as before.
+    guard_daily_loss_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    guard_max_loss_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # IANA timezone of the firm's trading-day boundary the daily loss is
+    # measured from (FTMO: midnight CE(S)T -> "Europe/Prague"). NULL -> UTC.
+    day_reset_tz: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Evaluation bookkeeping for a prop account -- informational, read by
+    # no trading code: which phase this account is in and its profit target
+    # (% of initial_balance). The hard limits live on Broker (firm policy)
+    # and the guards above (ours).
+    evaluation_phase: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    profit_target_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # broker credentials: one encrypted JSON blob, shape depends on `broker`
     # (see webapp/schemas/accounts.py's CREDENTIALS_BY_BROKER) -- set/read via
     # the `credentials` property, never the raw _enc column.
@@ -223,6 +244,11 @@ class AccountStrategy(Base):
     preset: Mapped[str | None] = mapped_column(String(32), nullable=True)  # overrides Strategy.default_preset
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)  # resolved/forced symbol
     risk_pct: Mapped[float] = mapped_column(Float, default=0.25)
+    # Sizing MODE for this (account, strategy): use_fixed_lot=True trades
+    # exactly fixed_lot (bot lots, 0.01 = 1 index contract) every order;
+    # False sizes each order from risk_pct. fixed_lot is NOT a minimum lot any
+    # more (ALGODEV-55): the minimum is the broker's own per-instrument
+    # minVolume, read live every cycle (bot/risk.py::broker_min_lot).
     fixed_lot: Mapped[float] = mapped_column(Float, default=0.01)
     use_fixed_lot: Mapped[bool] = mapped_column(Boolean, default=True)
     # seed capital for THIS (account, strategy) pair's own paper/shadow
@@ -234,6 +260,12 @@ class AccountStrategy(Base):
     # with independent capital allocations/risk bases, so this stays on the
     # per-pair association row, not the account.
     initial_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # This strategy's own daily risk budget on this account, % of
+    # initial_balance above (or live balance when that is NULL) -- ALGODEV-55,
+    # migration 008. NULL = the strategy's config default (S007:
+    # bot/s007_config.py::DAILY_RISK_CAP_PCT; S021: no cap). Replaces
+    # editing code to change a per-account budget.
+    daily_risk_cap_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     # "off" (shadow, default) | "dry" (compute+log intended orders, no broker
     # calls) | "execute" (place real orders) -- see webapp/schemas/enums.py's
     # BrokerMode. Per-(account,strategy) so flipping ONE link to live never

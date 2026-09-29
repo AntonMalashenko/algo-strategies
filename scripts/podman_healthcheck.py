@@ -293,6 +293,83 @@ def _check_daily_strategy_freshness(now: datetime.datetime, links) -> None:
                 exc=RuntimeError(f"{link.strategy.name} stale beyond self-heal margin"))
 
 
+# ALGODEV-48 track 2: the freshness checks above only look at last_cycle_at,
+# so a link that TICKS on schedule but FAILS every time looked perfectly
+# healthy -- exactly how S011 sat on CH_ACCESS_TOKEN_INVALID for ~34h
+# (2026-09-21..22, ~136 failed cycles) with nothing alerting.
+#
+# Alert once a link has been in status="error" continuously for this long.
+# Long enough that one transient broker hiccup (which the next cycle clears)
+# stays quiet, short enough to span two failed ticks of the slowest intraday
+# cadence in deployment/schedule.yml (S009/S011 every 15 min).
+LINK_ERROR_ALERT_AFTER_MINUTES = 20
+# While an error persists, repeat the alert at most this often instead of on
+# every 5-minute healthcheck run.
+LINK_ERROR_REALERT_MINUTES = 60
+# Error streak bookkeeping between runs of this (stateless, launchd-driven)
+# script: {link_id: {"since": iso, "last_alert": iso | None}}.
+LINK_ERROR_STATE_PATH = ROOT / "data" / "state" / "healthcheck_link_errors.json"
+
+
+def _load_link_error_state() -> dict:
+    try:
+        return json.loads(LINK_ERROR_STATE_PATH.read_text()) if LINK_ERROR_STATE_PATH.exists() else {}
+    except Exception as exc:
+        LOG.error("could not read healthcheck_link_errors.json -- starting a fresh error streak",
+                  exc=exc)
+        return {}
+
+
+def _check_link_errors(links, *, now_utc: datetime.datetime | None = None) -> None:
+    """Alert on enabled links whose LAST cycle failed (status="error" with a
+    last_error), for every strategy and broker -- the "ticks, but every tick
+    fails" failure class the freshness checks cannot see.
+
+    Credential failures (expired/refused cTrader token, see
+    bot.clients.ctrader.auth.needs_human_reauth) alert on the FIRST sighting:
+    they never clear on their own, a human has to re-authorise the account.
+    Anything else alerts once the error streak outlives
+    LINK_ERROR_ALERT_AFTER_MINUTES, then at most every
+    LINK_ERROR_REALERT_MINUTES while it lasts. A link that recovers drops out
+    of the state file, so its next failure starts a fresh streak.
+    """
+    from bot.clients.ctrader.auth import needs_human_reauth
+
+    now_utc = now_utc or datetime.datetime.now(datetime.timezone.utc)
+    previous = _load_link_error_state()
+    current = {}
+    for link in links:
+        if link.status != "error" or not link.last_error:
+            continue
+        key = str(link.id)
+        entry = previous.get(key) or {"since": now_utc.isoformat(), "last_alert": None}
+        current[key] = entry
+        since = datetime.datetime.fromisoformat(entry["since"])
+        last_alert = (datetime.datetime.fromisoformat(entry["last_alert"])
+                      if entry.get("last_alert") else None)
+        reauth = needs_human_reauth(link.last_error)
+        overdue = now_utc - since >= datetime.timedelta(minutes=LINK_ERROR_ALERT_AFTER_MINUTES)
+        throttled = (last_alert is not None and now_utc - last_alert
+                     < datetime.timedelta(minutes=LINK_ERROR_REALERT_MINUTES))
+        if not (reauth or overdue) or throttled:
+            continue
+        hint = (" -- cTrader credentials need a human: re-authorise once via "
+                "`python -m scripts.ctrader_oauth auth-url ...` then "
+                f"`exchange --code ... --db-account {link.account.id}`" if reauth else "")
+        LOG.error(
+            f"{link.strategy.name} account_strategy {link.id} "
+            f"({link.account.label or link.account.id}): every cycle failing since "
+            f"{entry['since']} (last_cycle_at={link.last_cycle_at}): "
+            f"{link.last_error[:500]}{hint}",
+            exc=RuntimeError(f"{link.strategy.name} cycles failing"))
+        entry["last_alert"] = now_utc.isoformat()
+    try:
+        LINK_ERROR_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LINK_ERROR_STATE_PATH.write_text(json.dumps(current, indent=2))
+    except Exception as exc:
+        LOG.error("could not write healthcheck_link_errors.json", exc=exc)
+
+
 def _check_scheduled_strategies() -> None:
     """DB-driven strategies (S007/S009/S011/...) only resume ticking once
     ofelia is actually back up -- a heal above fixes the container, but the
@@ -309,6 +386,7 @@ def _check_scheduled_strategies() -> None:
         now = datetime.datetime.now()
         _check_s007_freshness(now, links)
         _check_daily_strategy_freshness(now, links)
+        _check_link_errors(links)
         session.close()
     except Exception as exc:
         LOG.error("scheduled-strategy freshness check itself failed", exc=exc)

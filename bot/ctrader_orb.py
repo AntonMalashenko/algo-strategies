@@ -47,6 +47,7 @@ import pandas as pd
 
 from bot.ctrader import HAVE_SDK, Protobuf
 from bot.ctrader_s007 import CTraderS007, PRICE_SCALE
+from bot.risk import broker_min_lot
 
 if HAVE_SDK:
     from twisted.internet import defer
@@ -67,6 +68,11 @@ if HAVE_SDK:
 # lets bot/orb_config.STRATEGY.session_open == time(9, 30) mean exactly what
 # the backtest means by it. Matches engine.py's HISTDATA_FIXED_OFFSET.
 FIXED_EST_OFFSET = "Etc/GMT+5"
+
+# Closing-deal lookback for the account-level loss guard (ALGODEV-55): must
+# cover everything since the prop firm's day boundary, which is < 24h ago by
+# definition; also inside cTrader's 7-day ProtoOADealListReq window cap.
+DEAL_LOOKBACK_MS = 24 * 3600 * 1000
 
 
 class CTraderORB(CTraderS007):
@@ -338,16 +344,25 @@ class CTraderORB(CTraderS007):
                         f"none of {symbol_candidates} found; broker symbols "
                         f"e.g. {sorted(self._symbols.keys())[:15]}")
 
-                full_symbol, balance, m1, m15, reconciled = yield defer.gatherResults(
+                # ALGODEV-55: last 24h of closing deals, for the account-level
+                # loss guard (bot/account_guard.py) -- same fetch and same
+                # "never fail the cycle over it" errback as
+                # CTraderS007.run_live_cycle's own deal list.
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                d_deal_list = self._deal_list_step(now_ms - DEAL_LOOKBACK_MS, now_ms)
+                d_deal_list.addErrback(lambda f: [])
+
+                full_symbol, balance, m1, m15, reconciled, closed_deals = yield defer.gatherResults(
                     [self._get_full_symbol_step(symbol), self._get_balance_step(),
                      self._get_m1_step(symbol, today_days),
                      self._get_m15_step(symbol, history_days),
-                     self._reconcile_full_step()],
+                     self._reconcile_full_step(), d_deal_list],
                     consumeErrors=True)
                 money_per_point_per_lot = full_symbol.lotSize
 
                 actions = decide(symbol, m1, m15, reconciled["positions"], reconciled["orders"],
-                                 balance, money_per_point_per_lot)
+                                 balance, money_per_point_per_lot, closed_deals=closed_deals,
+                                 broker_min_lot=broker_min_lot(full_symbol))
 
                 results = []
                 for a in actions:

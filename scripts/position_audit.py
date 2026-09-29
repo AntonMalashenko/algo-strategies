@@ -75,11 +75,11 @@ def audit_account_strategy(account_strategy_id: int) -> int:
                 f"supposed to hold positions across days, 'any open position' is not a "
                 f"valid staleness test for them)")
         acc = link.account
-        creds_row = acc.credentials
-        creds = dict(client_id=creds_row.get("client_id"), client_secret=creds_row.get("client_secret"),
-                    access_token=creds_row.get("access_token"),
-                    account_id=int(acc.external_account_id) if acc.external_account_id else None,
-                    host=acc.broker_host)
+        # ALGODEV-48: refreshed centrally (locked, persisted) before the
+        # session is closed below -- this audit shares the account with the
+        # S007/S021 workers, and used to pass only the bare access token.
+        from webapp.ctrader_tokens import fresh_ctrader_creds
+        creds = fresh_ctrader_creds(session, acc)
         account_label = acc.label or acc.external_account_id
         # Must match webapp/runner.py's own StrategyLogger group key EXACTLY
         # (f"{strategy}-acct{external_account_id or id}", see _worker_s007/

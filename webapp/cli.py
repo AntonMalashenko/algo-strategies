@@ -325,6 +325,56 @@ def cmd_enable(a, on: bool):
     print(f"account-strategy {link.id} ({link.strategy.name}) enabled={on}")
 
 
+def _apply(obj, fields: dict) -> list[str]:
+    """Set every non-None field on `obj`; returns 'name=value' strings for
+    the confirmation print. A literal "none" (any case) clears a column
+    back to NULL (= check off / config default)."""
+    changed = []
+    for name, value in fields.items():
+        if value is None:
+            continue
+        value = None if isinstance(value, str) and value.lower() == "none" else value
+        setattr(obj, name, value)
+        changed.append(f"{name}={value}")
+    return changed
+
+
+def _float_or_none(value: str) -> float | str:
+    return value if value.lower() == "none" else float(value)
+
+
+def cmd_set_account_risk(a):
+    """ALGODEV-55: account-level risk limits (bot/account_guard.py) and prop
+    evaluation bookkeeping, editable without touching code."""
+    s = get_session()
+    acc = s.get(Account, a.account_id)
+    if acc is None:
+        raise SystemExit(f"account {a.account_id} not found")
+    changed = _apply(acc, dict(
+        initial_balance=a.initial_balance, guard_daily_loss_pct=a.daily_loss_pct,
+        guard_max_loss_pct=a.max_loss_pct, day_reset_tz=a.day_reset_tz,
+        evaluation_phase=a.phase, profit_target_pct=a.profit_target_pct))
+    if a.day_reset_tz and a.day_reset_tz.lower() != "none":
+        from zoneinfo import ZoneInfo
+        ZoneInfo(a.day_reset_tz)            # raises on a typo before we commit
+    s.commit()
+    print(f"account {acc.id} ({acc.label}): " + (", ".join(changed) or "nothing changed"))
+
+
+def cmd_set_strategy_risk(a):
+    """ALGODEV-55: per-(account, strategy) sizing/budget/mode knobs."""
+    s = get_session()
+    link = s.get(AccountStrategy, a.account_strategy_id)
+    if link is None:
+        raise SystemExit("account-strategy link not found")
+    changed = _apply(link, dict(
+        risk_pct=a.risk, fixed_lot=a.lot, daily_risk_cap_pct=a.daily_risk_cap_pct,
+        initial_balance=a.initial_balance, preset=a.preset, broker_mode=a.broker_mode))
+    s.commit()
+    print(f"account-strategy {link.id} ({link.strategy.name} on account {link.account_id}): "
+          + (", ".join(changed) or "nothing changed"))
+
+
 def cmd_list(a):
     s = get_session()
     for u in s.query(User).all():
@@ -333,9 +383,14 @@ def cmd_list(a):
             print(f"  account {acc.id} broker={acc.broker} env={acc.env} "
                   f"external_id={acc.external_account_id} "
                   f"account_number={acc.broker_account_number} '{acc.label}'")
+            if acc.guard_daily_loss_pct is not None or acc.guard_max_loss_pct is not None:
+                print(f"    guard: daily={acc.guard_daily_loss_pct}% max={acc.guard_max_loss_pct}% "
+                      f"of {acc.initial_balance} (day resets {acc.day_reset_tz or 'UTC'}) "
+                      f"phase={acc.evaluation_phase} target={acc.profit_target_pct}%")
             for link in acc.strategy_links:
-                print(f"    -> {link.strategy.name} enabled={link.enabled} "
-                      f"preset={link.preset} risk={link.risk_pct} lot={link.fixed_lot} "
+                print(f"    -> link {link.id} {link.strategy.name} enabled={link.enabled} "
+                      f"mode={link.broker_mode} preset={link.preset} risk={link.risk_pct} "
+                      f"daily_cap={link.daily_risk_cap_pct} lot={link.fixed_lot} "
                       f"status={link.status} last={link.last_cycle_at}")
 
 
@@ -408,6 +463,31 @@ def main():
 
     sub.add_parser("list")
 
+    # ALGODEV-55 -- pass "none" to clear a value back to NULL
+    p = sub.add_parser("set-account-risk")
+    p.add_argument("--account-id", dest="account_id", type=int, required=True)
+    p.add_argument("--initial-balance", dest="initial_balance", type=_float_or_none)
+    p.add_argument("--daily-loss-pct", dest="daily_loss_pct", type=_float_or_none,
+                   help="our account-wide daily loss guard, %% of initial balance")
+    p.add_argument("--max-loss-pct", dest="max_loss_pct", type=_float_or_none,
+                   help="our account-wide max loss guard, %% of initial balance")
+    p.add_argument("--day-reset-tz", dest="day_reset_tz",
+                   help="IANA tz of the firm's day boundary, e.g. Europe/Prague")
+    p.add_argument("--phase", default=None)
+    p.add_argument("--profit-target-pct", dest="profit_target_pct", type=_float_or_none)
+
+    p = sub.add_parser("set-strategy-risk")
+    p.add_argument("--account-strategy-id", dest="account_strategy_id", type=int, required=True)
+    p.add_argument("--risk", type=float, default=None, help="%% of balance per trade")
+    p.add_argument("--lot", type=float, default=None,
+                   help="fixed_lot: the order size used when use_fixed_lot is on "
+                        "(bot lots; 0.01 = 1 index contract). Not a minimum: that is "
+                        "the broker's own minVolume, read live")
+    p.add_argument("--daily-risk-cap-pct", dest="daily_risk_cap_pct", type=_float_or_none)
+    p.add_argument("--initial-balance", dest="initial_balance", type=_float_or_none)
+    p.add_argument("--preset", default=None)
+    p.add_argument("--broker-mode", dest="broker_mode", choices=["off", "dry", "execute"])
+
     a = ap.parse_args()
     {
         "init-db": cmd_init_db,
@@ -421,6 +501,8 @@ def main():
         "seed-assets": cmd_seed_assets,
         "list-brokers": cmd_list_brokers,
         "verify-symbol": cmd_verify_symbol,
+        "set-account-risk": cmd_set_account_risk,
+        "set-strategy-risk": cmd_set_strategy_risk,
     }[a.cmd](a)
 
 
