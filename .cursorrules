@@ -6,3 +6,7 @@ Language policy: write everything that goes into the code in English —
 commit messages, code comments, docstrings, identifiers, in-repo docs
 (README, docs/, config comments, logs) and PR titles/descriptions.
 Chat replies to the maintainer may stay in Russian.
+
+Branching policy: do not create branches for now — commit straight to
+master. No feature branches, no merges or rebases between branches. If a
+task really needs one, ask the maintainer first.

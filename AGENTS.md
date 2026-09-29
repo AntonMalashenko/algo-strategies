@@ -21,3 +21,17 @@ not about how the assistant talks to the user.
 
 Rationale: keep the codebase and its history consistent, reviewable and
 portable, independent of the language used while working.
+
+## Branching policy
+
+**For now, do not create branches.** Commit directly to `master`.
+
+- Do not open a feature branch for a task, even a large one.
+- Do not merge, rebase or cherry-pick between branches.
+- If a task genuinely needs its own branch, ask the maintainer first and
+  wait for an explicit go-ahead.
+
+Rationale: this is a single-maintainer repository where several tasks are
+often in flight at once. Parallel branches made it easy to lose track of
+which task a change belonged to, and to run or deploy code from the wrong
+branch. A single linear `master` removes that whole class of mistake.
