@@ -412,3 +412,40 @@ def test_expected_date_converts_a_non_utc_aware_datetime():
     kyiv_summer = timezone(timedelta(hours=3))
     now = datetime(2026, 9, 10, 1, 30, tzinfo=kyiv_summer)
     assert s011._expected_last_closed_trading_date(now) == "2026-09-09"
+
+
+def test_failed_action_keeps_the_day_open_for_a_same_day_retry(tmp_path, monkeypatch):
+    """Live 2026-10-01: ESTOXX50/FTSE100 opens were rejected MARKET_CLOSED
+    at the 01:00 Kyiv decision and every later tick short-circuited as
+    "up-to-date", so the entries were lost for the whole day. A failed
+    action must leave last_date unadvanced, so the NEXT tick on the SAME
+    calendar day re-runs and places only the still-missing open."""
+    _, st_after_failure = _run(
+        tmp_path, monkeypatch,
+        held_by_asset={"DOW": 1, "RUSSELL": 1}, existing_positions=[],
+        resolved={"DOW": "US30", "RUSSELL": "US2000"},
+        fail_assets={"DOW"}, prev_held={"DOW": 0, "RUSSELL": 0},
+        position_value={}, cash=1000.0,
+    )
+    assert st_after_failure["last_date"] == "2026-08-31"     # day NOT marked done
+    assert st_after_failure["prev_held"] == {"DOW": 0, "RUSSELL": 1}
+
+    # Same calendar day, same feed: the market has opened, the broker accepts.
+    def fake_rsi2_signal(bars, cfg):
+        return pd.Series([1], index=bars.index[-1:])
+    monkeypatch.setattr(s011, "rsi2_signal", fake_rsi2_signal)
+    fake_mod = types.SimpleNamespace(
+        CTraderS011=lambda **kw: _FakeClient({"DOW": 1, "RUSSELL": 1}, [],
+                                             {"DOW": "US30", "RUSSELL": "US2000"}, set()))
+    monkeypatch.setitem(sys.modules, "bot.ctrader_s011", fake_mod)
+    state = FileStateStore(tmp_path / "state.json", default_factory=s011._default_state)
+    retry = s011.run_cycle_for_account(
+        account_key="acct-a", creds={"api_key": "k"}, cfg=_cfg(), state=state,
+        logger=_log(tmp_path), broker="execute", allow_mainnet=False,
+        candidates={"DOW": ("DOW",), "RUSSELL": ("RUSSELL",)}, ledger_file=None)
+
+    assert retry["error"] is None
+    assert [(a["asset"], a["kind"]) for a in retry["actions"]] == [("DOW", "open")]  # RUSSELL not re-opened
+    st = state.load()
+    assert st["last_date"] == EXPECTED_TRADING_DATE                 # now the day is done
+    assert st["prev_held"] == {"DOW": 1, "RUSSELL": 1}

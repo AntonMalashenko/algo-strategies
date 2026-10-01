@@ -532,7 +532,17 @@ def run_cycle_for_account(*, account_key: str, creds: dict | None, cfg: Portfoli
                 held_today_final = decided["held_today"]
 
             equity = cash_final + sum(position_value_final.values())
-            st.update({"last_date": date, "cash": cash_final, "equity": equity,
+            # A failed action leaves the day NOT done: last_date stays where
+            # it was, so the cheap up-to-date check does not short-circuit
+            # the next tick and the retry above actually happens the same
+            # day. Without this the reverted prev_held was only retried on
+            # the NEXT trading day -- live 2026-10-01: ESTOXX50/FTSE100
+            # opens rejected MARKET_CLOSED at 01:00 Kyiv, every later tick
+            # "up-to-date", entries lost for the day. Safe to re-run: the
+            # recompute only produces the still-missing transitions (the
+            # successful ones are already in prev_held).
+            st.update({"last_date": date if not failed_assets else st.get("last_date"),
+                      "cash": cash_final, "equity": equity,
                       "position_value": position_value_final,
                       "prev_held": held_today_final})
             state.save(st)
