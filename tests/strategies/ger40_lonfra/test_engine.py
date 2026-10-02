@@ -221,3 +221,55 @@ def test_b_reversal_recovery_leg_carries_its_own_target_not_the_primary_legs():
         assert p["tp"] != primary_tp, (
             "recovery leg fell back to the primary leg's tp -- the exact "
             "TRADING_BAD_STOPS regression")
+
+
+def test_first_risk_is_the_entry_time_risk_even_after_breakeven_moved_the_stop():
+    """ALGODEV-56: simulate_day()'s `first_risk` must be the primary
+    position's REAL entry-time risk, read from its immutable `stop0`, not
+    from the mutable `stop` that the breakeven block collapses to entry.
+
+    Before the fix the local `stop0 = positions[0]["stop"]` was read AFTER
+    _simulate_leg() had already moved the stop, so first_risk came out 0.0
+    on every day the primary position reached its breakeven trigger --
+    routine under the live BE05 presets. backtest/s007_metalabel_data.py
+    DIVIDES by first_risk (`dist_to_tp_R`), so those days silently produced
+    inf/NaN meta-label features.
+    """
+    n = 180
+    idx = pd.date_range("2026-09-07 08:00", periods=n, freq="1min")
+    highs = np.full(n, 100.0)
+    lows = np.full(n, 99.0)
+    opens = np.full(n, 99.5)
+    closes = np.full(n, 99.5)
+
+    # Frankfurt range 08:00-08:59: rh=100, rl=99, mid=99.5 -> mid_range stop 99.5.
+    e_idx = 65
+    opens[e_idx] = 99.6
+    highs[e_idx] = 100.2
+    lows[e_idx] = 99.6      # stays above the 99.5 stop, so the entry bar survives
+    closes[e_idx] = 100.2   # breaks above rh=100 -> up B, entry 100.2, risk0 = 0.7
+    # Drift up past the 0.5R breakeven trigger (100.55) but short of the tp.
+    for t in range(e_idx + 1, e_idx + 30):
+        highs[t] = min(100.6, 100.2 + 0.05 * (t - e_idx))
+        lows[t] = 100.0
+        closes[t] = min(100.5, 100.1 + 0.05 * (t - e_idx))
+
+    df = pd.DataFrame(dict(open=opens, high=highs, low=lows, close=closes), index=idx)
+    df["date_only"] = df.index.date
+    df["time_only"] = df.index.time
+
+    cfg = StrategyConfig(stop_mode="mid_range", tp_mode="range", do_pyramid=False,
+                         breakeven_at_r=0.5)
+    bars = df[(df["time_only"] >= pd.Timestamp("08:00").time())
+             & (df["time_only"] <= pd.Timestamp("11:00").time())]
+    result = simulate_day(bars, rh=100.0, rl=99.0, mid=99.5, height=1.0, lv={}, cfg=cfg)
+
+    primary = result["positions"][0]
+    assert primary["be_moved"] is True, "synthetic path never armed breakeven"
+    assert primary["stop"] == primary["entry"]      # the mutated, collapsed stop
+    assert primary["stop0"] != primary["entry"]     # the real entry-time stop
+
+    assert result["first_risk"] == abs(primary["entry"] - primary["stop0"])
+    assert result["first_risk"] > 0.0, (
+        "first_risk collapsed to zero -- it was read from the breakeven-moved "
+        "stop instead of stop0")

@@ -313,7 +313,16 @@ def simulate_day(bars: pd.DataFrame, rh, rl, mid, height, lv, cfg: StrategyConfi
                                        swing_buffer=swing_buffer, add_cut_idx=add_cut_idx)
     if positions is None:  # first entry failed the min-risk guard -> no trade
         return dict(scenario="NONE")
-    stop0 = positions[0]["stop"]
+    # ALGODEV-56: read the primary position's IMMUTABLE creation-time stop
+    # (p["stop0"], ALGODEV-40), not p["stop"] -- the latter is mutated by the
+    # breakeven block in _simulate_leg, collapsing to entry +- the ALGODEV-41
+    # offset once breakeven_at_r fires. Reading it here used to zero out
+    # `first_risk` below on every day the primary position reached its
+    # breakeven trigger (routine under the live BE05 presets), which silently
+    # corrupted the meta-label features that DIVIDE by first_risk
+    # (backtest/s007_metalabel_data.py). Named first_stop, not stop0, so it
+    # no longer shadows the per-position field it is read from.
+    first_stop = positions[0].get("stop0", positions[0]["stop"])
 
     # B-reversal -> A model: a FAILED B breakout (never reached its target) that
     # returns to 0.5 flips into a scenario-A trade from the midline toward the
@@ -393,7 +402,7 @@ def simulate_day(bars: pd.DataFrame, rh, rl, mid, height, lv, cfg: StrategyConfi
                 n_recovery=n_recovery, positions=positions, tp=tp,
                 reached_tp=reached, day_R=day_R, first_R=positions[0]["R"],
                 entry_time=entry_time, entry_idx=e_idx,
-                first_risk=abs(e_price - stop0), open_above_mid=bool(opens[0] > mid),
+                first_risk=abs(e_price - first_stop), open_above_mid=bool(opens[0] > mid),
                 entry_price=e_price, rh=rh, rl=rl, mid=mid)
 
 
