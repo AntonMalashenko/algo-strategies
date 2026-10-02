@@ -274,11 +274,14 @@ def test_amend_offset_is_clamped_to_the_safe_side_of_the_latest_bar(monkeypatch)
                                 .tz_convert("UTC").timestamp() * 1000))]
     wanted = [dict(label="S007:2024-05-10:0", side="buy", entry=18000.0, sl=18000.0,
                    tp=18100.0, is_add=False, be_moved=True)]
-    # last bar's low is 18002 -> cap = 18002 - 1.5 = 18000.5, well short of
-    # the requested 18000 + 3 = 18003.
+    # Price first genuinely reached the REAL 0.5R trigger (fill 18000 + 0.5 *
+    # 50 = 18025; since 2026-10-02 the real numbers alone decide the trigger),
+    # then retraced: last bar's low is 18002 -> cap = 18002 - 1.5 = 18000.5,
+    # well short of the requested 18000 + 3 = 18003.
     bars = pd.DataFrame(
-        {"open": [18003.0], "high": [18004.0], "low": [18002.0], "close": [18002.5]},
-        index=pd.to_datetime(["2024-05-10 10:06"]),
+        {"open": [18010.0, 18003.0], "high": [18030.0, 18004.0],
+         "low": [18008.0, 18002.0], "close": [18020.0, 18002.5]},
+        index=pd.to_datetime(["2024-05-10 10:05", "2024-05-10 10:06"]),
     )
     fake = _install_with_real_bars(monkeypatch, broker, wanted, bars)
     monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
@@ -344,3 +347,32 @@ def test_amend_does_not_consume_day_caps(monkeypatch):
     _, _, actions = fake.last_decide_args
     kinds = {a["label"]: a["kind"] for a in actions}
     assert kinds == {"S007:2024-05-10:0": "amend"}   # amend passed, 5th blocked
+
+
+
+def test_engine_be_moved_alone_does_not_amend_when_a_worse_fill_has_not_reached_real_breakeven(monkeypatch):
+    """Live 2026-10-02 10:12 demo: the reversal long filled 11 pts ABOVE the
+    engine entry. The engine's own 0.5R (off its clean entry) set be_moved,
+    the old code amended off the real fill anyway, the stop landed ~4 pts
+    under price and a 14-pt dip took the trade out at breakeven one bar
+    before TP. With real numbers available, only the REAL 0.5R may fire."""
+    from bot import s007_paper
+
+    # engine: entry 25021.4, risk 30.5 -> its 0.5R (25036.65) was crossed
+    # real:   fill 25032.4, stop 24990.9 -> real risk 41.5, 0.5R at 25053.15
+    broker = [dict(label="S007:2026-10-02:10", position_id=41, volume=50,
+                   price=25032.4, stop_loss=24990.9, take_profit=25051.9, side="buy",
+                   opened_ts=int(pd.Timestamp("2026-10-02 10:12", tz="Europe/Bucharest")
+                                .tz_convert("UTC").timestamp() * 1000))]
+    wanted = [dict(label="S007:2026-10-02:10", side="buy", entry=25021.4, sl=25021.4,
+                   tp=25051.9, is_add=False, be_moved=True)]
+    bars = pd.DataFrame(
+        {"open": [25035.9], "high": [25038.9], "low": [25021.4], "close": [25037.4]},
+        index=pd.to_datetime(["2026-10-02 10:12"]),
+    )
+    fake = _install_with_real_bars(monkeypatch, broker, wanted, bars)
+
+    s007_paper.live()
+
+    _, _, actions = fake.last_decide_args
+    assert [a for a in actions if a["kind"] == "amend"] == []

@@ -47,7 +47,7 @@ class _FakeCTraderS007:
 
     def run_live_cycle(self, symbol_candidates, history_days, decide):
         m1 = pd.DataFrame(
-            {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+            {"open": [18050.0], "high": [18050.0], "low": [18050.0], "close": [18050.0]},
             index=pd.to_datetime(["2024-05-10 10:05"]),
         )
         balance = 10_000.0
@@ -147,7 +147,7 @@ class _FakeCTraderS007Slipped:
 
     def run_live_cycle(self, symbol_candidates, history_days, decide):
         m1 = pd.DataFrame(
-            {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+            {"open": [18000.0], "high": [18000.0], "low": [18000.0], "close": [18000.0]},
             index=pd.to_datetime(["2024-05-10 10:05"]),
         )
         balance = 10_000.0
@@ -288,7 +288,7 @@ class _FakeCTraderS007WithOpenPositions(_FakeCTraderS007):
 
     def run_live_cycle(self, symbol_candidates, history_days, decide):
         m1 = pd.DataFrame(
-            {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+            {"open": [18050.0], "high": [18050.0], "low": [18050.0], "close": [18050.0]},
             index=pd.to_datetime(["2024-05-10 10:05"]),
         )
         balance = 10_000.0
@@ -444,7 +444,7 @@ class _FakeCTraderS007WithDeals(_FakeCTraderS007):
 
     def run_live_cycle(self, symbol_candidates, history_days, decide):
         m1 = pd.DataFrame(
-            {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+            {"open": [18050.0], "high": [18050.0], "low": [18050.0], "close": [18050.0]},
             index=pd.to_datetime(["2024-05-10 10:05"]),
         )
         balance = 10_000.0
@@ -538,3 +538,35 @@ def test_live_uses_fixed_lot_when_flag_set(fake_broker, monkeypatch):
 
     _, _, actions = fake_broker.last_decide_args
     assert actions[0]["volume_lots"] == 0.01
+
+
+
+def test_add_with_its_shared_stop_on_the_wrong_side_of_price_is_not_sent(monkeypatch):
+    """Live 2026-10-02 11:20/11:29, both accounts: under stop_mode="mid_range"
+    a short add fired after price had run ~150 pts ABOVE the leg's shared
+    stop, so the sell went out with its stop BELOW the market and the broker
+    rejected it (TRADING_BAD_STOPS). decide() must skip such a placement and
+    log it, while a valid one in the same cycle still goes through."""
+    from bot import s007_paper, s007_config as C
+
+    fake_mod = types.SimpleNamespace(CTraderS007=_FakeCTraderS007Slipped)
+    monkeypatch.setitem(sys.modules, "bot.ctrader_s007", fake_mod)
+    monkeypatch.setattr(C, "USE_FIXED_LOT", True)
+    monkeypatch.setattr(C, "FIXED_LOT", 0.01)
+    fake_positions = [
+        # last price is 18000: this sell's stop 17850 sits BELOW it -> invalid
+        dict(label="S007:2024-05-10:79", side="sell", entry=18000.0, sl=17850.0,
+             tp=17700.0, is_add=True),
+        # a normal sell with its stop above price -> placed as usual
+        dict(label="S007:2024-05-10:80", side="sell", entry=18000.0, sl=18040.0,
+             tp=17700.0, is_add=True),
+    ]
+    monkeypatch.setattr(s007_paper, "plan_now", lambda m1, preset=None: dict(
+        in_window=True, day_done=False, flat=False, positions=fake_positions,
+        direction="down", context={}))
+
+    s007_paper.live()
+
+    _, _, actions = _FakeCTraderS007Slipped.last_decide_args
+    placed = [a["label"] for a in actions if a["kind"] == "place"]
+    assert placed == ["S007:2024-05-10:80"]

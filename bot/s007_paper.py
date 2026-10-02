@@ -385,6 +385,20 @@ def make_decide(*, preset: str, magic: str, risk_pct: float, fixed_lot: float,
                 # breakeven from the ACTUAL fill price once the position is
                 # genuinely open -- unaffected by this fix.
                 place_sl = o.get("orig_sl", o["sl"])
+                # 2026-10-02: under stop_mode="mid_range" every position of a
+                # leg shares ONE stop, so an add triggered after price has
+                # already run through that stop comes out with the stop on the
+                # WRONG side of the market (a sell with its stop below price).
+                # The broker rejects it (TRADING_BAD_STOPS) -- live 2026-10-02
+                # 11:20/11:29 on both accounts -- so don't send a doomed order;
+                # log it instead.
+                last_price = float(m1["close"].iloc[-1])
+                if ((o["side"] == "sell" and place_sl <= last_price)
+                        or (o["side"] == "buy" and place_sl >= last_price)):
+                    logger.event("skip_invalid_stop", cycle=cid, label=lab,
+                                 side=o["side"], sl=place_sl, last_price=last_price,
+                                 is_add=o["is_add"])
+                    continue
                 stop_distance = abs(o["entry"] - place_sl)
                 if use_fixed_lot:
                     lot = fixed_lot
@@ -481,8 +495,18 @@ def make_decide(*, preset: str, magic: str, risk_pct: float, fixed_lot: float,
                 if cur_sl and ((p["side"] == "buy" and cur_sl >= fill)
                                or (p["side"] == "sell" and cur_sl <= fill)):
                     continue
+                # 2026-10-02: when the broker's real numbers are available the
+                # trigger is decided by THEM ALONE -- the engine's be_moved is
+                # only the fallback when no real check is possible. Firing on
+                # be_moved while the stop is then placed off the real fill is
+                # inconsistent whenever the fill was worse than the engine
+                # entry: live 2026-10-02 10:12 demo long filled 11 pts above
+                # the engine entry, be_moved fired on the engine's 0.5R, the
+                # stop landed ~4 pts under price, a 14-pt dip took it out at
+                # breakeven, and the engine's own path (BE stop 11 pts lower)
+                # survived to hit TP one bar later (~+1R lost).
                 triggered = engine_triggered
-                if not triggered and breakeven_at_r is not None and cur_sl is not None:
+                if breakeven_at_r is not None and cur_sl is not None:
                     real_risk = abs(fill - cur_sl)
                     opened_ts = p.get("opened_ts")
                     position_opened_at = (
