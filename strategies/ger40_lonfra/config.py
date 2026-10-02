@@ -424,6 +424,25 @@ class StrategyConfig:
     min_risk_points: float = 0.0
     min_risk_frac: float = 0.0
 
+    # --- wrong-side-stop guard (ALGODEV-57, BUGFIX 2026-10-02 -- not a rule
+    #     change, see strategy-modifiers "the one allowed exception"). Under
+    #     stop_mode="mid_range" every position of a leg shares ONE stop, and
+    #     adds kept being created after price had already run through it. Such
+    #     an add is born with its stop on the WRONG side of its own entry (long
+    #     stop0 >= entry / short stop0 <= entry); the engine "stopped it out"
+    #     at that stop on the next bar, i.e. booked a guaranteed +1R that no
+    #     broker accepts (live: TRADING_BAD_STOPS, 2026-10-02 11:20/11:29 on
+    #     demo and FTMO; bot skips them since ebdc4c4 skip_invalid_stop).
+    #     MEASURED on WORKING_S007_NEWSSAFE_MAX8_BE05_OFF2, duka 2023-06-26..
+    #     2026-08-11 (backtest/run_s007_wrongside_adds.py): 1151 such positions
+    #     on 276 of 680 days, every one exactly +1.0R = 83% of gross R and 97%
+    #     of Gate-2 net R. True (default) = never create such a position (adds
+    #     AND the first entry of any leg, incl. the B-reversal recovery leg).
+    #     False = the pre-ALGODEV-57 engine, kept ONLY so the REF_* regression
+    #     presets and pre-2026-10-02 reports still reproduce byte-for-byte.
+    #     Every S007 result produced before this fix is invalid. ---
+    skip_wrong_side_stop: bool = True
+
     # --- data hygiene (matches reference run() guards) ---
     min_fr_bars: int = 45            # require a reasonably complete Frankfurt hour
     min_ld_bars: int = 60            # require enough London bars
@@ -653,6 +672,25 @@ WORKING_S007_NEWSSAFE_MAX8_BE05_OFF3 = WORKING_S007_NEWSSAFE_MAX8_BE05.with_(
 WORKING_S007_NEWSSAFE_MAX8_BE05_OFF2 = WORKING_S007_NEWSSAFE_MAX8_BE05.with_(
     breakeven_offset_points=2.0)
 
+# ALGODEV-57 VERDICT (2026-10-02): every S007 number in the comments above was
+# measured on the pre-fix engine and is INVALID -- most of it was phantom adds
+# born with their shared stop already past their own entry (see
+# skip_wrong_side_stop). Full re-simulation on the fixed engine
+# (backtest/run_s007_algodev57_revalidate.py -> reports/s007_algodev57_revalidate.csv,
+# duka 2023-06-26..2026-08-11, 680 days), THIS live preset:
+#   gross  +1383.0R -> +236.6R   R/day +2.034 -> +0.348   maxDD -12.4R -> -34.0R
+#   net    +1107.5R ->   +4.5R   R/day +1.629 -> +0.007   maxDD -17.0R -> -118.4R
+#   net by year: 2023 -43.6 | 2024 -61.9 | 2025 +81.9 | 2026 +28.1
+# Gate 1 (every year positive) FAILS net for EVERY preset in this module (2023 is
+# negative for all of them); Gate 2 (edge survives real costs) fails for the live
+# preset. Gate 3 (backtest/run_s007_propscheme.py): 8 slots @0.25%/R + BE@0.5R
+# was 100% cashout, now 42.7% cashout / 57.1% total-DD bust -- a coin flip. In
+# the S007+S021 combo (run_s007_s021_combo_propscheme.py) adding S007 at ANY
+# risk lowers S021's solo cashout (0.50%: 92.8% alone -> 67.4% with S007@0.25%).
+# Best fixed-engine net preset is WORKING_S007_NEWSSAFE_MAX8 (no breakeven):
+# +257.9R, +0.379 R/day, but maxDD -130.7R and 2023 -43.9R -- not deployable.
+# No preset is currently recommended for live money.
+
 # --- Exact reproductions of the two reference result files (regression only) ---
 # NOTE (ALGODEV-43): neither REF preset sets breakeven_at_r, so the breakeven
 # block in engine.py never runs for them and breakeven_offset_points is dead
@@ -668,6 +706,7 @@ REF_PYRAMID_DUKA = StrategyConfig(
     stop_mode="last_swing", tp_mode="range",
     trade_start="10:00", exit_end="11:59",
     allow_A=True, allow_B=True,
+    skip_wrong_side_stop=False,  # ALGODEV-57: pre-fix engine, reproduces history
 )
 # pyramid_liq_duka.csv <- pyramid_v2.py stop=mid_range, tp=liquidity, exit 16:59
 # (guard-free, so it reproduces the historical file exactly).
@@ -676,4 +715,5 @@ REF_PYRAMID_LIQ_DUKA = StrategyConfig(
     stop_mode="mid_range", tp_mode="liquidity",
     trade_start="10:00", exit_end="16:59",
     allow_A=True, allow_B=True,
+    skip_wrong_side_stop=False,  # ALGODEV-57: pre-fix engine, reproduces history
 )

@@ -24,12 +24,16 @@ loudly again.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import pytest
 
-from strategies.ger40_lonfra.config import StrategyConfig
+from strategies.ger40_lonfra.config import (WORKING_S007_NEWSSAFE_MAX8_BE05_OFF2,
+                                            StrategyConfig)
 from strategies.ger40_lonfra.engine import (BE_OFFSET_MIN_GAP_POINTS, _simulate_leg,
-                                            simulate_day)
+                                            run, simulate_day, stop_on_wrong_side)
 from strategies.ger40_lonfra.structure import structure_levels
 
 
@@ -153,7 +157,14 @@ def test_stop0_can_sit_on_the_far_side_of_entry_under_mid_range():
     identical for both. stop0 must reflect that real value exactly, not a
     direction-based mirror of risk0 (which would silently place it BELOW
     entry instead, on the wrong side -- exactly what caused two live adds
-    to lose money on trades the validated engine says should have won)."""
+    to lose money on trades the validated engine says should have won).
+
+    ALGODEV-57 (2026-10-02) correction: those "engine wins" were themselves
+    an artifact -- a position born with its stop beyond its own entry is
+    "stopped out" at a profit on the next bar, a fill no broker gives. The
+    default engine (skip_wrong_side_stop=True) no longer creates such a
+    position at all; the stop0 bookkeeping below is still checked on the
+    legacy path, which remains reachable for reproducing old reports."""
     n = 5
     highs = np.full(n, 100.0)
     lows = np.full(n, 99.0)
@@ -163,8 +174,13 @@ def test_stop0_can_sit_on_the_far_side_of_entry_under_mid_range():
 
     # entry (99.2) is BELOW the shared range_stop (99.5) for a long --
     # exactly the geometry that broke live: stop sits above entry.
+    default_positions, _ = _simulate_leg(highs, lows, closes, L, 0, 99.2, True,
+                                         105.0, 99.5, cfg, buffer=0)
+    assert default_positions is None, "ALGODEV-57: wrong-side leg must not be created"
+
+    legacy = cfg.with_(skip_wrong_side_stop=False)
     up_positions, _ = _simulate_leg(highs, lows, closes, L, 0, 99.2, True,
-                                    105.0, 99.5, cfg, buffer=0)
+                                    105.0, 99.5, legacy, buffer=0)
     p = up_positions[0]
     assert p["stop"] == 99.5
     assert p["stop0"] == 99.5           # real shared stop, above entry
@@ -273,3 +289,61 @@ def test_first_risk_is_the_entry_time_risk_even_after_breakeven_moved_the_stop()
     assert result["first_risk"] > 0.0, (
         "first_risk collapsed to zero -- it was read from the breakeven-moved "
         "stop instead of stop0")
+
+
+# ALGODEV-57: the real Dukascopy GER40 day where the artifact was first traced.
+_WRONGSIDE_FIXTURE = (Path(__file__).parent / "fixtures"
+                      / "duka_ger40_2023-06-27.csv")
+_WRONGSIDE_DAY_LEVELS = {"prev_day_high": 15877.749, "prev_day_low": 15708.899,
+                         "asia_high": 15865.199, "asia_low": 15811.199}
+_WRONGSIDE_SHARED_STOP = 15857.2
+
+
+def _run_wrongside_day(cfg):
+    bars = pd.read_csv(_WRONGSIDE_FIXTURE, parse_dates=["dt"])
+    bars["date_only"] = bars["dt"].dt.date
+    bars["time_only"] = bars["dt"].dt.strftime("%H:%M")
+    day = bars["date_only"].iloc[0]
+    res = run(bars, cfg, {day: _WRONGSIDE_DAY_LEVELS})
+    assert len(res) == 1
+    return res.iloc[0]
+
+
+def test_no_add_is_created_with_its_shared_stop_already_on_the_wrong_side():
+    """ALGODEV-57: 2023-06-27, scenario A up, shared mid_range stop 15857.2.
+    The pre-fix engine kept adding longs around 15800 -- BELOW that stop --
+    and "stopped them out" at 15857.2 on the next bar: seven +1.0R wins that
+    no broker would ever fill (TRADING_BAD_STOPS live). With the fix (the
+    default), no position of the live preset may have its stop on the wrong
+    side of its own entry, and the day is just the primary trade."""
+    live = WORKING_S007_NEWSSAFE_MAX8_BE05_OFF2
+    assert live.skip_wrong_side_stop is True, "the fix must be the default"
+
+    fixed = _run_wrongside_day(live)
+    assert (fixed["scenario"], fixed["direction"]) == ("A", "up")
+    assert all(not stop_on_wrong_side(p["up"], p["entry"], p["stop0"])
+               for p in fixed["positions"])
+    assert not any(p["is_add"] and p["status"] == "stop" and p["R"] > 0
+                   for p in fixed["positions"]), "an add was 'stopped out' at a profit"
+    assert fixed["n_pos"] == 1
+    assert fixed["day_R"] < 1.0
+
+    # The old engine, kept behind the flag only for reproducing past reports,
+    # still shows the artifact -- proves the fixture exercises the bug.
+    legacy = _run_wrongside_day(live.with_(skip_wrong_side_stop=False))
+    phantom = [p for p in legacy["positions"]
+               if p["is_add"] and stop_on_wrong_side(p["up"], p["entry"], p["stop0"])]
+    assert len(phantom) == 7
+    assert all(p["stop0"] == pytest.approx(_WRONGSIDE_SHARED_STOP, abs=0.05)
+               and p["status"] == "stop" and p["R"] == pytest.approx(1.0)
+               for p in phantom)
+    assert legacy["day_R"] - fixed["day_R"] == pytest.approx(7.0)
+
+
+def test_stop_on_wrong_side_definition():
+    assert stop_on_wrong_side(True, 100.0, 101.0)
+    assert stop_on_wrong_side(True, 100.0, 100.0)     # zero risk is not a valid stop either
+    assert not stop_on_wrong_side(True, 100.0, 99.0)
+    assert stop_on_wrong_side(False, 100.0, 99.0)
+    assert stop_on_wrong_side(False, 100.0, 100.0)
+    assert not stop_on_wrong_side(False, 100.0, 101.0)

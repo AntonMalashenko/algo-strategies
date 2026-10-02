@@ -26,6 +26,15 @@ from .structure import structure_levels
 BE_OFFSET_MIN_GAP_POINTS = 1.0
 
 
+def stop_on_wrong_side(up: bool, entry: float, stop: float) -> bool:
+    """ALGODEV-57: True when a position's stop is not strictly on the loss side
+    of its own entry (long: stop >= entry, short: stop <= entry). Such an order
+    is rejected by the broker (TRADING_BAD_STOPS); the simulator used to accept
+    it and "stop it out" at a profit on the next bar. See
+    StrategyConfig.skip_wrong_side_stop."""
+    return (up and stop >= entry) or ((not up) and stop <= entry)
+
+
 def pick_stop(mode, t, entry, up, L, range_stop, last_swing_buffer_points=0.0):
     def ok(v):
         return (not np.isnan(v)) and ((up and v < entry) or ((not up) and v > entry))
@@ -139,6 +148,10 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
     stop0 = pick_stop(cfg.stop_mode, start_idx, e_price, up, L, range_stop,
                       last_swing_buffer_points=cfg.last_swing_buffer_points)
     if buffer > 0 and abs(e_price - stop0) < buffer:
+        return None, False
+    # ALGODEV-57: a leg whose FIRST entry would already sit beyond its own stop
+    # is not tradeable either (same reason as the add guard below).
+    if cfg.skip_wrong_side_stop and stop_on_wrong_side(up, e_price, stop0):
         return None, False
     positions = [dict(entry=e_price, stop=stop0, status="open", exit=None,
                       is_add=False, up=up, idx=start_idx, tp=tp,
@@ -255,6 +268,13 @@ def _simulate_leg(highs, lows, closes, L, start_idx, e_price, up, tp, range_stop
                         st = pick_stop(cfg.stop_mode, t, c, up, L, range_stop,
                                        last_swing_buffer_points=cfg.last_swing_buffer_points)
                         if buffer > 0 and abs(c - st) < buffer:
+                            continue
+                        # ALGODEV-57: never create an add whose (shared, under
+                        # mid_range) stop price has already passed -- it would be
+                        # "stopped out" at a profit on the next bar, a fill no
+                        # broker gives. Like the min-risk guard above, the add
+                        # stays armed: a later bar back on the valid side may add.
+                        if cfg.skip_wrong_side_stop and stop_on_wrong_side(up, c, st):
                             continue
                         positions.append(dict(entry=c, stop=st, status="open",
                                               exit=None, is_add=True, up=up, idx=t, tp=tp,
