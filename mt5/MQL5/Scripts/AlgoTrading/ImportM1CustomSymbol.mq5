@@ -17,6 +17,12 @@
 #property script_show_inputs
 
 #define IMPORT_BATCH_BARS 100000
+// Tick volume written on every imported bar. The Strategy Tester never generates
+// more ticks for a bar than its tick volume: with 1 it emitted ONE tick per bar
+// (at the close), so the EA saw O=H=L=C=close bars -- wrong anchor open and
+// shrunken session ranges (found by mt5/tools/s021_parity.py, 2026-10-05).
+// 4 is enough for "1 minute OHLC" (open, high, low, close).
+#define IMPORT_TICK_VOLUME 4
 
 input string InpCsvPath      = "AlgoTrading/fixtures/s021_m1.csv"; // CSV under <Common>/Files
 input string InpSymbol       = "NSXUSD_HD";                        // custom symbol name
@@ -106,7 +112,7 @@ void OnStart()
       bar.high=StringToDouble(fields[2]);
       bar.low=StringToDouble(fields[3]);
       bar.close=StringToDouble(fields[4]);
-      bar.tick_volume=1;
+      bar.tick_volume=IMPORT_TICK_VOLUME;
       bar.real_volume=0;
       bar.spread=InpSpreadPoints;
       batch[in_batch++]=bar;
