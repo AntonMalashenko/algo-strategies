@@ -24,7 +24,7 @@
 // 4 is enough for "1 minute OHLC" (open, high, low, close).
 #define IMPORT_TICK_VOLUME 4
 
-input string InpCsvPath      = "AlgoTrading/fixtures/s021_m1.csv"; // CSV under <Common>/Files
+input string InpCsvPath      = "AlgoTrading/e2e/s021_m1.csv"; // CSV under <Common>/Files (tester history)
 input string InpSymbol       = "NSXUSD_HD";                        // custom symbol name
 input int    InpDigits       = 3;                                  // price digits
 input double InpContractSize = 1.0;                                // $ per 1.0 move per lot
