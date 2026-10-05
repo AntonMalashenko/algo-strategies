@@ -1,0 +1,291 @@
+# MT5 expert advisors: installation, setup and daily use
+
+How to install the MQL5 code from `mt5/` into a MetaTrader 5 terminal on macOS,
+Windows or Linux. It also covers the S021 tests (self-test, offline tester run,
+parity check) and how to set the EA up on a prop account. Layout and design
+rules: [`mt5/README.md`](../README.md). Ticket: ALGODEV-61.
+
+---
+
+## TL;DR: what you run day to day
+
+| When | macOS / Linux | Windows (PowerShell) |
+|---|---|---|
+| after `git pull` or any code change | `mt5/tools/deploy.sh` | `powershell -ExecutionPolicy Bypass -File mt5\tools\deploy.ps1` |
+| while developing (auto-deploy on save) | `mt5/tools/deploy.sh --watch` | `... deploy.ps1 -Watch` |
+
+`deploy` does everything that does not need a mouse:
+
+1. regenerates the strategy constants from Python (`gen_params`);
+2. runs `tests/mt5`;
+3. creates the self-test fixtures and the tester history if they are missing;
+4. copies sources, presets and fixtures into the terminal;
+5. compiles every EA and script with MetaEditor, and stops with a non-zero exit code on any compile error.
+
+Afterwards, in MT5: **Navigator → right click → Refresh**.
+
+Things you do **once**, not on every update:
+
+- installing the terminal;
+- creating the offline symbol;
+- tester settings (the terminal remembers them);
+- attaching the EA to a chart (it is reloaded automatically after recompilation).
+
+| Change | What to repeat |
+|---|---|
+| Any `.mq5` / `.mqh` / preset / Python config change | `deploy` (or let `--watch` do it), then Refresh in MT5 |
+| `strategies/orb_intraday/config.py` (`ORB_BASE`) changed | same. `gen_params` refuses to export a config with a modifier enabled, see `mt5/README.md` |
+| New histdata / you want a longer tester window | regenerate the history (section 6.1), rerun `ImportM1CustomSymbol` |
+| New terminal, new machine | the whole OS section below |
+
+---
+
+## 1. What gets installed where
+
+`deploy` copies only our own folders; the terminal's stock files are never touched.
+
+| Repo | Terminal (`<MQL5>` = data folder `MQL5`, MT5 → File → Open Data Folder) |
+|---|---|
+| `mt5/MQL5/Include/AlgoCore` | `<MQL5>/Include/AlgoCore` |
+| `mt5/MQL5/Include/Strategies` | `<MQL5>/Include/Strategies` |
+| `mt5/MQL5/Experts/AlgoTrading` | `<MQL5>/Experts/AlgoTrading` |
+| `mt5/MQL5/Scripts/AlgoTrading` | `<MQL5>/Scripts/AlgoTrading` |
+| `mt5/MQL5/Presets/AlgoTrading/*.set` | `<MQL5>/Presets` and `<MQL5>/Profiles/Tester` |
+| `mt5/MQL5/Files/AlgoTrading/{fixtures,e2e}` (generated, git-ignored) | `<Common>/Files/AlgoTrading/{fixtures,e2e}` |
+
+The EA writes its logs to `<Common>/Files/AlgoTrading/logs/S021-mt5-acct<login>/`:
+
+- `events-YYYY-MM-DD.jsonl`
+- `positions/<label>.jsonl`
+- `heartbeat.json`
+- `S021-mt5-acct<login>_days.csv`
+
+`<Common>` per OS:
+
+| OS | `<Common>/Files` |
+|---|---|
+| macOS | `~/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/users/user/AppData/Roaming/MetaQuotes/Terminal/Common/Files` |
+| Windows | `%APPDATA%\MetaQuotes\Terminal\Common\Files` |
+| Linux | `~/.mt5/drive_c/users/<you>/AppData/Roaming/MetaQuotes/Terminal/Common/Files` |
+
+Copy mode is the default because the macOS (Wine) build of MT5 does not list Expert Advisors that sit behind a symlink. Scripts behind a symlink do show up, EAs do not, neither in the Navigator nor in the Strategy Tester. `install_mac.sh --link` is still available for terminals that follow symlinks.
+
+---
+
+## 2. macOS (Apple Silicon or Intel)
+
+### 2.1 One-time setup
+
+1. **Install MetaTrader 5.** Download the macOS build from metatrader5.com (Download → macOS) and install it. Launch it once so it creates its Wine prefix.
+2. **Log in to any account.** The Strategy Tester refuses to start without one. For tests only, a demo is enough: File → Open an Account → MetaQuotes-Demo.
+3. **Repo + Python** (once per machine):
+   ```bash
+   cd ~/Trading/algo
+   python3 -m venv .venv && source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+4. **Deploy:**
+   ```bash
+   mt5/tools/deploy.sh
+   ```
+   - **Expected:** steps 1/5 … 5/5. Step 5 should print `ok … 0 errors` for each `.mq5`.
+   - **If step 5 says it cannot compile from the command line:** the bundled Wine binary was not found. Either point `MT5_WINE` at it (`find "/Applications/MetaTrader 5.app" -name 'wine*' -type f`), or open MetaEditor (F4) and press **F7** on each file in `Experts/AlgoTrading` and `Scripts/AlgoTrading`.
+5. **Refresh MT5.** Navigator → right click → **Refresh**. Expect **Expert Advisors → AlgoTrading → S021_ORB** and **Scripts → AlgoTrading → ExportM1, ImportM1CustomSymbol, S021_SelfTest**.
+6. **Self-test** (section 5).
+
+### 2.2 macOS quirks
+
+- **The Mac Terminal app** is Applications → Utilities → Terminal (or Cmd+Space → "Terminal"). The VS Code terminal works too.
+- **The EA is missing from the Navigator or the tester list** (you deployed with `--link` earlier): run `mt5/tools/deploy.sh` (copy mode), then quit MT5 completely with **Cmd+Q** and start it again.
+- **The "Select expert…" drop-down on the tester's *Parameters* tab** loads saved parameter sets. It is *not* the EA selector. The EA is chosen on the **Settings** tab.
+- **Keep the Mac awake while trading.** System Settings → Battery/Energy → *Prevent automatic sleeping when the display is off*, or run `caffeinate -dimsu &`. Add MetaTrader 5 to **Login Items**. Prop firms forbid VPS/VPN, so the terminal runs on this Mac.
+
+---
+
+## 3. Windows
+
+### 3.1 One-time setup
+
+1. **Install MetaTrader 5** from metatrader5.com (or the prop firm's own MT5 build) and launch it once. Log in to any account (see 2.2 above for why).
+2. **Install Python 3.11+** from python.org, with "Add to PATH" checked, then:
+   ```powershell
+   cd $HOME\Trading\algo
+   python -m venv .venv; .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   ```
+3. **Deploy:**
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File mt5\tools\deploy.ps1
+   ```
+   - **Data folder:** taken from the most recently used `%APPDATA%\MetaQuotes\Terminal\<hash>`. With several terminals installed, pass it explicitly: `-DataDir "<File → Open Data Folder path>"`.
+   - **MetaEditor64.exe:** found through `<DataDir>\origin.txt`. For a portable install, the data folder *is* the install folder.
+4. **Refresh and self-test.** Navigator → Refresh, then the self-test (section 5).
+
+### 3.2 Windows notes
+
+- Symlinks are not needed. If you want edit-in-repo without redeploying, create directory junctions (`mklink /J`) instead of copies. Junctions are left out of `deploy.ps1` on purpose: the copy is simpler and always works.
+- **Keep the PC from sleeping** (Settings → Power), and put MT5 in **Startup** (`shell:startup`).
+
+---
+
+## 4. Linux (Wine)
+
+### 4.1 One-time setup
+
+1. **Install MT5 with MetaQuotes' official Linux installer**, which sets up Wine and the terminal in the prefix `~/.mt5`. Run the installer script from metatrader5.com (Download → Linux) and follow its prompts. Start the terminal once and log in to an account.
+2. **Repo + Python:** same as macOS step 3.
+3. **Deploy:**
+   ```bash
+   MT5_WINEPREFIX=~/.mt5 mt5/tools/deploy.sh
+   ```
+   - `MT5_WINE` defaults to `wine64` or `wine` on `PATH`.
+   - **On a headless box** (no X server) MetaEditor needs a virtual display. Create a wrapper once:
+     ```bash
+     printf '#!/bin/bash\nexec xvfb-run -a wine "$@"\n' > ~/bin/xwine && chmod +x ~/bin/xwine
+     MT5_WINE=~/bin/xwine MT5_WINEPREFIX=~/.mt5 mt5/tools/deploy.sh
+     ```
+     This is how `deploy.sh` was verified headless: MetaEditor build 6235 compiled all four programs with `0 errors, 0 warnings`, and the same Wine terminal ran S021_SelfTest: 9828 passed.
+   - **If autodetection of the data folder fails,** pass `--mql5 "$HOME/.mt5/drive_c/Program Files/MetaTrader 5/MQL5" --common "$HOME/.mt5/drive_c/users/$USER/AppData/Roaming/MetaQuotes/Terminal/Common/Files"`.
+
+---
+
+## 5. Self-test (any OS, ~1 minute)
+
+1. Open any chart. Drag **Navigator → Scripts → AlgoTrading → S021_SelfTest** onto it and press OK.
+2. Toolbox (Ctrl/Cmd+T) → **Experts** tab:
+   ```
+   levels fixture: 87 days compared, 72 with levels
+   S021 self-test: 9828 passed, 0 failed -- OK
+   ```
+   The result is also written to `<Common>/Files/AlgoTrading/selftest/S021_selftest.json`.
+
+**What it checks:**
+
+- server-time rules against real timezones (5549 instants);
+- O / ADR14 / U / L on 72 days of real history against the Python engine (including both 2025 DST ends and the Thanksgiving half day);
+- sizing and the account guard against the pytest cases.
+
+Run it after any change to `AlgoCore` or `Strategies/S021_ORB`.
+
+---
+
+## 6. Offline backtest in the Strategy Tester + parity with Python
+
+This runs the EA on **our own** Nasdaq history (histdata, the same bars the Python backtest uses), so EA and engine can be compared day by day. It needs no broker data.
+
+### 6.1 History → custom symbol (once, or when you want a new window)
+
+1. **History.** `deploy` generates it if it is missing (2025-01-02 … 2026-09-30). For a different window:
+   ```bash
+   python -m mt5.tools.s021_fixtures --start 2024-01-02 --end 2026-09-30 \
+       --out mt5/MQL5/Files/AlgoTrading/e2e && mt5/tools/deploy.sh --skip-tests
+   ```
+2. **Custom symbol.** Drag **Scripts → AlgoTrading → ImportM1CustomSymbol** onto any chart and set its inputs:
+   - `InpCsvPath` = `AlgoTrading/e2e/s021_m1.csv` (not the default `fixtures/…`, which is the short self-test file);
+   - `InpSymbol` = `NSXUSD_HD`.
+
+   Expect `ImportM1: 587932 bars imported into custom symbol NSXUSD_HD`. A preceding `some symbol properties were rejected, error 5307/5308` is harmless.
+
+### 6.2 Tester settings (remembered by the terminal after the first run)
+
+Open the tester with **View → Strategy Tester** (Ctrl/Cmd+R), or right-click S021_ORB in the Navigator → **Test**.
+
+**Settings** tab:
+
+| Field | Value |
+|---|---|
+| Expert | `AlgoTrading\S021_ORB.ex5` |
+| Symbol / period | `NSXUSD_HD` / `M1` |
+| Date | custom, `2025.03.01` – `2026.09.30` (≥ 45 days after the history start, for ADR14) |
+| Forward | No |
+| Delays | Zero latency, ideal execution |
+| Modelling | **1 minute OHLC** (the custom symbol has no real ticks; "history quality 0%" is expected) |
+| Deposit | 10000 USD, any leverage |
+| Optimization | Disabled |
+
+**Inputs** tab: right click → **Load** → `S021_tester_offline.set`, then **Start**. The preset sets:
+
+- `ServerTzRule = EET_US_DST`, because the history was stamped with that rule;
+- `VerifyServerOffset = false`;
+- `TimerSeconds = 60`, which is much faster in the tester;
+- `RiskPct = 0.5`.
+
+Reference run (2026-10-05, macOS, 0.5% risk): 366 trades, net +$818.65, profit factor 1.16, max equity drawdown 3.99%.
+
+### 6.3 Parity check
+
+Copy the EA's per-day file into the repo (`data/raw` is git-ignored) and run the comparison:
+
+```bash
+# macOS (Linux: replace the prefix with ~/.mt5/drive_c/users/$USER/...)
+mkdir -p data/raw/mt5
+cp ~/Library/Application\ Support/net.metaquotes.wine.metatrader5/drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files/AlgoTrading/logs/S021-mt5-acct*/S021-mt5-acct*_days.csv data/raw/mt5/
+python -m mt5.tools.s021_parity \
+  --bars mt5/MQL5/Files/AlgoTrading/e2e/s021_m1.csv \
+  --ea-days data/raw/mt5/S021-mt5-acct<login>_days.csv \
+  --rule EET_US_DST --out reports/s021_mt5_parity.csv
+```
+
+On Windows the source folder is `%APPDATA%\MetaQuotes\Terminal\Common\Files\AlgoTrading\logs\`.
+
+Exit code 0 means parity holds. Levels must match to 1e-6; entries must match day by day. Known, explained categories are not failures:
+
+| Category | Why |
+|---|---|
+| `engine_skip_both_in_bar` | both levels inside one M1 bar: the engine skips the day, the tester's ticks decide |
+| `live_only_short_session` | half days: the engine needs ≥ 350 session bars, live cannot know that in advance |
+| `ea_missed_entry` | a level was touched before the EA could place its stops |
+
+---
+
+## 7. Live / prop account
+
+1. **Log in to the account** (File → Login to Trade Account). Put the Nasdaq 100 symbol in Market Watch (`US100`, `USTEC`, `NAS100`, …) and open its chart (any timeframe, M1 recommended).
+2. **Attach the EA.** Drag **S021_ORB** onto that chart.
+   - **Common** tab: tick **Allow Algo Trading**.
+   - **Inputs** tab: **Load** the preset for the firm, then set `InpRiskPct` to the risk chosen for this account.
+
+   | Preset | Use for |
+   |---|---|
+   | `S021_fundingpips_10k_eval.set` | FundingPips 2-Step $10K, evaluation phases |
+   | `S021_fundingpips_10k_master_summer.set` | FundingPips Master, US summer time (Mar–Nov): `ForceExitUtc = 20:44`, because the firm auto-closes at 20:45–21:00 UTC. Use the eval preset in winter. |
+   | `S021_ftmo_10k.set` | FTMO $10K (day reset = Prague midnight) |
+
+   All presets use a guard of 4.5% daily / 9% max, tighter than the firms' 5% / 10%. The guard blocks *new* entries only, it never force-closes positions.
+3. **Turn on Algo Trading** with the toolbar button (it must be green). The EA icon in the chart corner must not be grey.
+4. **Check the `init` event** in the Experts tab (or in `events-*.jsonl`):
+
+   | Field | Expected |
+   |---|---|
+   | `server_offset_expected_s` == `server_offset_observed_s` | equal. Otherwise the EA logs `halted` and refuses new entries: fix `InpServerTzRule`. |
+   | `margin_mode` | `hedging` |
+   | `volume_min`, `volume_step`, `money_per_point_per_lot`, `contract_size` | the broker's real spec; keep it for the records |
+
+5. **Daily timeline.** All S021 times are fixed in UTC:
+
+   | Event | UTC | Kyiv (summer / winter) |
+   |---|---|---|
+   | levels + two stop orders | 14:30 | 17:30 / 16:30 |
+   | unfilled orders cancelled | 19:30 | 22:30 / 21:30 |
+   | time exit | 20:59 | 23:59 / 22:59 |
+
+   Look for `levels`, `size`, two `place_stop`, then on a fill `fill` and `cancel_sibling` with `cancel_latency_ms`.
+6. **Keep the machine running:** see the OS sections. `heartbeat.json` is refreshed every 60 s and can be monitored.
+7. **Several accounts** need one terminal instance per account: a terminal can only be logged in to one account. That is not covered by these scripts yet.
+
+---
+
+## 8. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `Invalid account` on login | wrong password or an expired demo. Reset the password in the broker's cabinet, or File → Open an Account to create a fresh demo from inside MT5 |
+| Strategy Tester: "tester not started because the account is not specified" | log in to any account (a demo is fine) |
+| EA not in the Navigator / tester list | deployed with `--link` on macOS. Redeploy in copy mode, then Cmd+Q and restart MT5 |
+| `deploy` step 5: "no compiler log" | MetaEditor could not be started through Wine. Set `MT5_WINE` / `MT5_WINEPREFIX`, or compile with F7 |
+| Compile `FAIL` with `cannot open file <AlgoCore/...>` | `Include/AlgoCore` or `Include/Strategies` missing in the terminal. Rerun `deploy` |
+| `ImportM1: 114365 bars` instead of 587932 | `InpCsvPath` left at the default `fixtures/…`. Rerun with `AlgoTrading/e2e/s021_m1.csv` |
+| `halted` event at start | the server timezone rule disagrees with the terminal clock. Check the broker's server time and set `InpServerTzRule` |
+| `missed_entry` warning | a level was already touched before the EA could place the stops (late start or a gap). The day is skipped by design: no market-order substitute |
+| `insufficient_adr_history` | fewer than 14 valid sessions in the M1 history. Scroll the chart back (Home key), or set Tools → Options → Charts → Max bars = Unlimited |
+| `oco_double_fill` error | both stops filled before the sibling was cancelled. Both legs are closed (`DoubleFillPolicy`), see ALGODEV-60 |

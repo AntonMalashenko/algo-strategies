@@ -1,0 +1,25 @@
+; S021 ORB -- FundingPips 2-Step Standard $10K, EVALUATION phases (MT5).
+; Firm limits: daily 5% (vs day-start balance/equity, reset 00:00 platform time), max 10% static.
+; Our guard is tighter: 4.5% / 9%. Server rule assumed TZ_EET_US_DST -- the EA verifies it live
+; (init event: server_offset_expected_s == server_offset_observed_s).
+; InpRiskPct: placeholder 0.5 -- set the risk chosen for this account before attaching.
+; Enum codes: ServerTzRule/DayResetRule 0=UTC 1=FIXED 2=EET_US_DST 3=EET_EU_DST 4=CET_EU_DST
+InpRiskPct=0.5
+InpDailyRiskCapPct=0.0
+InpMaxRealRiskWarnPct=4.5
+InpInitialBalance=10000.0
+InpDailyGuardPct=4.5
+InpMaxGuardPct=9.0
+InpDayResetRule=2
+InpDayResetFixedHours=0
+InpServerTzRule=2
+InpServerFixedHours=0
+InpVerifyServerOffset=true
+InpExitBufferMin=0
+InpForceExitUtc=
+InpDoubleFillPolicy=0
+InpMagic=21021
+InpHistoryDays=45
+InpLogToCommon=true
+InpWriteDaysCsv=true
+InpTimerSeconds=1

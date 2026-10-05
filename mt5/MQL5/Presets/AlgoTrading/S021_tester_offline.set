@@ -1,0 +1,23 @@
+; S021 ORB -- Strategy Tester run on the offline custom symbol NSXUSD_HD
+; (history from mt5/tools/s021_fixtures.py, stamped in TZ_EET_US_DST server time).
+; Symbol NSXUSD_HD, M1, model "1 minute OHLC", deposit 10000 USD.
+; Enum codes: ServerTzRule/DayResetRule 0=UTC 1=FIXED 2=EET_US_DST 3=EET_EU_DST 4=CET_EU_DST
+InpRiskPct=0.5
+InpDailyRiskCapPct=0.0
+InpMaxRealRiskWarnPct=0.0
+InpInitialBalance=0.0
+InpDailyGuardPct=0.0
+InpMaxGuardPct=0.0
+InpDayResetRule=2
+InpDayResetFixedHours=0
+InpServerTzRule=2
+InpServerFixedHours=0
+InpVerifyServerOffset=false
+InpExitBufferMin=0
+InpForceExitUtc=
+InpDoubleFillPolicy=0
+InpMagic=21021
+InpHistoryDays=45
+InpLogToCommon=true
+InpWriteDaysCsv=true
+InpTimerSeconds=60

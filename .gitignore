@@ -61,3 +61,7 @@ _stage_tmp.tar.gz
 
 # Scratch holding pen for files pending manual deletion (device_bash cannot rm)
 _to_delete/
+
+# MetaTrader 5 (mt5/): compiled experts/scripts and generated self-test fixtures
+mt5/**/*.ex5
+mt5/MQL5/Files/
