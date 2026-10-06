@@ -28,12 +28,15 @@ after the first touch expires.
 """
 from __future__ import annotations
 
+from datetime import time
+
 import numpy as np
 import pandas as pd
 
 BUFFER_PIPS = 2.0      # stop-loss buffer
 WINDOW_BARS = 96       # confirmation window after first touch (~1 day of M15)
 OB_VALID_BARS = 48     # how long an order-block limit stays active
+MINUTES_PER_HOUR = 60
 
 
 def resample_h4(m15: pd.DataFrame) -> pd.DataFrame:
@@ -121,6 +124,8 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                  trend_align: str = "with",
                  max_reentries: int = 0,
                  fta_min_r: float | None = None,
+                 intraday_cutoff: time | None = None,
+                 cost_inclusive_sizing: bool = False,
                  return_state: bool = False):
     """Event-driven backtest. Returns a DataFrame of trades.
 
@@ -152,6 +157,25 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                          trade is allowed, filter is silent. Causal: `ref` is
                          only ever a swing confirmed strictly before bar t.
 
+      intraday_cutoff -- prop rule 1 (S004-intraday, ALGODEV-62, OFF by
+                         default): a position still open on a bar whose
+                         time-of-day is at or past this clock reading is
+                         closed at that bar's close (exit_reason="intraday"),
+                         so nothing is carried over the rollover, overnight or
+                         a weekend. Server/broker clock, same clock the bar
+                         index is stamped in. The round-trip cost is still
+                         charged on that exit.
+      cost_inclusive_sizing -- prop rule 2 (S004-intraday, ALGODEV-62, OFF by
+                         default): report R against (stop distance + spread)
+                         instead of the raw stop distance, i.e. size the
+                         position on what a full stop actually costs. A full
+                         stop then loses exactly -1R, which removes the
+                         tiny-stop R-explosions documented in
+                         backtest/s004_metalabel_data.py (worst case -10R on a
+                         0.1-pip stop). Price levels (stop, TP, partial and
+                         breakeven triggers) are unaffected -- only the R
+                         denominator changes.
+
     Intrabar pessimism: within one bar SL is always assumed to be hit BEFORE
     any favourable level (partial/BE trigger/TP).
     """
@@ -182,6 +206,9 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
 
     buf = BUFFER_PIPS * pip
     cost = spread_pips * pip            # total round-trip cost in price units
+    cutoff_minute = (None if intraday_cutoff is None
+                     else intraday_cutoff.hour * MINUTES_PER_HOUR + intraday_cutoff.minute)
+    minute_of_day = times.hour * MINUTES_PER_HOUR + times.minute
 
     zi = 0                              # next zone to activate
     active: list[dict] = []
@@ -204,11 +231,12 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
         if pos is not None:
             d = pos["dir"]
             risk0 = pos["risk"]
+            r_denom = pos["r_denom"]
             hit_sl = l[t] <= pos["sl"] if d == 1 else h[t] >= pos["sl"]
             if hit_sl:
                 pnl = pos["realized"] + pos["frac"] * (pos["sl"] - pos["entry"]) * d - cost
                 reason = "be" if pos["be_done"] and pos["sl"] == pos["entry"] else "sl"
-                _record(trades, pos, bar_time, t, pos["sl"], pnl / risk0,
+                _record(trades, pos, bar_time, t, pos["sl"], pnl / r_denom,
                         reason, mode, stop, rr)
                 _release(pos, reason == "sl", max_reentries)
                 pos = None
@@ -227,15 +255,21 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
             hit_tp = h[t] >= pos["tp"] if d == 1 else l[t] <= pos["tp"]
             if hit_tp:
                 pnl = pos["realized"] + pos["frac"] * (pos["tp"] - pos["entry"]) * d - cost
-                _record(trades, pos, bar_time, t, pos["tp"], pnl / risk0,
+                _record(trades, pos, bar_time, t, pos["tp"], pnl / r_denom,
                         "tp", mode, stop, rr)
                 _release(pos, False, max_reentries)
                 pos = None
                 continue
             if time_stop_bars is not None and t - pos["t_in"] >= time_stop_bars:
                 pnl = pos["realized"] + pos["frac"] * (c[t] - pos["entry"]) * d - cost
-                _record(trades, pos, bar_time, t, c[t], pnl / risk0,
+                _record(trades, pos, bar_time, t, c[t], pnl / r_denom,
                         "time", mode, stop, rr)
+                _release(pos, False, max_reentries)
+                pos = None
+            if pos is not None and cutoff_minute is not None and minute_of_day[t] >= cutoff_minute:
+                pnl = pos["realized"] + pos["frac"] * (c[t] - pos["entry"]) * d - cost
+                _record(trades, pos, bar_time, t, c[t], pnl / r_denom,
+                        "intraday", mode, stop, rr)
                 _release(pos, False, max_reentries)
                 pos = None
             continue                    # no new signals while managing
@@ -271,7 +305,7 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                         z["dead"] = True    # touched against the filter: consumed
                         continue
                     entry = min(o[t], near) if d == 1 else max(o[t], near)
-                    pos = _open(z, entry, t, times, stop, rr, buf, d)
+                    pos = _open(z, entry, t, times, stop, rr, buf, d, cost, cost_inclusive_sizing)
                     if pos is None:
                         z["dead"] = True
                         break           # keep original bar semantics
@@ -318,7 +352,7 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                 if trend is not None and not _trend_ok(trend[t], d, trend_align):
                     z["dead"] = True
                     continue
-                pos = _open(z, entry, t, times, stop, rr, buf, d)
+                pos = _open(z, entry, t, times, stop, rr, buf, d, cost, cost_inclusive_sizing)
                 if pos is None:
                     z["dead"] = True
                     break               # keep original bar semantics
@@ -340,8 +374,15 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
             if (d0 == 1 and l[t] <= pos["sl"]) or (d0 == -1 and h[t] >= pos["sl"]):
                 pnl = (pos["sl"] - pos["entry"]) * d0 - cost
                 _record(trades, pos, bar_time, t, pos["sl"],
-                        pnl / pos["risk"], "sl", mode, stop, rr)
+                        pnl / pos["r_denom"], "sl", mode, stop, rr)
                 _release(pos, True, max_reentries)
+                pos = None
+            elif cutoff_minute is not None and minute_of_day[t] >= cutoff_minute:
+                # opened on the cutoff bar itself: still not carried overnight
+                pnl = (c[t] - pos["entry"]) * d0 - cost
+                _record(trades, pos, bar_time, t, c[t],
+                        pnl / pos["r_denom"], "intraday", mode, stop, rr)
+                _release(pos, False, max_reentries)
                 pos = None
 
     if return_state:
@@ -406,7 +447,7 @@ def _record(trades, pos, bar_time, t, exit_px, r, reason, mode, stop, rr):
     ))
 
 
-def _open(z, entry, t, times, stop, rr, buf, d):
+def _open(z, entry, t, times, stop, rr, buf, d, cost, cost_inclusive_sizing):
     if stop == "zone":
         sl = (z["bot"] - buf) if d == 1 else (z["top"] + buf)
     else:                               # swing
@@ -415,7 +456,12 @@ def _open(z, entry, t, times, stop, rr, buf, d):
     if risk <= 0:
         return None
     tp = entry + d * rr * risk
+    # r_denom: what a full stop costs. cost_inclusive_sizing=True sizes the
+    # position on (stop + spread), so a full stop is exactly -1R; the default
+    # (False) keeps the raw stop distance, i.e. the frozen S004/S016 baseline.
+    r_denom = risk + cost if cost_inclusive_sizing else risk
     return dict(entry=entry, sl=sl, sl0=sl, tp=tp, dir=d, risk=risk,
+                r_denom=r_denom,
                 frac=1.0, realized=0.0, partial_done=False, be_done=False,
                 t_in=t, time_in=times[t], hour=times[t].hour,
                 sweep=z.get("sweep", False),

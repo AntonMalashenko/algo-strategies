@@ -23,12 +23,9 @@ import numpy as np
 import pandas as pd
 
 from strategies.fvg_mtf import run_backtest, resample_h4
+from strategies.s004_config import ASIA_HOURS, CORE_PAIRS, PIP_RAW, S004_BASE
 
 ROOT = Path(__file__).resolve().parent.parent
-CORE_PAIRS = ["GBPJPY", "EURUSD", "USDCHF", "GBPUSD", "EURJPY", "USDJPY", "AUDUSD"]
-PIP_RAW = 10.0     # FX: 1 pip = 10 raw price units (data scaled by 1e5)
-SPREAD_PIPS = 0.9  # real measured spread used throughout S004 validation
-ASIA_HOURS = set(range(0, 7))   # 00:00-06:59 server time, per passport S004 SS3
 TREND_MA_DAYS = 20              # matches the S016 E1 precedent for this engine
 ATR_WINDOW = 14                 # standard ATR window, used for H4 and D1
 
@@ -136,8 +133,7 @@ def build_all(until: str | None = None) -> pd.DataFrame:
     all_tr = []
     for sym in CORE_PAIRS:
         m15 = load_combined(sym, until=until)
-        tr = run_backtest(m15, mode="base", stop="zone", rr=3.0,
-                          pip=PIP_RAW, spread_pips=SPREAD_PIPS)
+        tr = run_backtest(m15, **S004_BASE.engine_kwargs())
         tr = tr[tr["hour"].isin(ASIA_HOURS)].copy()
         tr = build_features(sym, m15, tr)
         all_tr.append(tr)
