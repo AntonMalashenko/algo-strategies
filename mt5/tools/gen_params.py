@@ -268,7 +268,7 @@ def render_s004(config=None) -> str:
         _define("S004_SYMBOLS", ",".join(config.pairs),
                 "S004_INTRADAY.pairs; entry order on ties is by symbol name, not this order"),
         _define("S004_CLOCK_TZ_RULE", _MqlIdentifier(clock_rule),
-                f"s004_config.SESSION_TZ {SESSION_TZ} (measured, see run_s004_clock_probe.py)"),
+                f"s004_config.SESSION_TZ {SESSION_TZ} (measured, see mt5/tools/s004_clock_probe.py)"),
         _define("S004_MAGIC_PREFIX", MAGIC, "s004_config.MAGIC (labels)"),
         _define("S004_DEFAULT_RISK_PCT", float(RISK_PCT),
                 "s004_config.RISK_PCT (EA input default)"),
@@ -278,7 +278,7 @@ def render_s004(config=None) -> str:
                  ["S004-intraday (H4 FVG bounce, Asia session, FX) rule constants.",
                   "Session hours and the cutoff are on the broker's EET/EEST clock,",
                   "DST-aware on EUROPEAN dates -- measured from the M15 data by",
-                  "backtest/run_s004_clock_probe.py, never assumed to be a fixed offset.",
+                  "mt5/tools/s004_clock_probe.py, never assumed to be a fixed offset.",
                   "The daily cap is portfolio-wide: the EA counts entries across all",
                   "S004_SYMBOLS together (see backtest/run_s004_intraday.py)."],
                  body)

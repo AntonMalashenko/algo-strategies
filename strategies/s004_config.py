@@ -47,7 +47,7 @@ ASIA_HOURS = tuple(range(0, 7))  # 00:00-06:59 session clock, per passport S004 
 
 # The clock the M15 bar index -- and therefore every session hour above -- is
 # stamped in: EET/EEST, switching on the EUROPEAN DST dates (UTC+2 winter,
-# UTC+3 summer). This is NOT an assumption: backtest/run_s004_clock_probe.py
+# UTC+3 summer). This is NOT an assumption: mt5/tools/s004_clock_probe.py
 # measures it from the data itself and shows the European morning sits at the
 # same clock hour on both sides of the EU transition (so the clock moves with
 # Europe) and on both sides of the US transition (so it does not move with the

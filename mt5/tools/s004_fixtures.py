@@ -11,7 +11,7 @@ mt5/tools/install_mac.sh copies it to the terminal's Common/Files):
                    backtest/s004_metalabel_data.py feeds the engine. No clock
                    conversion happens here: these files are ALREADY stamped on
                    the broker's EET/EEST clock (strategies/s004_config.py::
-                   SESSION_TZ, measured by backtest/run_s004_clock_probe.py).
+                   SESSION_TZ, measured by mt5/tools/s004_clock_probe.py).
   s004_trades.csv  every trade strategies/fvg_mtf.py::run_backtest produces on
                    those bars under the S004_INTRADAY preset -- the expectation
                    the MQL5 engine port must reproduce one for one.

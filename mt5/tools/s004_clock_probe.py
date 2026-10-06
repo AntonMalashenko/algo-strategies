@@ -1,6 +1,6 @@
 """Measure which timezone the S004 M15 files are stamped in (ALGODEV-62 phase B).
 
-    python -m backtest.run_s004_clock_probe
+    python -m mt5.tools.s004_clock_probe
 
 Why this exists: the EA has to read the Asia window (00:00-06:59) and the 22:45
 cutoff off the broker's clock exactly the way the backtest reads them off the

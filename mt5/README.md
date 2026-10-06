@@ -35,10 +35,16 @@ mt5/
           Params.mqh             GENERATED from strategies/orb_intraday/config.py::ORB_BASE
           Levels.mqh             S021 levels: O, ADR14, U/L, stop -- pure functions
           Runtime.mqh            S021 state machine (decide() cases 1-7, event driven)
+        S004_FVG/
+          Params.mqh             GENERATED from strategies/s004_config.py::S004_INTRADAY
+          Engine.mqh             S004 engine: port of strategies/fvg_mtf.py::run_backtest,
+                                 pure (no orders, no account) so it can be diffed bar for bar
     Experts/AlgoTrading/
       S021_ORB.mq5               thin EA shell: inputs + event wiring
     Scripts/AlgoTrading/
       S021_SelfTest.mq5          runs the pure pieces against Python-made fixtures
+      S004_SelfTest.mq5          replays Python-made fixtures through S004 Engine.mqh and
+                                 compares every trade (entry/SL/TP/exit/reason/R)
       ExportM1.mq5               dumps the broker's M1 bars + symbol spec (any strategy)
       ImportM1CustomSymbol.mq5   builds an offline custom symbol from an M1 CSV (tester runs
                                  on histdata or on a saved broker export -- any strategy)
@@ -49,6 +55,9 @@ mt5/
     clock.py                     the same tz rules as Clock.mqh (tested against zoneinfo)
     s021_fixtures.py             self-test fixtures from histdata + the engine
     s021_parity.py               engine vs EA on the broker's own bars
+    s004_clock_probe.py          measures which timezone the S004 data is stamped in
+    s004_fixtures.py             S004 self-test fixtures: the engine's bars + its trades
+    run_selftest.sh              runs a *_SelfTest script headlessly in a throwaway terminal
     deploy.sh / deploy.ps1       one-command deploy: generate, test, copy, compile (--watch / -Watch)
     install_mac.sh               copy (default) or link sources/presets/fixtures into a terminal
 tests/mt5/                       pytest for the tools (repo testpaths = tests/)

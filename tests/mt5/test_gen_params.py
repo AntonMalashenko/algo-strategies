@@ -76,7 +76,7 @@ def test_s004_header_carries_the_intraday_preset():
 
 
 def test_s004_session_clock_is_eet_on_european_dst_dates():
-    # measured from the M15 data, not assumed: backtest/run_s004_clock_probe.py.
+    # measured from the M15 data, not assumed: mt5/tools/s004_clock_probe.py.
     # A fixed offset (or the US-dated TZ_EET_US_DST) drifts an hour every summer.
     assert gen_params.SESSION_CLOCK_RULES[SESSION_TZ] == "TZ_EET_EU_DST"
     assert _defines(gen_params.render_s004())["S004_CLOCK_TZ_RULE"] == "TZ_EET_EU_DST"

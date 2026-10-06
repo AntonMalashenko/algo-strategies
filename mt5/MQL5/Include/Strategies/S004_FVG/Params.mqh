@@ -3,7 +3,7 @@
 // S004-intraday (H4 FVG bounce, Asia session, FX) rule constants.
 // Session hours and the cutoff are on the broker's EET/EEST clock,
 // DST-aware on EUROPEAN dates -- measured from the M15 data by
-// backtest/run_s004_clock_probe.py, never assumed to be a fixed offset.
+// mt5/tools/s004_clock_probe.py, never assumed to be a fixed offset.
 // The daily cap is portfolio-wide: the EA counts entries across all
 // S004_SYMBOLS together (see backtest/run_s004_intraday.py).
 #ifndef STRATEGIES_S004_FVG_PARAMS_MQH
@@ -19,7 +19,7 @@
 #define S004_MAX_TRADES_PER_DAY              2            // prop rule 3: entries per session day across ALL symbols, not per symbol
 #define S004_SYMBOL_COUNT                    7            // S004_INTRADAY.pairs count
 #define S004_SYMBOLS                         "GBPJPY,EURUSD,USDCHF,GBPUSD,EURJPY,USDJPY,AUDUSD" // S004_INTRADAY.pairs; entry order on ties is by symbol name, not this order
-#define S004_CLOCK_TZ_RULE                   TZ_EET_EU_DST // s004_config.SESSION_TZ Europe/Bucharest (measured, see run_s004_clock_probe.py)
+#define S004_CLOCK_TZ_RULE                   TZ_EET_EU_DST // s004_config.SESSION_TZ Europe/Bucharest (measured, see mt5/tools/s004_clock_probe.py)
 #define S004_MAGIC_PREFIX                    "S004"       // s004_config.MAGIC (labels)
 #define S004_DEFAULT_RISK_PCT                1.0          // s004_config.RISK_PCT (EA input default)
 #define S004_PARAMS_SOURCE                   "strategies/s004_config.py::S004_INTRADAY sha=8024c6e97f50" // provenance, logged by the EA at init

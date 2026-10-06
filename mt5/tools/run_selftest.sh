@@ -16,6 +16,7 @@
 #
 # Env: MT5_WINE, MT5_WINEPREFIX -- same meaning as in deploy.sh.
 set -uo pipefail
+set +m          # no "Terminated" job notices when the sandbox is stopped
 
 SCRIPT_NAME="${1:-S004_SelfTest}"
 [[ "${1:-}" == --* ]] && SCRIPT_NAME="S004_SelfTest"
@@ -25,9 +26,10 @@ for arg in "$@"; do [[ "$arg" == "--keep" ]] && KEEP=1; done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 TERMINAL_SUBDIR="drive_c/Program Files/MetaTrader 5"
-SANDBOX_SUBDIR="drive_c/algotrading_selftest"
+SANDBOX_NAME="algotrading_selftest"
+SANDBOX_SUBDIR="drive_c/$SANDBOX_NAME"
 RESULT_SUBPATH="AlgoTrading/selftest/${SCRIPT_NAME}.json"
-TIMEOUT_SECONDS=300
+TIMEOUT_SECONDS=600
 POLL_SECONDS=3
 
 prefix="${MT5_WINEPREFIX:-$HOME/Library/Application Support/net.metaquotes.wine.metatrader5}"
@@ -65,10 +67,24 @@ if [[ -d "$REPO/mt5/MQL5/Files/AlgoTrading/fixtures" ]]; then
 fi
 
 sandbox="$prefix/$SANDBOX_SUBDIR"
-# a sandbox terminal left over from an interrupted run still holds the folder,
-# and MT5 silently drops the second instance -- clear it before rebuilding
-for pid in $(pgrep -f "$SANDBOX_SUBDIR" 2>/dev/null || true); do kill "$pid" 2>/dev/null; done
-sleep 2
+# A sandbox terminal left over from an interrupted run still holds the folder,
+# and MT5 silently drops the second instance -- so the run would just time out.
+# Wine's preloader ignores the first TERM often enough to need the follow-up.
+stop_sandbox() {
+  for attempt in 1 2 3; do
+    local pids; pids="$(pgrep -f "$SANDBOX_NAME" 2>/dev/null || true)"
+    [[ -z "$pids" ]] && return 0
+    for pid in $pids; do
+      if [[ $attempt -eq 1 ]]; then kill "$pid" 2>/dev/null; else kill -9 "$pid" 2>/dev/null; fi
+    done
+    sleep 3
+  done
+  [[ -z "$(pgrep -f "$SANDBOX_NAME" 2>/dev/null || true)" ]]
+}
+if ! stop_sandbox; then
+  echo "a sandbox terminal from an earlier run will not die -- kill it by hand" >&2
+  exit 2
+fi
 rm -rf "$sandbox"
 mkdir -p "$sandbox/MQL5"
 cp "$terminal/terminal64.exe" "$sandbox/"
@@ -94,6 +110,7 @@ for ((waited=0; waited<TIMEOUT_SECONDS; waited+=POLL_SECONDS)); do
 done
 [[ $status -eq 1 && ! -f "$result" ]] && echo "$SCRIPT_NAME: no result after ${TIMEOUT_SECONDS}s" >&2
 
-for pid in $(pgrep -f "$SANDBOX_SUBDIR" 2>/dev/null || true); do kill "$pid" 2>/dev/null; done
+for pid in $(pgrep -f "$SANDBOX_NAME" 2>/dev/null || true); do kill "$pid" 2>/dev/null; done
+stop_sandbox || echo "warning: a sandbox terminal is still running" >&2
 [[ $KEEP -eq 1 ]] || rm -rf "$sandbox"
 exit $status
