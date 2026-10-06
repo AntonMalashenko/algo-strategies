@@ -18,7 +18,10 @@ rules: [`mt5/README.md`](../README.md). Ticket: ALGODEV-61.
 
 1. regenerates the strategy constants from Python (`gen_params`);
 2. runs `tests/mt5`;
-3. creates the self-test fixtures and the tester history if they are missing;
+3. regenerates the self-test fixtures and the tester history when they are missing **or
+   stale** (older than `s021_fixtures.py`, `clock.py`, or the strategy's `config.py` /
+   `engine.py` -- the expectations bake in the session clock and the strategy params, so a
+   stale fixture keeps asserting the previous behaviour);
 4. copies sources, presets and fixtures into the terminal;
 5. compiles every EA and script with MetaEditor, and stops with a non-zero exit code on any compile error.
 
@@ -155,17 +158,20 @@ Copy mode is the default because the macOS (Wine) build of MT5 does not list Exp
 2. Toolbox (Ctrl/Cmd+T) → **Experts** tab:
    ```
    levels fixture: 87 days compared, 72 with levels
-   S021 self-test: 9828 passed, 0 failed -- OK
+   S021 self-test: 12172 passed, 0 failed -- OK
    ```
    The result is also written to `<Common>/Files/AlgoTrading/selftest/S021_selftest.json`.
 
 **What it checks:**
 
-- server-time rules against real timezones (5549 instants);
+- server-time rules against real timezones (6968 instants, including the strategy's own
+  `EST_US_DST` New York clock);
 - O / ADR14 / U / L on 72 days of real history against the Python engine (including both 2025 DST ends and the Thanksgiving half day);
 - sizing and the account guard against the pytest cases.
 
-Run it after any change to `AlgoCore` or `Strategies/S021_ORB`.
+Run it after any change to `AlgoCore` or `Strategies/S021_ORB`. If it fails on roughly the
+DST half of the fixture window and passes on the other half, suspect stale fixtures before
+suspecting the code: re-run `deploy.sh`, which now regenerates them on staleness.
 
 ---
 
@@ -313,13 +319,20 @@ first tick of the exit minute (= the bar open), the engine on that bar's close.
    | `margin_mode` | `hedging` |
    | `volume_min`, `volume_step`, `money_per_point_per_lot`, `contract_size` | the broker's real spec; keep it for the records |
 
-5. **Daily timeline.** All S021 times are fixed in UTC:
+5. **Daily timeline.** S021 is anchored on the **New York** clock, so the UTC readings
+   move with US DST (which starts and ends on different dates than EU DST):
 
-   | Event | UTC | Kyiv (summer / winter) |
-   |---|---|---|
-   | levels + two stop orders | 14:30 | 17:30 / 16:30 |
-   | unfilled orders cancelled | 19:30 | 22:30 / 21:30 |
-   | time exit | 20:59 | 23:59 / 22:59 |
+   | Event | New York | UTC, US DST (Mar–Nov) | UTC, standard time |
+   |---|---|---|---|
+   | levels + two stop orders | 09:30 | 13:30 | 14:30 |
+   | unfilled orders cancelled | 14:30 | 18:30 | 19:30 |
+   | time exit | 15:59 | 19:59 | 20:59 |
+
+   In Kyiv the first event normally reads **16:30** in both seasons, because Ukraine and
+   the US change clocks in the same direction. It reads 15:30 during the two weeks a year
+   when the two DST calendars disagree (roughly 8–29 March and 25 October – 1 November).
+   The broker server clock (`EET_US_DST`) is a constant 7 hours ahead of New York all year,
+   so on the chart the levels always appear at 16:30 server time.
 
    Look for `levels`, `size`, two `place_stop`, then on a fill `fill` and `cancel_sibling` with `cancel_latency_ms`.
 6. **Keep the machine running:** see the OS sections. `heartbeat.json` is refreshed every 60 s and can be monitored.
@@ -340,6 +353,8 @@ first tick of the exit minute (= the bar open), the engine on that bar's close.
 | `ImportM1: cannot open <Common>/Files/… (error 5004)` | only when the terminal is started from the shell: wine mapped a different user, so `FILE_COMMON` points at an empty tree. Run it with `USER=user USERNAME=user` |
 | Tester report: `ticks` == `bars`, EA sees O=H=L=C bars | the tester is replaying a stale snapshot of the custom symbol (or a pre-`tick_volume=4` import). Delete `<terminal>/Tester/bases` and `<terminal>/Tester/cache`, then rerun — see §6.1 |
 | Parity fails only outside the window you last imported | same stale tester snapshot: the snapshot is refreshed per history chunk, so a partial re-import "fixes" only its own date range |
+| Self-test fails on roughly half the days, passing on the rest | stale fixtures: the expectations on disk were generated under a different session clock or different strategy params, and only the days affected by the change fail. Rerun `deploy.sh` (step 3 regenerates on staleness), do not "fix" the code |
+| Self-test suddenly reports more checks than the docs say | expected after a new `ENUM_TZ_RULE` is added: the clock fixture gains ~1419 cross-checks per rule |
 | `halted` event at start | the server timezone rule disagrees with the terminal clock. Check the broker's server time and set `InpServerTzRule` |
 | `missed_entry` warning | a level was already touched before the EA could place the stops (late start or a gap). The day is skipped by design: no market-order substitute |
 | `insufficient_adr_history` | fewer than 14 valid sessions in the M1 history. Scroll the chart back (Home key), or set Tools → Options → Charts → Max bars = Unlimited |

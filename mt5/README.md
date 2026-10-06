@@ -23,7 +23,7 @@ mt5/
   MQL5/
     Include/
       AlgoCore/                  shared, strategy-agnostic (the MQL5 counterpart of bot/ + utils/)
-        Clock.mqh                server time <-> UTC <-> fixed strategy clocks (explicit tz rules)
+        Clock.mqh                server time <-> UTC <-> strategy clocks (explicit tz rules)
         JsonLog.mqh              JSONL logs, record-compatible with utils/trade_logger.py
         Sessions.mqh             daily sessions from M1 + causal average range (engine.py port)
         Sizing.mqh               lots_for_risk + volume/price normalisation (bot/risk.py port)
@@ -70,6 +70,12 @@ tests/mt5/                       pytest for the tools (repo testpaths = tests/)
   timezone is an explicit rule (`ENUM_TZ_RULE`), because the Strategy Tester has
   no real `TimeGMT()` and past DST cannot be observed. Live, the EA compares the
   rule with the terminal's actual offset and blocks new entries on a mismatch.
+- **The strategy's own session clock is generated, not hand-written.**
+  `mt5.tools.gen_params` reads `engine.SESSION_TZ` and emits the matching
+  `ENUM_TZ_RULE` into `Params.mqh`, so the EA and the backtest cannot drift apart.
+  S021 is anchored on `America/New_York`: the 09:30 open is 13:30 UTC under US DST
+  and 14:30 UTC in standard time. A fixed offset here is a bug, not a shortcut --
+  it silently moves the anchor an hour for half the year (see ALGODEV-61).
 - **State is rebuilt from the broker on every reconcile.** Positions, orders and
   history are read using the magic number and the day encoded in the order
   comment and open time. A restart therefore never re-enters a day and never

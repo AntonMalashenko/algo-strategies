@@ -9,10 +9,14 @@ package. Do not tune these values here; a variant is a new preset via .with_(...
 freezes.
 
 session_open/session_close/entry_cutoff are clock readings against histdata's native
-FIXED UTC-5 (EST) clock, not DST-converted -- see engine.py's module docstring for the
-2026-09-21 investigation that confirmed this is the correct, canonical rule: it anchors
-the opening range at the true NY 09:30 open in EST months and at true NY 10:30 in EDT
-months (a deliberate seasonal-conditional anchor, not a timezone bug).
+timestamps, which are TRUE New York local time (DST-aware), so 09:30 is the real cash
+open all year round. A 2026-09-21 investigation concluded the opposite -- that the
+timestamps were a fixed UTC-5 clock and the seasonal drift was deliberate -- and that
+conclusion was WRONG; see engine.py's module docstring for the 2026-10-05 correction
+(ALGODEV-61) and the two independent proofs. The values below are unchanged by that
+correction: the backtest always anchored on the true open. What changed is the live
+bots, which had been converting broker UTC into a fixed UTC-5 clock and so ran an hour
+late every US-DST month.
 
 S021.1 -- NAS100 Opening-Range Squeeze (claude/prompts-new-strategy-candidates.md P14,
 "S021.1"; own reformalization of an idea from an external review (Google Gemini), see the
@@ -22,7 +26,7 @@ squeeze_preset_enabled=False fields below are additive and unused by ORB_BASE/si
 NAS_SQUEEZE_PRESET below sets squeeze_preset_enabled=True and is read only by
 engine.simulate_squeeze_preset(), a separate sibling function -- see that function's
 docstring for why this preset needed its own function rather than a branch inside
-simulate(). Session times for the preset are TRUE UTC (unlike ORB_BASE's fixed-EST clock
+simulate(). Session times for the preset are TRUE UTC (unlike ORB_BASE's New York clock
 above) -- see engine.simulate_squeeze_preset()'s docstring.
 """
 from __future__ import annotations
@@ -36,7 +40,7 @@ class OrbConfig:
     adr_window: int = 14                    # trading days of ADR lookback (past only, causal)
     k_range: float = 0.20                   # opening-range half-width = k_range * ADR14
     stop_adr_mult: float = 0.75             # stop distance = stop_adr_mult * ADR14 from entry
-    session_open: time = time(9, 30)        # fixed-EST clock reading (NOT DST-converted -- see module docstring)
+    session_open: time = time(9, 30)        # New York local clock reading -- see module docstring
     session_close: time = time(15, 59)
     entry_cutoff: time = time(14, 29)       # last minute of the entry scan window
     min_session_bars: int = 350             # day invalid below this many M1 bars in-session
@@ -45,7 +49,7 @@ class OrbConfig:
 
     # --- S021.1 "NAS100 Opening-Range Squeeze" preset-only fields (default-off; unused by
     # the base ADR-band simulate()/ORB_BASE path above -- see engine.simulate_squeeze_preset()
-    # and NAS_SQUEEZE_PRESET below). Session times here are TRUE UTC, not the fixed-EST clock
+    # and NAS_SQUEEZE_PRESET below). Session times here are TRUE UTC, not the New York clock
     # session_open/session_close/entry_cutoff above use.
     squeeze_preset_enabled: bool = False
     orb_open_start: time = time(13, 30)     # UTC, inclusive -- first M15 candle of the cash session
