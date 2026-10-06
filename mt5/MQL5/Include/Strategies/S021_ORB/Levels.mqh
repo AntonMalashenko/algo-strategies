@@ -18,8 +18,8 @@
 
 struct S021Levels
   {
-   datetime          day;              // strategy-clock (fixed EST) midnight
-   double            open_price;       // O: open of the 09:30 fixed-EST M1 bar
+   datetime          day;              // strategy-clock (NY exchange local) midnight
+   double            open_price;       // O: open of the 09:30 NY M1 bar
    double            upper;            // U
    double            lower;            // L
    double            adr;              // ADR14
@@ -36,15 +36,18 @@ SessionWindow S021Window()
    return window;
   }
 
-// The strategy clock is a FIXED offset from UTC (no DST) -- see Params.mqh.
+// The strategy clock is the exchange's own local time, DST-aware -- see
+// Params.mqh (S021_CLOCK_TZ_RULE) and engine.py's module docstring for the
+// measurements that established it. Anchoring on a fixed UTC-5 clock instead
+// (as this EA did before ALGODEV-61) enters one hour late every US summer.
 datetime S021UtcToClock(const datetime utc)
   {
-   return utc+S021_CLOCK_UTC_OFFSET_HOURS*CLOCK_SECONDS_PER_HOUR;
+   return ClockUtcToLocal(S021_CLOCK_TZ_RULE,0,utc);
   }
 
 datetime S021ClockToUtc(const datetime clock_time)
   {
-   return clock_time-S021_CLOCK_UTC_OFFSET_HOURS*CLOCK_SECONDS_PER_HOUR;
+   return ClockLocalToUtc(S021_CLOCK_TZ_RULE,0,clock_time);
   }
 
 // Levels for `day`, given every valid session known (any order of days is

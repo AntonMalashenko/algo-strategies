@@ -3,12 +3,14 @@ name: code-change-log
 description: >-
   Read and write the repo's per-component change log under
   .claude/change-log/ (one JSONL file per package -- bot.jsonl, webapp.jsonl,
-  utils.jsonl, ... -- and one per strategy -- ger40_lonfra.jsonl,
-  fvg_mtf.jsonl, ...). Covers ANY change to the repo, not just source code --
+  utils.jsonl, mt5.jsonl, ... -- and one per strategy -- ger40_lonfra.jsonl,
+  fvg_mtf.jsonl, orb_intraday.jsonl, ...). Covers ANY change to the repo, not just source code --
   docs, config, scripts, this skill itself. READ the relevant file(s) BEFORE
   starting non-trivial work on a package or strategy (e.g. before touching
   bot/, read bot.jsonl; before touching strategies/ger40_lonfra/ or
-  bot/s007_*, read BOTH bot.jsonl and ger40_lonfra.jsonl). WRITE an entry to
+  bot/s007_*, read BOTH bot.jsonl and ger40_lonfra.jsonl; before touching
+  mt5/, read BOTH mt5.jsonl and the strategy file for the EA you are changing).
+  WRITE an entry to
   the relevant file(s) after finishing a logical change, right before your
   closing summary -- including docs-only changes (new/updated files under
   docs/, README.md, this skill's own files). Also use this whenever the user
@@ -20,7 +22,7 @@ description: >-
 
 `.claude/change-log/` holds one append-only JSONL file per **component**:
 one per package (`bot.jsonl`, `webapp.jsonl`, `utils.jsonl`, `scripts.jsonl`,
-`configs.jsonl`, `backtest.jsonl`, `deployment.jsonl`) and one per **strategy** (named after its
+`configs.jsonl`, `backtest.jsonl`, `deployment.jsonl`, `mt5.jsonl`) and one per **strategy** (named after its
 module under `strategies/`: `ger40_lonfra.jsonl`, `donchian.jsonl`,
 `fvg_mtf.jsonl`, `fx_carry.jsonl`, `funding_carry.jsonl`,
 `crypto_mtf.jsonl`, ...), plus `repo.jsonl` for cross-cutting/meta changes
@@ -55,6 +57,11 @@ way it does, or flag something already identified but not yet fixed.
 - Touching `bot/s007_paper.py` (bot package AND the ger40_lonfra/S007
   strategy) → read **both** `bot.jsonl` and `ger40_lonfra.jsonl`.
 - Touching `webapp/models.py` → read `webapp.jsonl`.
+- Touching `mt5/MQL5/Include/AlgoCore/Clock.mqh` (the shared MQL5 layer, no strategy in
+  the path) → read `mt5.jsonl`.
+- Touching `mt5/MQL5/Include/Strategies/S021_ORB/Runtime.mqh` or `mt5/tools/s021_parity.py`
+  (mt5 package AND the orb_intraday/S021 strategy) → read **both** `mt5.jsonl` and
+  `orb_intraday.jsonl`.
 
 ```bash
 tail -20 .claude/change-log/bot.jsonl .claude/change-log/ger40_lonfra.jsonl 2>/dev/null \
@@ -73,10 +80,14 @@ for line in sys.stdin:
 
 **Package** = the top-level directory of the file, stripping a leading
 `tests/` (tests mirror packages 1:1: `tests/bot/`, `tests/webapp/`,
-`tests/utils/`, `tests/scripts/`, `tests/configs/`, `tests/backtest/` map to
-`bot`, `webapp`, `utils`, `scripts`, `configs`, `backtest`).
+`tests/utils/`, `tests/scripts/`, `tests/configs/`, `tests/backtest/`,
+`tests/mt5/` map to
+`bot`, `webapp`, `utils`, `scripts`, `configs`, `backtest`, `mt5`).
 `strategies/` is NOT a package component — every file under it resolves to a
-strategy component instead (see below). Anything else at repo root
+strategy component instead (see below). `mt5/` IS a package component even
+though it contains per-strategy folders: a file under
+`mt5/MQL5/Include/Strategies/<Sxxx>/` resolves to BOTH `mt5` and that
+strategy. Anything else at repo root
 (`README.md`, `requirements.txt`, `CLAUDE.md`, `AGENTS.md`, `pyproject.toml`,
 `.claude/*`) → component `repo`.
 
@@ -98,6 +109,9 @@ mappings as of this writing (extend this list when a new strategy shows up
 | `strategies/gap_fade.py`, `gap_fade`, `s019` | `gap_fade`       |
 | `strategies/s017_elliott.py`, `s017`      | `s017_elliott`      |
 | `strategies/crypto_mtf/`, `crypto_mtf`    | `crypto_mtf`        |
+| `strategies/orb_intraday/`, `orb_intraday`, `s021`, `S021_ORB` | `orb_intraday` |
+| `strategies/rsi2_portfolio.py`, `rsi2_portfolio` | `rsi2_portfolio` |
+| `strategies/gerchik_levels/`, `gerchik_levels`, `s031` | `gerchik_levels` |
 | `strategies/overnight_drift.py`, `overnight_drift`, `s025` | `overnight_drift` |
 | `strategies/xsect_equity_momentum.py`, `xsect_equity_momentum`, `s027` | `xsect_equity_momentum` |
 | `strategies/eia_calendar.py`, `eia_calendar`, `s026` | `eia_calendar` |

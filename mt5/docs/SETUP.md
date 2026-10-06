@@ -186,6 +186,22 @@ This runs the EA on **our own** Nasdaq history (histdata, the same bars the Pyth
 
    Expect `ImportM1: 587932 bars imported into custom symbol NSXUSD_HD`. A preceding `some symbol properties were rejected, error 5307/5308` is harmless.
 
+3. **Drop the tester's own copy of the history.** The Strategy Tester does not read
+   the custom symbol directly: on the first run it snapshots it into
+   `<terminal>/Tester/bases/<server>/history/<symbol>/*.hcs` and keeps reusing that
+   snapshot. After *any* re-import the snapshot is stale, so delete it (and the run
+   cache) before testing again:
+
+   ```bash
+   # macOS; Windows: <terminal data folder>\Tester\{bases,cache}
+   T=~/Library/Application\ Support/net.metaquotes.wine.metatrader5/drive_c/Program\ Files/MetaTrader\ 5
+   rm -rf "$T/Tester/bases" "$T/Tester/cache"
+   ```
+
+   Skipping this is what made the 2026-10-05 parity run fail on 304 days: the symbol
+   already held the correct bars, but the tester replayed a snapshot taken before the
+   `tick_volume` fix. **Sanity check in the tester log: `ticks` must be ≈ 4 × `bars`.**
+
 ### 6.2 Tester settings (remembered by the terminal after the first run)
 
 Open the tester with **View → Strategy Tester** (Ctrl/Cmd+R), or right-click S021_ORB in the Navigator → **Test**.
@@ -210,7 +226,33 @@ Open the tester with **View → Strategy Tester** (Ctrl/Cmd+R), or right-click S
 - `TimerSeconds = 60`, which is much faster in the tester;
 - `RiskPct = 0.5`.
 
-Reference run (2026-10-05, macOS, 0.5% risk): 366 trades, net +$818.65, profit factor 1.16, max equity drawdown 3.99%.
+Reference run (2026-10-05, macOS, 0.5% risk, 2025.03.01–2026.09.30): 2132464 ticks /
+533116 bars, 365 trades, net +$1444.23, profit factor 1.30, win rate 58.4%, max balance
+drawdown 3.11%.
+
+#### Running the import and the tester headless (macOS/Linux)
+
+Everything above can also be driven from the shell, which is what CI-style reruns use.
+The terminal must be closed first (one instance locks the data folder), and the wine user
+has to be `user`, otherwise `FILE_COMMON` resolves to an empty
+`drive_c/users/$USER/...` tree and the import fails with `error 5004`:
+
+```bash
+P=~/Library/Application\ Support/net.metaquotes.wine.metatrader5
+W="/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64"
+
+printf '[StartUp]\nScript=AlgoTrading\\ImportM1CustomSymbol\nSymbol=EURUSD\nPeriod=M1\nShutdownTerminal=1\n' \
+    > "$P/drive_c/algotrading_import.ini"
+
+cd "$P/drive_c/Program Files/MetaTrader 5"
+USER=user USERNAME=user WINEPREFIX="$P" WINEDEBUG=-all "$W" terminal64.exe '/config:C:\algotrading_import.ini'
+```
+
+The tester is the same call with a `[Tester]` config (`Expert=AlgoTrading\S021_ORB`,
+`ExpertParameters=S021_tester_offline.set`, `Symbol=NSXUSD_HD`, `Period=M1`, `Model=1`,
+`FromDate`/`ToDate`, `Deposit=10000`, `Optimization=0`, `ShutdownTerminal=1`). Do not pass
+`/portable`: the macOS app does not, and adding it changes the data folder. Results land in
+`<terminal>/Tester/logs/` and in the EA's own `_days.csv`.
 
 ### 6.3 Parity check
 
@@ -235,6 +277,16 @@ Exit code 0 means parity holds. Levels must match to 1e-6; entries must match da
 | `engine_skip_both_in_bar` | both levels inside one M1 bar: the engine skips the day, the tester's ticks decide |
 | `live_only_short_session` | half days: the engine needs ≥ 350 session bars, live cannot know that in advance |
 | `ea_missed_entry` | a level was touched before the EA could place its stops |
+| `ea_no_levels` | no session to anchor on: weekends/holidays, the ADR14 warm-up, histdata gaps |
+| `both_no_trade` | neither side triggered |
+
+Result on 2026-10-05 (histdata 2025.03.01–2026.09.30, 574 EA days): **exit code 0** —
+326 `match`, 198 `ea_no_levels`, 39 `live_only_short_session`, 11 `both_no_trade`, no
+failures. On the 326 traded days entry price, direction, entry minute and `exit_reason`
+are identical. Mean R per trade: EA +0.0834 vs engine gross +0.0793 (engine net +0.0685,
+i.e. the engine's modelled spread/commission, which the custom symbol does not have). The
+remaining +0.004 R comes only from intrabar timing of the time exit: the EA closes on the
+first tick of the exit minute (= the bar open), the engine on that bar's close.
 
 ---
 
@@ -285,6 +337,9 @@ Exit code 0 means parity holds. Levels must match to 1e-6; entries must match da
 | `deploy` step 5: "no compiler log" | MetaEditor could not be started through Wine. Set `MT5_WINE` / `MT5_WINEPREFIX`, or compile with F7 |
 | Compile `FAIL` with `cannot open file <AlgoCore/...>` | `Include/AlgoCore` or `Include/Strategies` missing in the terminal. Rerun `deploy` |
 | `ImportM1: 114365 bars` instead of 587932 | `InpCsvPath` left at the default `fixtures/…`. Rerun with `AlgoTrading/e2e/s021_m1.csv` |
+| `ImportM1: cannot open <Common>/Files/… (error 5004)` | only when the terminal is started from the shell: wine mapped a different user, so `FILE_COMMON` points at an empty tree. Run it with `USER=user USERNAME=user` |
+| Tester report: `ticks` == `bars`, EA sees O=H=L=C bars | the tester is replaying a stale snapshot of the custom symbol (or a pre-`tick_volume=4` import). Delete `<terminal>/Tester/bases` and `<terminal>/Tester/cache`, then rerun — see §6.1 |
+| Parity fails only outside the window you last imported | same stale tester snapshot: the snapshot is refreshed per history chunk, so a partial re-import "fixes" only its own date range |
 | `halted` event at start | the server timezone rule disagrees with the terminal clock. Check the broker's server time and set `InpServerTzRule` |
 | `missed_entry` warning | a level was already touched before the EA could place the stops (late start or a gap). The day is skipped by design: no market-order substitute |
 | `insufficient_adr_history` | fewer than 14 valid sessions in the M1 history. Scroll the chart back (Home key), or set Tools → Options → Charts → Max bars = Unlimited |

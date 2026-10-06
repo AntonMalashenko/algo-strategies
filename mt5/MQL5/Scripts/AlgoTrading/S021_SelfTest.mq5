@@ -70,6 +70,7 @@ ENUM_TZ_RULE RuleFromName(const string name)
   {
    if(name=="UTC")        return TZ_UTC;
    if(name=="EET_US_DST") return TZ_EET_US_DST;
+   if(name=="EST_US_DST") return TZ_EST_US_DST;
    if(name=="EET_EU_DST") return TZ_EET_EU_DST;
    if(name=="CET_EU_DST") return TZ_CET_EU_DST;
    return TZ_FIXED;
@@ -93,9 +94,14 @@ void TestClockFixed()
    Check(ClockUtcToLocal(TZ_EET_US_DST,0,summer_utc)==summer_utc+3*CLOCK_SECONDS_PER_HOUR,"clock.eet_us.summer");
    Check(ClockUtcToLocal(TZ_EET_US_DST,0,winter_utc)==winter_utc+2*CLOCK_SECONDS_PER_HOUR,"clock.eet_us.winter");
    Check(ClockLocalToUtc(TZ_EET_US_DST,0,summer_utc+3*CLOCK_SECONDS_PER_HOUR)==summer_utc,"clock.eet_us.roundtrip");
-   // S021 fixed-EST clock: 14:30 UTC is always 09:30 on the strategy clock
-   Check(ClockMinuteOfDay(S021UtcToClock(summer_utc))==S021_SESSION_OPEN_MINUTE,"clock.s021.anchor_summer");
+   // S021 session clock is true New York local time, so the 09:30 anchor sits at
+   // 13:30 UTC while US DST is on and at 14:30 UTC in standard time. The negative
+   // check guards against a regression to the old fixed-UTC-5 clock, under which
+   // the anchor stayed at 14:30 UTC all year and ran an hour late every summer.
+   datetime summer_anchor_utc=ClockMakeTime(2025,7,15,13,30);
+   Check(ClockMinuteOfDay(S021UtcToClock(summer_anchor_utc))==S021_SESSION_OPEN_MINUTE,"clock.s021.anchor_summer");
    Check(ClockMinuteOfDay(S021UtcToClock(winter_utc))==S021_SESSION_OPEN_MINUTE,"clock.s021.anchor_winter");
+   Check(ClockMinuteOfDay(S021UtcToClock(summer_utc))!=S021_SESSION_OPEN_MINUTE,"clock.s021.anchor_not_fixed_est");
    Check(ClockParseHhMm("20:44")==20*60+44,"clock.parse.ok");
    Check(ClockParseHhMm("")==-1 && ClockParseHhMm("2:44")==-1 && ClockParseHhMm("24:00")==-1,"clock.parse.bad");
   }

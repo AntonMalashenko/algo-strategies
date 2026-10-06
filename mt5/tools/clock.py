@@ -27,13 +27,16 @@ RULE_FIXED = "FIXED"
 RULE_EET_US_DST = "EET_US_DST"  # UTC+2, UTC+3 while US DST (typical MT5 "NY close" server)
 RULE_EET_EU_DST = "EET_EU_DST"  # UTC+2, UTC+3 while EU DST (Europe/Athens-like)
 RULE_CET_EU_DST = "CET_EU_DST"  # UTC+1, UTC+2 while EU DST (Europe/Prague-like)
-RULES = (RULE_UTC, RULE_FIXED, RULE_EET_US_DST, RULE_EET_EU_DST, RULE_CET_EU_DST)
+RULE_EST_US_DST = "EST_US_DST"  # UTC-5, UTC-4 while US DST (America/New_York)
+RULES = (RULE_UTC, RULE_FIXED, RULE_EET_US_DST, RULE_EET_EU_DST, RULE_CET_EU_DST,
+         RULE_EST_US_DST)
 
 STANDARD_OFFSET_HOURS = {
     RULE_UTC: 0,
     RULE_EET_US_DST: 2,
     RULE_EET_EU_DST: 2,
     RULE_CET_EU_DST: 1,
+    RULE_EST_US_DST: -5,
 }
 
 
@@ -75,7 +78,7 @@ def standard_offset_seconds(rule: str, fixed_hours: int = 0) -> int:
 def offset_seconds_at_utc(rule: str, utc: datetime, fixed_hours: int = 0) -> int:
     """Offset (local - UTC) in seconds that `rule` has at the naive-UTC instant."""
     standard = standard_offset_seconds(rule, fixed_hours)
-    if rule == RULE_EET_US_DST:
+    if rule in (RULE_EET_US_DST, RULE_EST_US_DST):
         return standard + (SECONDS_PER_HOUR if is_us_dst(utc) else 0)
     if rule in (RULE_EET_EU_DST, RULE_CET_EU_DST):
         return standard + (SECONDS_PER_HOUR if is_eu_dst(utc) else 0)

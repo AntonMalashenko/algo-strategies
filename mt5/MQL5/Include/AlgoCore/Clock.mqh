@@ -7,9 +7,10 @@
 //| usually switches with DST (most prop/FX servers run UTC+2 / +3,  |
 //| switching together with the US so that server midnight is the NY |
 //| 17:00 rollover). Strategies in this repo define their sessions on |
-//| their own clocks (S021: a FIXED UTC-5 clock, no DST -- see        |
-//| strategies/orb_intraday/config.py), so all strategy decisions are |
-//| made on UTC-derived clocks, never on raw server time.            |
+//| their own clocks (S021: America/New_York exchange local time,     |
+//| TZ_EST_US_DST -- see strategies/orb_intraday/config.py), so all   |
+//| strategy decisions are made on UTC-derived clocks, never on raw   |
+//| server time.                                                      |
 //|                                                                  |
 //| The server's DST behaviour cannot be observed for PAST bars, and |
 //| TimeGMT() is meaningless inside the Strategy Tester (it returns  |
@@ -42,7 +43,8 @@ enum ENUM_TZ_RULE
    TZ_FIXED      = 1, // fixed offset (FixedHours parameter)
    TZ_EET_US_DST = 2, // UTC+2, UTC+3 while US DST (typical MT5 "NY close" server)
    TZ_EET_EU_DST = 3, // UTC+2, UTC+3 while EU DST (Europe/Athens-like)
-   TZ_CET_EU_DST = 4  // UTC+1, UTC+2 while EU DST (Europe/Prague-like, FTMO day reset)
+   TZ_CET_EU_DST = 4, // UTC+1, UTC+2 while EU DST (Europe/Prague-like, FTMO day reset)
+   TZ_EST_US_DST = 5  // UTC-5, UTC-4 while US DST (America/New_York exchange local time)
   };
 
 //--- calendar helpers ------------------------------------------------
@@ -128,6 +130,7 @@ int ClockStandardOffsetSeconds(const ENUM_TZ_RULE rule,const int fixed_hours)
       case TZ_EET_US_DST: return 2*CLOCK_SECONDS_PER_HOUR;
       case TZ_EET_EU_DST: return 2*CLOCK_SECONDS_PER_HOUR;
       case TZ_CET_EU_DST: return 1*CLOCK_SECONDS_PER_HOUR;
+      case TZ_EST_US_DST: return -5*CLOCK_SECONDS_PER_HOUR;
      }
    return 0;
   }
@@ -139,6 +142,7 @@ int ClockOffsetSecondsAtUtc(const ENUM_TZ_RULE rule,const int fixed_hours,const 
    switch(rule)
      {
       case TZ_EET_US_DST:
+      case TZ_EST_US_DST:
          return ClockIsUsDst(utc) ? standard+CLOCK_SECONDS_PER_HOUR : standard;
       case TZ_EET_EU_DST:
       case TZ_CET_EU_DST:

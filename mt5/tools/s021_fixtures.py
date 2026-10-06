@@ -45,6 +45,7 @@ PRICE_DECIMALS = 8
 # zoneinfo zones each rule must equal (tests/mt5/test_clock.py asserts the same)
 RULE_REFERENCE_ZONES = {
     clock.RULE_EET_US_DST: ("America/New_York", timedelta(hours=7)),
+    clock.RULE_EST_US_DST: ("America/New_York", timedelta(0)),
     clock.RULE_EET_EU_DST: ("Europe/Athens", timedelta(0)),
     clock.RULE_CET_EU_DST: ("Europe/Prague", timedelta(0)),
     clock.RULE_UTC: ("UTC", timedelta(0)),
@@ -86,32 +87,28 @@ def clock_cases() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def to_server_frame(m1_fixed_est: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """histdata bars (naive fixed-EST index) -> naive SERVER-time index."""
-    from strategies.orb_intraday import engine
-
-    est_offset_hours = int(ZoneInfo(engine.HISTDATA_FIXED_OFFSET)
-                           .utcoffset(datetime(2020, 1, 1)).total_seconds() // 3600)
-    utc_index = m1_fixed_est.index - pd.Timedelta(hours=est_offset_hours)
-    server = m1_fixed_est.copy()
+def to_server_frame(m1_ny: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """histdata bars (naive America/New_York index) -> naive SERVER-time index."""
+    utc_index = clock.index_local_to_utc(pd.DatetimeIndex(m1_ny.index), clock.RULE_EST_US_DST)
+    server = m1_ny.copy()
     server.index = clock.index_utc_to_local(utc_index, rule)
     return server
 
 
-def expected_levels(m1_fixed_est: pd.DataFrame, config) -> pd.DataFrame:
+def expected_levels(m1_ny: pd.DataFrame, config) -> pd.DataFrame:
     """Per strategy-clock day that has a session-open bar: engine validity and
     the live-style levels (bot/orb_signals.py::_levels_for_today semantics,
     computed with the engine's own functions on M1 bars)."""
     from strategies.orb_intraday.engine import compute_adr14, compute_daily_sessions
 
-    daily = compute_daily_sessions(m1_fixed_est, config)
-    dates = m1_fixed_est.index.normalize()
+    daily = compute_daily_sessions(m1_ny, config)
+    dates = m1_ny.index.normalize()
     rows = []
     for day in dates.unique():
         open_ts = pd.Timestamp.combine(day.date(), config.session_open)
-        if open_ts not in m1_fixed_est.index:
+        if open_ts not in m1_ny.index:
             continue
-        open_price = float(m1_fixed_est.loc[open_ts, "open"])
+        open_price = float(m1_ny.loc[open_ts, "open"])
         prior = daily.loc[daily.index < day]
         today_row = pd.DataFrame({"session_open": [open_price], "session_high": [math.nan],
                                   "session_low": [math.nan], "session_range": [math.nan],

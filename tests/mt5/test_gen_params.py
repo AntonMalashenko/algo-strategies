@@ -30,7 +30,7 @@ def test_s021_header_carries_orb_base_values():
     assert int(values["S021_ENTRY_CUTOFF_MINUTE"]) == 14 * 60 + 29
     assert int(values["S021_MIN_SESSION_BARS"]) == ORB_BASE.min_session_bars
     assert float(values["S021_MAX_GAP_DAYS_PER_SESSION"]) == ORB_BASE.max_gap_days_per_session
-    assert values["S021_CLOCK_UTC_OFFSET_HOURS"] == "(-5)"    # fixed EST, no DST
+    assert values["S021_CLOCK_TZ_RULE"] == "TZ_EST_US_DST"    # NY exchange local, DST-aware
     assert values["S021_MAGIC_PREFIX"] == '"S021"'
 
 

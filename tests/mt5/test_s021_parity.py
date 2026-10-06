@@ -11,7 +11,7 @@ import pytest
 from mt5.tools import clock, s021_fixtures, s021_parity
 from strategies.orb_intraday.config import ORB_BASE
 
-from .conftest import make_fixed_est_m1
+from .conftest import make_ny_m1
 
 RULE = clock.RULE_EET_US_DST
 
@@ -38,7 +38,9 @@ def _ea_days_from_python(m1: pd.DataFrame) -> pd.DataFrame:
         trade = trades.loc[day] if (not trades.empty and day in trades.index) else None
         entry_utc = ""
         if trade is not None:
-            entry_utc = (pd.Timestamp(trade["entry_time"]) + pd.Timedelta(hours=5)).isoformat()
+            entry_utc = clock.local_to_utc(
+                clock.RULE_EST_US_DST,
+                pd.Timestamp(trade["entry_time"]).to_pydatetime()).isoformat()
         rows.append(dict(
             day=day.date().isoformat(), status="traded" if trade is not None else "no_fill",
             open=level["open"], adr=level["adr"], upper=level["upper"], lower=level["lower"],
@@ -50,21 +52,31 @@ def _ea_days_from_python(m1: pd.DataFrame) -> pd.DataFrame:
 
 
 @pytest.fixture
-def broker_csv(tmp_path, fixed_est_m1):
+def broker_csv(tmp_path, ny_m1):
     path = tmp_path / "US100_M1_test.csv"
-    _export_csv(path, s021_fixtures.to_server_frame(fixed_est_m1, RULE))
+    _export_csv(path, s021_fixtures.to_server_frame(ny_m1, RULE))
     return path
 
 
-def test_server_time_round_trip_is_lossless(broker_csv, fixed_est_m1):
+def test_server_time_round_trip_is_lossless(broker_csv, ny_m1):
     loaded = s021_parity.load_broker_bars(broker_csv, RULE)
-    pd.testing.assert_frame_equal(loaded, fixed_est_m1, check_freq=False)
+    pd.testing.assert_frame_equal(loaded, ny_m1, check_freq=False)
 
 
-def test_server_frame_really_moves_with_us_dst(fixed_est_m1):
-    server = s021_fixtures.to_server_frame(fixed_est_m1, RULE)
-    shift = (server.index - fixed_est_m1.index).to_series().dt.total_seconds() / 3600
-    assert set(shift.round().unique()) == {7.0, 8.0}   # EST->UTC+2 / UTC+3
+def test_server_frame_is_a_constant_shift_from_the_ny_clock(ny_m1):
+    # Both clocks switch on the US DST dates (NY = UTC-5/-4, an EET_US_DST
+    # server = UTC+2/+3), so the gap between them is 7h year-round. That is a
+    # property of this broker rule, not of the strategy clock -- the DST move
+    # itself is asserted against UTC below.
+    server = s021_fixtures.to_server_frame(ny_m1, RULE)
+    shift = (server.index - ny_m1.index).to_series().dt.total_seconds() / 3600
+    assert set(shift.round().unique()) == {7.0}
+
+
+def test_ny_clock_really_moves_with_us_dst(ny_m1):
+    utc = clock.index_local_to_utc(pd.DatetimeIndex(ny_m1.index), clock.RULE_EST_US_DST)
+    shift = (utc - ny_m1.index).to_series().dt.total_seconds() / 3600
+    assert set(shift.round().unique()) == {4.0, 5.0}   # EDT -> UTC+4, EST -> UTC+5
 
 
 def test_parity_passes_on_engine_consistent_ea_output(broker_csv):
@@ -95,7 +107,7 @@ def test_parity_flags_an_unexplained_direction_mismatch(broker_csv):
 
 
 def test_expected_levels_need_adr_window_prior_sessions():
-    m1 = make_fixed_est_m1()
+    m1 = make_ny_m1()
     levels = s021_fixtures.expected_levels(m1, ORB_BASE)
     with_adr = levels.index[levels["adr"].notna()]
     assert levels["valid_session"].all()
@@ -107,7 +119,7 @@ def test_expected_levels_need_adr_window_prior_sessions():
 def test_write_fixtures_end_to_end(tmp_path):
     histdata = tmp_path / "histdata"
     histdata.mkdir()
-    m1 = make_fixed_est_m1()
+    m1 = make_ny_m1()
     raw = pd.DataFrame({
         "dt": m1.index.strftime("%Y%m%d %H%M%S"), "open": m1["open"], "high": m1["high"],
         "low": m1["low"], "close": m1["close"], "vol": 0})

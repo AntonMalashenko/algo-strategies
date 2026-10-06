@@ -97,19 +97,36 @@ step_tests() {
   (cd "$REPO" && "$py" -m pytest tests/mt5 -q -p no:cacheprovider) || fail "tests/mt5"
 }
 
+# True when target is missing, or when any source is newer than it.
+is_stale() {
+  local target="$1"; shift
+  [[ -f "$target" ]] || return 0
+  local src
+  for src in "$@"; do
+    [[ -f "$src" && "$src" -nt "$target" ]] && return 0
+  done
+  return 1
+}
+
 step_fixtures() {
   local py; py="$(python_bin)"
   local files="$MT5/MQL5/Files/AlgoTrading"
-  if [[ ! -f "$files/fixtures/s021_m1.csv" ]]; then
-    log "3/5 self-test fixtures missing -> generating"
+  # Expectations bake in the session clock and the strategy params, so a change to
+  # either must invalidate them. A stale fixture is worse than a missing one: it keeps
+  # asserting the previous behaviour and the self-test fails for no obvious reason.
+  local srcs=("$REPO/mt5/tools/s021_fixtures.py" "$REPO/mt5/tools/clock.py"
+              "$REPO/strategies/orb_intraday/config.py" "$REPO/strategies/orb_intraday/engine.py")
+  if is_stale "$files/fixtures/s021_m1.csv" "${srcs[@]}"; then
+    log "3/5 self-test fixtures missing or stale -> generating"
     (cd "$REPO" && "$py" -m mt5.tools.s021_fixtures) || fail "s021_fixtures"
   else
-    log "3/5 fixtures present"
+    log "3/5 fixtures up to date"
   fi
-  if [[ ! -f "$files/e2e/s021_m1.csv" ]]; then
-    log "    tester history missing -> generating (2025-01-02..2026-09-30)"
+  if is_stale "$files/e2e/s021_m1.csv" "${srcs[@]}"; then
+    log "    tester history missing or stale -> generating (2025-01-02..2026-09-30)"
     (cd "$REPO" && "$py" -m mt5.tools.s021_fixtures --start 2025-01-02 --end 2026-09-30 \
         --out "$files/e2e") || fail "e2e history"
+    log "    NOTE: re-run ImportM1CustomSymbol in MT5, the offline tester symbol is now stale"
   fi
 }
 

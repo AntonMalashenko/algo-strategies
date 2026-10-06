@@ -36,7 +36,7 @@ input int                     InpServerFixedHours   = 0;     // ... fixed offset
 input bool                    InpVerifyServerOffset = true;  // Live: block entries if the rule disagrees with the terminal
 
 input group "Exits"
-input int                     InpExitBufferMin      = 0;     // Time exit N minutes before 15:59 fixed-EST
+input int                     InpExitBufferMin      = 0;     // Time exit N minutes before 15:59 New York
 input string                  InpForceExitUtc       = "";    // Firm auto-close workaround, "HH:MM" UTC (empty = off)
 input ENUM_DOUBLE_FILL_POLICY InpDoubleFillPolicy   = DOUBLE_FILL_CLOSE_BOTH; // If both stops fill
 

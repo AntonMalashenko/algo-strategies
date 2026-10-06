@@ -35,6 +35,7 @@
 
 #define S021_LOG_ROOT                "AlgoTrading/logs"
 #define S021_DAYS_CSV_SUFFIX         "_days.csv"
+#define S021_DAYS_CSV_HEADER_KEY     "day"          // first column; also the header line's prefix
 #define S021_HEARTBEAT_FILE          "heartbeat.json"
 #define S021_HEARTBEAT_SECONDS       60
 #define S021_LEVELS_RETRY_SECONDS    10   // history not synced yet -> retry this often
@@ -172,18 +173,40 @@ private:
      {
       if(!m_cfg.write_days_csv || m_day.day==0 || StringLen(m_day.status)==0)
          return;
-      int flags=FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_SHARE_READ;
-      if(m_cfg.log_to_common)
-         flags|=FILE_COMMON;
+      int common=m_cfg.log_to_common ? FILE_COMMON : 0;
       string path=DaysCsvPath();
-      int handle=FileOpen(path,flags);
+      // One row per day, always the latest state: Deinit() flushes too, so a
+      // reattach/reinit cycle (OnDeinit+OnInit, reason 3 on every properties
+      // dialog) would otherwise append a duplicate row for the same date and
+      // break mt5/tools/s021_parity.py, which keys days by date. Rewrite the
+      // file without this day's earlier row instead of appending blindly.
+      string prefix=ClockIsoDate(m_day.day)+",";
+      string kept[];
+      int kept_count=0;
+      int handle=FileOpen(path,FILE_READ|FILE_TXT|FILE_ANSI|FILE_SHARE_READ|common);
+      if(handle!=INVALID_HANDLE)
+        {
+         while(!FileIsEnding(handle))
+           {
+            string line=FileReadString(handle);
+            if(StringLen(line)==0)
+               continue;
+            if(StringFind(line,prefix)==0 || StringFind(line,S021_DAYS_CSV_HEADER_KEY)==0)
+               continue;
+            ArrayResize(kept,kept_count+1);
+            kept[kept_count]=line;
+            kept_count++;
+           }
+         FileClose(handle);
+        }
+      handle=FileOpen(path,FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_SHARE_READ|common);
       if(handle==INVALID_HANDLE)
          return;
-      if(FileSize(handle)==0)
-         FileWriteString(handle,"day,status,open,adr,upper,lower,stop_distance,sessions,"
-                         "direction,entry_time_utc,entry_price,lots,exit_reason,"
-                         "exit_time_utc,exit_price,profit\n");
-      FileSeek(handle,0,SEEK_END);
+      FileWriteString(handle,S021_DAYS_CSV_HEADER_KEY+",status,open,adr,upper,lower,"
+                      "stop_distance,sessions,direction,entry_time_utc,entry_price,lots,"
+                      "exit_reason,exit_time_utc,exit_price,profit\n");
+      for(int i=0;i<kept_count;i++)
+         FileWriteString(handle,kept[i]+"\n");
       int digits=(int)SymbolInfoInteger(m_cfg.symbol,SYMBOL_DIGITS);
       string row=StringFormat("%s,%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%s,%s,%s,%s,%s\n",
                               ClockIsoDate(m_day.day),m_day.status,
@@ -201,7 +224,7 @@ private:
                               DoubleToString(m_day.profit,2));
       FileWriteString(handle,row);
       FileClose(handle);
-      m_days_csv_rows++;
+      m_days_csv_rows=kept_count+1;
      }
 
    void              SetStatus(const string status)

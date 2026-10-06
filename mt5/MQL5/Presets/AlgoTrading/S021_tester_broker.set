@@ -1,0 +1,29 @@
+; S021 ORB -- Strategy Tester run on a REAL broker symbol with real ticks (stage 2).
+; Example: ICMarketsSC-Demo USTEC, M1, model "every tick based on real ticks", deposit 10000 USD.
+; Unlike the offline custom symbol, this run pays the real spread and commission, so the
+; equity curve is expected to be worse than the S021_tester_offline baseline.
+;
+; Logging is OFF on purpose. The log folder is named S021-mt5-acct<login> with no tester marker
+; (S021_ORB.mq5), and ACCOUNT_LOGIN inside the tester returns the login of the attached account,
+; so a tester run would otherwise append synthetic rows to the live account's events/days files.
+;
+; Enum codes: ServerTzRule/DayResetRule 0=UTC 1=FIXED 2=EET_US_DST 3=EET_EU_DST 4=CET_EU_DST
+InpRiskPct=1.0
+InpDailyRiskCapPct=0.0
+InpMaxRealRiskWarnPct=0.0
+InpInitialBalance=0.0
+InpDailyGuardPct=0.0
+InpMaxGuardPct=0.0
+InpDayResetRule=2
+InpDayResetFixedHours=0
+InpServerTzRule=2
+InpServerFixedHours=0
+InpVerifyServerOffset=false
+InpExitBufferMin=0
+InpForceExitUtc=
+InpDoubleFillPolicy=0
+InpMagic=21021
+InpHistoryDays=45
+InpLogToCommon=false
+InpWriteDaysCsv=false
+InpTimerSeconds=60

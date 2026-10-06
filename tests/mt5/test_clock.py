@@ -51,8 +51,8 @@ def test_unknown_rule_is_rejected():
 
 
 @pytest.mark.parametrize("rule", [clock.RULE_EET_US_DST, clock.RULE_EET_EU_DST])
-def test_index_conversion_matches_scalar(rule, fixed_est_m1):
-    utc_index = fixed_est_m1.index + pd.Timedelta(hours=5)
+def test_index_conversion_matches_scalar(rule, ny_m1):
+    utc_index = ny_m1.index + pd.Timedelta(hours=5)
     local = clock.index_utc_to_local(utc_index, rule)
     back = clock.index_local_to_utc(local, rule)
     assert (back == utc_index).all()

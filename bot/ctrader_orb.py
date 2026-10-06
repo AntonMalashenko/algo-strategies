@@ -60,14 +60,17 @@ if HAVE_SDK:
         ProtoOAOrderStatus, ProtoOATimeInForce,
     )
 
-# histdata's/S021's frozen session anchor is a FIXED UTC-5 (EST, no DST)
-# clock reading -- see strategies/orb_intraday/engine.py's module docstring
-# for the full investigation. cTrader trendbars arrive as UTC minute stamps;
-# converting them to this fixed offset (never DST-adjusted, unlike
-# CTraderS007.get_m1's "Europe/Bucharest" conversion for GER40/S007) is what
-# lets bot/orb_config.STRATEGY.session_open == time(9, 30) mean exactly what
-# the backtest means by it. Matches engine.py's HISTDATA_FIXED_OFFSET.
-FIXED_EST_OFFSET = "Etc/GMT+5"
+# S021's frozen session anchor is the NY cash open on the exchange's own
+# DST-aware local clock -- see strategies/orb_intraday/engine.py's module
+# docstring for the measurements (ALGODEV-61) that corrected the earlier
+# "fixed UTC-5" reading. cTrader trendbars arrive as UTC minute stamps;
+# converting them to America/New_York (unlike CTraderS007.get_m1's
+# "Europe/Bucharest" conversion for GER40/S007) is what lets
+# bot/orb_config.STRATEGY.session_open == time(9, 30) mean exactly what the
+# backtest means by it. Converting to a FIXED UTC-5 offset instead, as this
+# module did before ALGODEV-61, entered one hour late for the whole US DST
+# season (measured cost: +0.0445 vs +0.0696 R/trade, 2019-2026).
+SESSION_TZ = "America/New_York"
 
 # Closing-deal lookback for the account-level loss guard (ALGODEV-55): must
 # cover everything since the prop firm's day boundary, which is < 24h ago by
@@ -87,7 +90,7 @@ class CTraderORB(CTraderS007):
     subclassing the S004-era CTraderAdapter.
     """
 
-    # ---------- M1/M15 on the fixed-EST clock (overrides CTraderS007's
+    # ---------- M1/M15 on the NY exchange clock (overrides CTraderS007's
     # Europe/Bucharest conversion -- see module docstring) ----------
 
     def _trendbars_req(self, symbol: str, days: int, period=None):
@@ -130,12 +133,12 @@ class CTraderORB(CTraderS007):
                              close=(lo + tb.deltaClose) / PRICE_SCALE))
         df = pd.DataFrame(rows)
         idx = (pd.to_datetime(df.pop("ts"), unit="s", utc=True)
-               .dt.tz_convert(FIXED_EST_OFFSET).dt.tz_localize(None))
+               .dt.tz_convert(SESSION_TZ).dt.tz_localize(None))
         df.index = idx
         return df.sort_index()
 
     def get_m1(self, symbol: str, days: int) -> pd.DataFrame:
-        """One-off M1 fetch (--check/--dry-run style use), fixed-EST clock."""
+        """One-off M1 fetch (--check/--dry-run style use), NY exchange clock."""
         def work(done):
             d = self._load_symbols()
 
@@ -156,11 +159,11 @@ class CTraderORB(CTraderS007):
 
     def get_m15(self, symbol: str, days: int) -> pd.DataFrame:
         """One-off M15 fetch (--check/--dry-run/diagnostic-script style use,
-        same as get_m1 but M15) -- same fixed-EST clock, see _get_m15_step.
+        same as get_m1 but M15) -- same NY exchange clock, see _get_m15_step.
 
         Overrides bot.ctrader.CTraderAdapter.get_m15, which returns raw
         points on a Europe/Bucharest clock for the S004-era bot; this
-        version returns prices (divided by PRICE_SCALE) on the fixed-EST
+        version returns prices (divided by PRICE_SCALE) on the NY exchange
         clock, same as this class's get_m1 override does for M1."""
         def work(done):
             d = self._load_symbols()
@@ -186,7 +189,7 @@ class CTraderORB(CTraderS007):
 
         Why M15 is an EXACT substitute for each day's session range, not an
         approximation: the session is
-        09:30-15:59 fixed-EST inclusive, i.e. 390 minutes = 26 whole M15
+        09:30-15:59 NY inclusive, i.e. 390 minutes = 26 whole M15
         bars, and 09:30 is itself a 15-minute boundary (570 min from
         midnight, 570/15 = 38), as is the 16:00 end. Every M15 bar in that
         window therefore aggregates exactly M1 bars that are themselves
@@ -194,7 +197,7 @@ class CTraderORB(CTraderS007):
         and max-of-highs / min-of-lows is invariant to that sub-bar
         aggregation -- so session_high/session_low/session_range (all ADR14
         reads) come out identical to the M1-derived values. D1 does not
-        work (the broker's daily-bar boundary is not the fixed-EST session)
+        work (the broker's daily-bar boundary is not the NY cash session)
         and neither does H1 (570/60 = 9.5, so 09:30 falls mid-bar and an H1
         bar would straddle the session open).
 

@@ -55,19 +55,20 @@ CATEGORY_ENTRY_MISMATCH = "FAIL_entry"
 FAIL_CATEGORIES = (CATEGORY_LEVEL_MISMATCH, CATEGORY_ENTRY_MISMATCH)
 
 
-def _fixed_offset_hours() -> int:
+def _session_clock_rule() -> str:
     from strategies.orb_intraday import engine
 
-    offset = ZoneInfo(engine.HISTDATA_FIXED_OFFSET).utcoffset(datetime(2020, 1, 1))
-    return int(offset.total_seconds() // 3600)
+    if engine.SESSION_TZ != "America/New_York":
+        raise ValueError(f"no tz rule mirrors engine.SESSION_TZ {engine.SESSION_TZ!r}")
+    return clock.RULE_EST_US_DST
 
 
 def load_broker_bars(path: Path, rule: str, fixed_hours: int = 0) -> pd.DataFrame:
-    """ExportM1 CSV (server time) -> engine-ready frame on the fixed-EST clock."""
+    """ExportM1 CSV (server time) -> engine-ready frame on the NY exchange clock."""
     raw = pd.read_csv(path)
     server_index = pd.DatetimeIndex(pd.to_datetime(raw["time_server"], format=SERVER_TIME_FORMAT))
     utc_index = clock.index_local_to_utc(server_index, rule, fixed_hours)
-    clock_index = utc_index + pd.Timedelta(hours=_fixed_offset_hours())
+    clock_index = clock.index_utc_to_local(utc_index, _session_clock_rule())
     frame = raw[["open", "high", "low", "close"]].astype(float)
     frame.index = clock_index
     frame.index.name = "dt"
@@ -113,7 +114,7 @@ def _near(actual: float, expected: float) -> bool:
 def compare(m1: pd.DataFrame, ea_days: pd.DataFrame, config) -> pd.DataFrame:
     levels = python_levels(m1, config)
     trades = engine_trades(m1, config)
-    offset = pd.Timedelta(hours=_fixed_offset_hours())
+    session_rule = _session_clock_rule()
     rows = []
     for _index, ea in ea_days.iterrows():
         day = pd.Timestamp(ea["day"])
@@ -141,7 +142,9 @@ def compare(m1: pd.DataFrame, ea_days: pd.DataFrame, config) -> pd.DataFrame:
         row.update(ea_direction=ea_direction, engine_direction=engine_direction)
         if ea_direction == engine_direction:
             if ea_direction:
-                ea_minute = (pd.Timestamp(ea["entry_time_utc"]) + offset).floor("min")
+                ea_entry_utc = pd.Timestamp(ea["entry_time_utc"]).to_pydatetime()
+                ea_minute = pd.Timestamp(
+                    clock.utc_to_local(session_rule, ea_entry_utc)).floor("min")
                 engine_minute = pd.Timestamp(engine_trade["entry_time"]).floor("min")
                 if ea_minute != engine_minute:
                     row.update(category=CATEGORY_ENTRY_MISMATCH,

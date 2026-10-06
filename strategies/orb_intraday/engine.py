@@ -4,36 +4,39 @@ No look-ahead: ADR14 and the data-gap guard use only sessions strictly before th
 current trading day; within a day, the entry scan and the stop check both walk
 forward bar by bar and never consult a bar later than the one being evaluated.
 
-Session-anchor investigation (2026-09-21, Cowork independent verification): the
-passport originally specified the session as "09:30-15:59 America/New_York, with
-DST" -- i.e. genuine DST-aware NY wall-clock time. An independent backtest built
-strictly to that literal spec (see load_nsxusd_m1_true_dst_local below) reproduces
-a real but materially weaker edge than the passport's claimed sec 4 numbers: 1712
-trades, +8.71 pt/trade, only 5/8 positive years, maxDD -2351.8 (claimed: 1518
-trades, +11.06 pt/trade, 8/8 positive years, maxDD -2659).
+Session-anchor investigation (2026-09-21, superseded -- see the correction below):
+the passport specified the session as "09:30-15:59 America/New_York, with DST".
+A backtest built on load_nsxusd_m1_true_dst_local below reproduced a materially
+weaker edge than the passport's sec 4 numbers (1712 trades, +8.71 pt/trade, 5/8
+positive years), and that was read as evidence that histdata's
+DAT_ASCII_NSXUSD_M1_*.csv is timestamped in a FIXED UTC-5 (EST) clock year-round,
+making the canonical loader's 09:30 a seasonal-conditional anchor (true NY open in
+winter, true NY 10:30 in summer) that was then adopted as the intended design.
 
-Root cause, confirmed by splitting both runs' trades on whether the NY calendar
-date falls under EST or EDT: histdata's DAT_ASCII_NSXUSD_M1_*.csv is timestamped
-in a FIXED UTC-5 (EST) clock year-round (matching the repo's own established
-convention for this index source -- scripts/convert_histdata_indices.py never
-applies DST). In EST months (~Nov-Mar) that fixed clock reading equals true NY
-local time, so both runs agree exactly (603 trades, +12.75 pt/trade, both). In EDT
-months (~Mar-Nov) it does not: true NY local = fixed-clock reading + 1h. Anchoring
-the opening range at fixed-clock "09:30" therefore anchors it at the TRUE local
-09:30 open in winter and at the TRUE local 10:30 (one hour into the session) in
-summer -- a seasonal-conditional anchor, not a DST bug. Anton confirmed (chat,
-2026-09-21) this seasonal switch is the intended design going forward, not an
-artifact to fix: use the fixed-EST-clock reading of 09:30 as the anchor year-round
-(equivalently: true NY open in EST months, true NY 10:30 in EDT months), rather
-than a uniformly DST-aware 09:30 anchor. This is also simpler to run live -- the
-bot never needs America/New_York DST-conversion logic, only the fixed-EST clock
-histdata (and cTrader, which reports in a fixed server-side offset) already gives.
-
-load_nsxusd_m1 (the canonical loader used by simulate()) therefore does NOT
-DST-convert -- this is deliberate, not an oversight; see the note above. The
-DST-aware loader is kept as load_nsxusd_m1_true_dst_local purely as the
-diagnostic/reference implementation used to find and confirm this, and for any
-future re-audit of the same question -- it is not used by the frozen strategy.
+CORRECTION (2026-10-05, ALGODEV-61): that reading was backwards. Two independent
+measurements show the histdata labels are TRUE America/New_York local time,
+DST-aware, not a fixed UTC-5 clock:
+  1. Broker cross-check. IC Markets USTEC M1 (774k bars, server rule EET_US_DST)
+     and histdata agree to ~1.5 index points in EST months but are offset by
+     exactly 60 minutes in EDT months, and the intraday volatility peak sits at
+     true 09:30 NY in the broker feed against 09:30 histdata-label time -- i.e.
+     the histdata label already tracks the DST switch.
+  2. Data-shape check, histdata alone. Re-stamping the labels onto a genuinely
+     fixed UTC-5 clock pushes the 09:30-15:59 window to 10:30-16:59 NY in summer,
+     where the last hour is past the cash close and the minute bars thin out (345
+     of 390), so every summer session fails min_session_bars. The dense region
+     ends at label 16:00 in BOTH seasons, which only holds for exchange-local
+     labelling.
+Consequence: load_nsxusd_m1 (the canonical loader, naive labels, no conversion)
+anchors at the TRUE NY cash open year-round -- so simulate() and every passport
+number have always been measured on the true-open anchor, and are unaffected by
+this correction. What the 2026-09-21 run actually compared was the true open
+against load_nsxusd_m1_true_dst_local, which adds another hour in summer and
+therefore anchors at 08:30 NY, in the pre-market -- that is why it was weaker.
+The live bots, however, inherited the wrong conclusion and anchored on a fixed
+UTC-5 clock, entering an hour late every summer; measured cost on ORB_BASE over
+2019-2026 is +0.0445 vs +0.0696 R/trade. Fixed in bot/ctrader_orb.py and in the
+MT5 EA (strategy clock = TZ_EST_US_DST), ALGODEV-61.
 """
 from __future__ import annotations
 

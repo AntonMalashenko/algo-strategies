@@ -34,6 +34,17 @@ SECONDS_PER_HOUR = 3600
 SOURCE_HASH_CHARS = 12
 OFFSET_PROBE_INSTANT = datetime(2020, 1, 1)             # any instant: the zone is fixed-offset
 
+# IANA zone of a strategy's session clock -> the ENUM_TZ_RULE member that
+# reproduces it in MQL5 (AlgoCore/Clock.mqh). Keep both sides in step; the
+# rules are cross-checked against zoneinfo by tests/mt5/test_clock.py.
+SESSION_CLOCK_RULES = {
+    "America/New_York": "TZ_EST_US_DST",
+}
+
+
+class _MqlIdentifier(str):
+    """Emitted verbatim (an enum member name), never as a quoted string literal."""
+
 
 @dataclass(frozen=True)
 class GeneratedHeader:
@@ -47,6 +58,8 @@ class GeneratedHeader:
 
 # ---------------------------------------------------------------- formatting
 def _mql_value(value) -> str:
+    if isinstance(value, _MqlIdentifier):
+        return str(value)
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -141,9 +154,9 @@ def render_s021(config=None) -> str:
 
     config = ORB_BASE if config is None else config
     _check_s021_base_only(config)
-    clock_offset = _fixed_offset_hours(engine.HISTDATA_FIXED_OFFSET)
+    clock_rule = SESSION_CLOCK_RULES[engine.SESSION_TZ]
     source = (f"strategies/orb_intraday/config.py::ORB_BASE "
-              f"sha={_source_hash(config, engine.HISTDATA_FIXED_OFFSET)}")
+              f"sha={_source_hash(config, engine.SESSION_TZ)}")
     body = [
         _define("S021_ADR_WINDOW", config.adr_window, "ORB_BASE.adr_window (sessions)"),
         _define("S021_K_RANGE", config.k_range, "ORB_BASE.k_range: U/L = O +/- k * ADR14"),
@@ -159,8 +172,8 @@ def render_s021(config=None) -> str:
                 "ORB_BASE.min_session_bars (M1 bars in session)"),
         _define("S021_MAX_GAP_DAYS_PER_SESSION", float(config.max_gap_days_per_session),
                 "ORB_BASE.max_gap_days_per_session (ADR gap guard)"),
-        _define("S021_CLOCK_UTC_OFFSET_HOURS", clock_offset,
-                f"engine.HISTDATA_FIXED_OFFSET {engine.HISTDATA_FIXED_OFFSET} (fixed, no DST)"),
+        _define("S021_CLOCK_TZ_RULE", _MqlIdentifier(clock_rule),
+                f"engine.SESSION_TZ {engine.SESSION_TZ} (DST-aware exchange local time)"),
         _define("S021_MAGIC_PREFIX", orb_config.MAGIC, "bot/orb_config.py MAGIC (labels)"),
         _define("S021_DEFAULT_RISK_PCT", float(orb_config.RISK_PCT),
                 "bot/orb_config.py RISK_PCT (EA input default)"),
@@ -168,7 +181,8 @@ def render_s021(config=None) -> str:
     ]
     return _wrap("Strategies/S021_ORB/Params.mqh",
                  ["S021 (ORB, Nasdaq 100) rule constants. Session minutes are on the",
-                  "strategy's FIXED UTC-5 clock (see strategies/orb_intraday/config.py)."],
+                  "strategy's America/New_York exchange clock, DST-aware (see",
+                  "strategies/orb_intraday/config.py and engine.py's module docstring)."],
                  body)
 
 

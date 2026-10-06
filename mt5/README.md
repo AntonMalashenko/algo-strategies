@@ -121,6 +121,8 @@ mt5/tools/deploy.sh
 #      InpCsvPath=AlgoTrading/e2e/s021_m1.csv (python -m mt5.tools.s021_fixtures
 #      --start 2025-06-01 --end 2025-12-31 --out mt5/MQL5/Files/AlgoTrading/e2e), then the
 #      tester on the custom symbol NSXUSD_HD, model "1 minute OHLC", InpTimerSeconds=60.
+#      After every re-import delete <terminal>/Tester/{bases,cache}: the tester replays its
+#      own snapshot of the symbol, not the symbol (log must show ticks ~= 4 x bars).
 #      The tester still needs the terminal to be logged in to some account.
 
 # 4. parity on the broker's own bars
