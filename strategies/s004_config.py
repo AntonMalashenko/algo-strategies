@@ -43,11 +43,29 @@ from datetime import time
 PIP_RAW = 10.0
 SPREAD_PIPS = 0.9               # real measured round-trip cost, used throughout S004 validation
 CORE_PAIRS = ("GBPJPY", "EURUSD", "USDCHF", "GBPUSD", "EURJPY", "USDJPY", "AUDUSD")
-ASIA_HOURS = tuple(range(0, 7))  # 00:00-06:59 server time, per passport S004 SS3
+ASIA_HOURS = tuple(range(0, 7))  # 00:00-06:59 session clock, per passport S004 SS3
+
+# The clock the M15 bar index -- and therefore every session hour above -- is
+# stamped in: EET/EEST, switching on the EUROPEAN DST dates (UTC+2 winter,
+# UTC+3 summer). This is NOT an assumption: backtest/run_s004_clock_probe.py
+# measures it from the data itself and shows the European morning sits at the
+# same clock hour on both sides of the EU transition (so the clock moves with
+# Europe) and on both sides of the US transition (so it does not move with the
+# US). It holds for both data vintages: ejtrader 2012-2022 is the broker's own
+# EET server time, and scripts/convert_histdata.py converts the 2022+ histdata
+# files from fixed EST into Europe/Bucharest on purpose. ALGODEV-61 cost a live
+# hour of drift per summer month by assuming a fixed offset -- a fixed offset is
+# a bug here, never a shortcut.
+SESSION_TZ = "Europe/Bucharest"
 
 # S004-intraday prop rules (ALGODEV-62) -- see the module docstring.
-INTRADAY_CUTOFF = time(22, 45)  # last M15 bar of the server day; it closes at 23:00
+INTRADAY_CUTOFF = time(22, 45)  # last M15 bar of the session day; it closes at 23:00
 MAX_TRADES_PER_DAY = 2          # portfolio-wide, all 7 pairs together
+
+# Live-trading identity, consumed by the MT5 EA through mt5/tools/gen_params.py
+# (the S021 equivalents live in bot/orb_config.py; S004 has no bot module).
+MAGIC = "S004"                  # position-label prefix
+RISK_PCT = 1.0                  # % of equity per trade (ALGODEV-62: 1% x 2 trades = -2% worst day)
 
 
 @dataclass(frozen=True)

@@ -39,6 +39,7 @@ OFFSET_PROBE_INSTANT = datetime(2020, 1, 1)             # any instant: the zone 
 # rules are cross-checked against zoneinfo by tests/mt5/test_clock.py.
 SESSION_CLOCK_RULES = {
     "America/New_York": "TZ_EST_US_DST",
+    "Europe/Bucharest": "TZ_EET_EU_DST",
 }
 
 
@@ -186,9 +187,107 @@ def render_s021(config=None) -> str:
                  body)
 
 
+# ---------------------------------------------------------------- S004
+# Fields of S004Config the S004 EA implements. The EA trades the ALGODEV-62
+# prop preset S004_INTRADAY, so that -- not the frozen base -- is the reference
+# every exported config is checked against.
+S004_EA_FIELDS = ("rr", "entry_hours", "pairs", "intraday_cutoff",
+                  "cost_inclusive_sizing", "max_trades_per_day")
+# Backtest-only fields: the EA reads the live symbol instead. `pip` is a data
+# artifact (ejtrader/histdata store MT points), and the live sizing cost is the
+# broker's real spread at entry, not S004's modelled 0.9-pip average.
+S004_BACKTEST_ONLY_FIELDS = ("pip", "spread_pips")
+# Entry-mode fields: the EA implements "base"/"zone" only and cannot express the
+# other engine modes, so they are checked rather than exported as numbers.
+S004_FIXED_MODE = {"mode": "base", "stop": "zone"}
+# The three ALGODEV-62 prop rules: off in S004_BASE, and the whole reason the EA
+# exists, so an export with any of them missing is refused.
+S004_PROP_RULE_FIELDS = ("intraday_cutoff", "cost_inclusive_sizing", "max_trades_per_day")
+
+
+def _check_s004_intraday(config) -> None:
+    from strategies.s004_config import S004_INTRADAY, S004Config
+
+    for field, expected in S004_FIXED_MODE.items():
+        if getattr(config, field) != expected:
+            raise ValueError(
+                f"the S004 EA implements {S004_FIXED_MODE} only, got {field}={getattr(config, field)!r}")
+    missing = [field for field in S004_PROP_RULE_FIELDS if not getattr(config, field)]
+    if missing:
+        raise ValueError(
+            "the S004 EA implements the S004_INTRADAY preset only, but the exported config has "
+            f"its prop rules off: {missing}. These are what keep the worst day at -2R; exporting "
+            "without them would trade overnight and uncapped. Export S004_INTRADAY.")
+    enabled = [field.name for field in dataclasses.fields(S004Config)
+               if field.name not in S004_EA_FIELDS + S004_BACKTEST_ONLY_FIELDS
+               + tuple(S004_FIXED_MODE)
+               and getattr(config, field.name) != getattr(S004_INTRADAY, field.name)]
+    if enabled:
+        raise ValueError(
+            "the S004 EA implements the S004_INTRADAY preset only, but the exported config "
+            f"differs in: {enabled}. Implement the modifier in the EA first (and add it to "
+            "S004_EA_FIELDS), or export S004_INTRADAY.")
+
+
+def _contiguous_hours(hours: tuple[int, ...]) -> tuple[int, int]:
+    """First/last hour of a contiguous session window (the EA stores a range)."""
+    ordered = sorted(hours)
+    if ordered != list(range(ordered[0], ordered[-1] + 1)):
+        raise ValueError(f"the S004 EA stores the session as a first/last hour range, but "
+                         f"entry_hours is not contiguous: {hours}")
+    return ordered[0], ordered[-1]
+
+
+def render_s004(config=None) -> str:
+    from strategies import fvg_mtf
+    from strategies.s004_config import MAGIC, RISK_PCT, SESSION_TZ, S004_INTRADAY
+
+    config = S004_INTRADAY if config is None else config
+    _check_s004_intraday(config)
+    first_hour, last_hour = _contiguous_hours(config.entry_hours)
+    clock_rule = SESSION_CLOCK_RULES[SESSION_TZ]
+    source = (f"strategies/s004_config.py::S004_INTRADAY "
+              f"sha={_source_hash(config, SESSION_TZ, fvg_mtf.BUFFER_PIPS, fvg_mtf.WINDOW_BARS)}")
+    body = [
+        _define("S004_RR", float(config.rr), "S004_INTRADAY.rr: TP distance = rr * risk"),
+        _define("S004_BUFFER_PIPS", float(fvg_mtf.BUFFER_PIPS),
+                "fvg_mtf.BUFFER_PIPS: stop sits this far beyond the zone's far edge"),
+        _define("S004_WINDOW_BARS", fvg_mtf.WINDOW_BARS,
+                "fvg_mtf.WINDOW_BARS: M15 bars a zone stays armed after its first touch"),
+        _define("S004_SESSION_FIRST_HOUR", first_hour,
+                f"S004_INTRADAY.entry_hours start (Asia {first_hour:02d}:00, session clock)"),
+        _define("S004_SESSION_LAST_HOUR", last_hour,
+                f"S004_INTRADAY.entry_hours end, inclusive ({last_hour:02d}:59)"),
+        _define("S004_INTRADAY_CUTOFF_MINUTE", _minute_of_day(config.intraday_cutoff),
+                f"prop rule 1: everything open is closed on the {config.intraday_cutoff:%H:%M} bar"),
+        _define("S004_COST_INCLUSIVE_SIZING", config.cost_inclusive_sizing,
+                "prop rule 2: size on (stop + spread), so a full stop is exactly -1R"),
+        _define("S004_MAX_TRADES_PER_DAY", config.max_trades_per_day,
+                "prop rule 3: entries per session day across ALL symbols, not per symbol"),
+        _define("S004_SYMBOL_COUNT", len(config.pairs), "S004_INTRADAY.pairs count"),
+        _define("S004_SYMBOLS", ",".join(config.pairs),
+                "S004_INTRADAY.pairs; entry order on ties is by symbol name, not this order"),
+        _define("S004_CLOCK_TZ_RULE", _MqlIdentifier(clock_rule),
+                f"s004_config.SESSION_TZ {SESSION_TZ} (measured, see run_s004_clock_probe.py)"),
+        _define("S004_MAGIC_PREFIX", MAGIC, "s004_config.MAGIC (labels)"),
+        _define("S004_DEFAULT_RISK_PCT", float(RISK_PCT),
+                "s004_config.RISK_PCT (EA input default)"),
+        _define("S004_PARAMS_SOURCE", source, "provenance, logged by the EA at init"),
+    ]
+    return _wrap("Strategies/S004_FVG/Params.mqh",
+                 ["S004-intraday (H4 FVG bounce, Asia session, FX) rule constants.",
+                  "Session hours and the cutoff are on the broker's EET/EEST clock,",
+                  "DST-aware on EUROPEAN dates -- measured from the M15 data by",
+                  "backtest/run_s004_clock_probe.py, never assumed to be a fixed offset.",
+                  "The daily cap is portfolio-wide: the EA counts entries across all",
+                  "S004_SYMBOLS together (see backtest/run_s004_intraday.py)."],
+                 body)
+
+
 HEADERS: tuple[GeneratedHeader, ...] = (
     GeneratedHeader("AlgoCore/GeneratedCore.mqh", render_core),
     GeneratedHeader("Strategies/S021_ORB/Params.mqh", render_s021),
+    GeneratedHeader("Strategies/S004_FVG/Params.mqh", render_s004),
 )
 
 
