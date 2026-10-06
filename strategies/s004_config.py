@@ -32,6 +32,24 @@ S004_INTRADAY  -- ALGODEV-62: the same frozen champion plus three prop rules,
                   Rules 1-2 are engine flags; rule 3 is portfolio-level and is
                   applied by backtest/run_s004_intraday.py, which is the only
                   place that sees all 7 pairs at once.
+
+The two position-sizing dials
+-----------------------------
+`max_trades_per_day` and `risk_pct` are deliberately kept separate and both are
+EA inputs (mt5/tools/gen_params.py exports them as the MT5 defaults), because
+they are what the account's survival is actually made of: with rule 2 the
+planned worst day is exactly `max_trades_per_day * risk_pct` percent, and the
+firm kills the account at -5% in a day. `DAILY_RISK_BUDGET_PCT` is the share of
+that limit S004 may spend (the rest belongs to S021's Nasdaq leg), and the
+product is checked against it here rather than in the EA, so an impossible pair
+cannot even be exported.
+
+backtest/run_s004_risk_grid.py measures the trade-off across the grid. The edge
+of the budget is a cliff, not a slope: at cap 2 the expected number of blown
+challenges in 3 years goes 3.0 (0.50%) -> 7.1 (1.00%) -> 32.8 (1.50%), because
+1.50% is where `cap * risk + S021` first crosses -5% in a single day. The
+default pair stays 2 x 1.00% (maintainer's call, 2026-10-07): it is the
+validated preset, and it sits one step inside that cliff.
 """
 from __future__ import annotations
 
@@ -66,6 +84,10 @@ MAX_TRADES_PER_DAY = 2          # portfolio-wide, all 7 pairs together
 # (the S021 equivalents live in bot/orb_config.py; S004 has no bot module).
 MAGIC = "S004"                  # position-label prefix
 RISK_PCT = 1.0                  # % of equity per trade (ALGODEV-62: 1% x 2 trades = -2% worst day)
+# The share of the firm's -5% daily limit S004 may plan to lose; the remaining
+# 3% is S021's 2% Nasdaq leg plus headroom for slippage on both. Any
+# (max_trades_per_day, risk_pct) pair whose product exceeds this is refused.
+DAILY_RISK_BUDGET_PCT = 2.0
 
 
 @dataclass(frozen=True)
@@ -83,6 +105,32 @@ class S004Config:
     intraday_cutoff: time | None = None         # engine flag, rule 1
     cost_inclusive_sizing: bool = False         # engine flag, rule 2
     max_trades_per_day: int | None = None       # portfolio-level, rule 3
+
+    # --- live sizing (ignored by the backtest engine, exported to the EA) ---
+    risk_pct: float = RISK_PCT                  # % of equity per trade
+
+    def __post_init__(self) -> None:
+        # Uncapped (S004_BASE) there is no planned worst day to check: that
+        # preset is backtest-only and gen_params.py refuses to export it.
+        if self.max_trades_per_day is None:
+            return
+        if self.worst_planned_day_pct() > DAILY_RISK_BUDGET_PCT:
+            raise ValueError(
+                f"max_trades_per_day={self.max_trades_per_day} x risk_pct={self.risk_pct}% plans "
+                f"a {self.worst_planned_day_pct():.2f}% worst day, over S004's "
+                f"{DAILY_RISK_BUDGET_PCT:.2f}% share of the firm's -5% daily limit. Lower one of "
+                "the two dials, or raise DAILY_RISK_BUDGET_PCT only together with S021's leg.")
+
+    def worst_planned_day_pct(self) -> float:
+        """The worst day the prop rules allow, in % of equity.
+
+        Exact, not an estimate: rule 2 (cost_inclusive_sizing) makes a full stop
+        cost exactly -1R, so `max_trades_per_day` stops cost exactly that many
+        times `risk_pct`. Uncapped (`S004_BASE`) there is no such bound.
+        """
+        if self.max_trades_per_day is None:
+            return float("inf")
+        return self.max_trades_per_day * self.risk_pct
 
     def engine_kwargs(self) -> dict:
         """Keyword arguments for strategies.fvg_mtf.run_backtest."""

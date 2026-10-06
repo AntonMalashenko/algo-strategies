@@ -6,6 +6,9 @@
 // mt5/tools/s004_clock_probe.py, never assumed to be a fixed offset.
 // The daily cap is portfolio-wide: the EA counts entries across all
 // S004_SYMBOLS together (see backtest/run_s004_intraday.py).
+// The two S004_DEFAULT_* values are only the defaults of the EA's
+// inputs -- the cap and the risk are meant to be tuned live -- but
+// their product must stay within S004_DAILY_RISK_BUDGET_PCT.
 #ifndef STRATEGIES_S004_FVG_PARAMS_MQH
 #define STRATEGIES_S004_FVG_PARAMS_MQH
 
@@ -16,12 +19,13 @@
 #define S004_SESSION_LAST_HOUR               6            // S004_INTRADAY.entry_hours end, inclusive (06:59)
 #define S004_INTRADAY_CUTOFF_MINUTE          1365         // prop rule 1: everything open is closed on the 22:45 bar
 #define S004_COST_INCLUSIVE_SIZING           true         // prop rule 2: size on (stop + spread), so a full stop is exactly -1R
-#define S004_MAX_TRADES_PER_DAY              2            // prop rule 3: entries per session day across ALL symbols, not per symbol
+#define S004_DEFAULT_MAX_TRADES_PER_DAY      2            // prop rule 3 (EA input default): entries per session day across ALL symbols, not per symbol
 #define S004_SYMBOL_COUNT                    7            // S004_INTRADAY.pairs count
 #define S004_SYMBOLS                         "GBPJPY,EURUSD,USDCHF,GBPUSD,EURJPY,USDJPY,AUDUSD" // S004_INTRADAY.pairs; entry order on ties is by symbol name, not this order
 #define S004_CLOCK_TZ_RULE                   TZ_EET_EU_DST // s004_config.SESSION_TZ Europe/Bucharest (measured, see mt5/tools/s004_clock_probe.py)
 #define S004_MAGIC_PREFIX                    "S004"       // s004_config.MAGIC (labels)
-#define S004_DEFAULT_RISK_PCT                1.0          // s004_config.RISK_PCT (EA input default)
-#define S004_PARAMS_SOURCE                   "strategies/s004_config.py::S004_INTRADAY sha=8024c6e97f50" // provenance, logged by the EA at init
+#define S004_DEFAULT_RISK_PCT                1.0          // S004_INTRADAY.risk_pct (EA input default)
+#define S004_DAILY_RISK_BUDGET_PCT           2.0          // s004_config.DAILY_RISK_BUDGET_PCT: the EA refuses inputs whose cap x risk plans a worse day than this
+#define S004_PARAMS_SOURCE                   "strategies/s004_config.py::S004_INTRADAY sha=84ac4f2cb71a" // provenance, logged by the EA at init
 
 #endif // STRATEGIES_S004_FVG_PARAMS_MQH

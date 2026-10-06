@@ -11,7 +11,8 @@ import pytest
 from mt5.tools import clock, gen_params
 from strategies import fvg_mtf
 from strategies.orb_intraday.config import ORB_BASE
-from strategies.s004_config import SESSION_TZ, S004_BASE, S004_INTRADAY
+from strategies.s004_config import (DAILY_RISK_BUDGET_PCT, SESSION_TZ, S004_BASE,
+                                    S004_INTRADAY)
 
 
 def _defines(text: str) -> dict[str, str]:
@@ -68,7 +69,7 @@ def test_s004_header_carries_the_intraday_preset():
     assert int(values["S004_SESSION_LAST_HOUR"]) == max(S004_INTRADAY.entry_hours)
     assert int(values["S004_INTRADAY_CUTOFF_MINUTE"]) == 22 * 60 + 45
     assert values["S004_COST_INCLUSIVE_SIZING"] == "true"
-    assert int(values["S004_MAX_TRADES_PER_DAY"]) == S004_INTRADAY.max_trades_per_day
+    assert int(values["S004_DEFAULT_MAX_TRADES_PER_DAY"]) == S004_INTRADAY.max_trades_per_day
     assert int(values["S004_SYMBOL_COUNT"]) == len(S004_INTRADAY.pairs)
     assert values["S004_SYMBOLS"] == '"' + ",".join(S004_INTRADAY.pairs) + '"'
     assert float(values["S004_BUFFER_PIPS"]) == fvg_mtf.BUFFER_PIPS
@@ -119,3 +120,26 @@ def test_core_header_mirrors_bot_constants():
     assert float(values["ALGO_PCT"]) == account_guard.PCT
     assert values["ALGO_REASON_DAILY"] == f'"{account_guard.REASON_DAILY}"'
     assert values["ALGO_REASON_MAX"] == f'"{account_guard.REASON_MAX}"'
+
+
+def _source_sha(rendered: str) -> str:
+    [sha] = re.findall(r"S004_PARAMS_SOURCE.*sha=([0-9a-f]+)", rendered)
+    return sha
+
+
+def test_s004_exports_both_sizing_dials_as_ea_input_defaults():
+    values = _defines(gen_params.render_s004())
+    assert float(values["S004_DEFAULT_RISK_PCT"]) == S004_INTRADAY.risk_pct
+    assert float(values["S004_DAILY_RISK_BUDGET_PCT"]) == DAILY_RISK_BUDGET_PCT
+    # the defaults themselves must sit inside the budget they are checked against
+    assert S004_INTRADAY.worst_planned_day_pct() <= DAILY_RISK_BUDGET_PCT
+
+
+def test_s004_export_follows_a_retuned_risk():
+    retuned = S004_INTRADAY.with_(max_trades_per_day=1, risk_pct=2.0)
+    values = _defines(gen_params.render_s004(retuned))
+    assert int(values["S004_DEFAULT_MAX_TRADES_PER_DAY"]) == 1
+    assert float(values["S004_DEFAULT_RISK_PCT"]) == 2.0
+    # a retune must not pass silently: the provenance hash moves with it
+    # (_defines keeps only the first token of a value, so compare the headers)
+    assert _source_sha(gen_params.render_s004(retuned)) != _source_sha(gen_params.render_s004())

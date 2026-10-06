@@ -148,3 +148,17 @@ def test_cutoff_exit_does_not_look_ahead():
     with_future = run_backtest(long, **kwargs)
     first = with_future[with_future["time_in"] < pd.Timestamp("2024-03-05")]
     pd.testing.assert_frame_equal(first_day_only, first.reset_index(drop=True))
+
+
+def test_the_two_sizing_dials_are_bounded_by_the_daily_risk_budget():
+    # The EA exposes both dials, so the pair has to be checkable here: rule 2
+    # makes a full stop exactly -1R, which is what turns cap x risk into an
+    # exact worst day rather than an estimate.
+    assert S004_INTRADAY.worst_planned_day_pct() == pytest.approx(2.0)
+    assert S004_BASE.worst_planned_day_pct() == float("inf")  # uncapped, backtest-only
+    assert S004_INTRADAY.with_(max_trades_per_day=1, risk_pct=2.0).worst_planned_day_pct() == 2.0
+    assert S004_INTRADAY.with_(max_trades_per_day=4, risk_pct=0.5).worst_planned_day_pct() == 2.0
+    with pytest.raises(ValueError, match="worst day"):
+        S004_INTRADAY.with_(risk_pct=1.5)        # 2 x 1.5% = -3%, over S004's share
+    with pytest.raises(ValueError, match="worst day"):
+        S004_INTRADAY.with_(max_trades_per_day=3)  # 3 x 1% = -3%, same breach

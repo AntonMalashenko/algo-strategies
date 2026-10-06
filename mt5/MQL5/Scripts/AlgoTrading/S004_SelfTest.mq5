@@ -222,7 +222,7 @@ void TestGeneratedParams()
   {
    Check(S004_SESSION_FIRST_HOUR==0 && S004_SESSION_LAST_HOUR==6,"params.session_hours");
    Check(S004_INTRADAY_CUTOFF_MINUTE==22*60+45,"params.cutoff_minute");
-   Check(S004_MAX_TRADES_PER_DAY==2,"params.daily_cap");
+   Check(S004_DEFAULT_MAX_TRADES_PER_DAY==2,"params.daily_cap");
    Check(S004_COST_INCLUSIVE_SIZING,"params.cost_inclusive_sizing");
    Check(S004_SYMBOL_COUNT==7,"params.symbol_count");
    Check(S004_CLOCK_TZ_RULE==TZ_EET_EU_DST,"params.clock_rule_is_european");
