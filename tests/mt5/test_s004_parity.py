@@ -149,10 +149,16 @@ def test_a_trade_the_engine_never_took_fails(engine, ea):
 
 
 def test_a_cap_the_ea_got_wrong_fails(engine, ea):
-    """The one error a shadow run exists to catch: a trade taken past the cap."""
+    """The one error a shadow run exists to catch: a trade taken past the cap.
+
+    Unbalanced, so it is not the excused `cap_tie` swap: the EA spent a slot
+    without giving one back.
+    """
     over_cap = ea.index[ea["status"] == s004_parity.STATUS_VIRTUAL_CAP][0]
     ea.loc[over_cap, "status"] = s004_parity.STATUS_TAKEN
-    assert _categories(engine, ea)[s004_parity.CATEGORY_FAIL_STATUS] == 1
+    categories = _categories(engine, ea)
+    assert categories[s004_parity.CATEGORY_FAIL_STATUS] == 1
+    assert s004_parity.CATEGORY_CAP_TIE not in categories
 
 
 def test_an_out_of_session_trade_the_ea_took_fails(engine, ea):
@@ -168,6 +174,29 @@ def test_live_only_outcomes_are_classified_not_failed(engine, ea):
     categories = _categories(engine, ea)
     assert categories[s004_parity.CATEGORY_MISSED_FILL] == 1
     assert categories[s004_parity.CATEGORY_HALTED] == 1
+    assert not set(categories) & set(s004_parity.FAIL_CATEGORIES)
+
+
+def _swap_a_cap_slot(engine: pd.DataFrame, ea: pd.DataFrame) -> pd.Timestamp:
+    """Give a day's slot to the pair the backtest's name order did not pick."""
+    day = engine["time_in"].dt.normalize()
+    for date in day.unique():
+        same_day = engine[day == date]
+        taken = same_day.index[same_day["expected_status"] == s004_parity.STATUS_TAKEN]
+        capped = same_day.index[same_day["expected_status"] == s004_parity.STATUS_VIRTUAL_CAP]
+        if not len(taken) or not len(capped):
+            continue
+        ea.loc[taken[-1], "status"] = s004_parity.STATUS_VIRTUAL_CAP
+        ea.loc[capped[0], "status"] = s004_parity.STATUS_TAKEN
+        return date
+    raise AssertionError("the fixture has no day with both a taken and a capped trade")
+
+
+def test_a_swapped_cap_slot_is_a_cap_tie_not_a_failure(engine, ea):
+    """Live, the slot goes to whoever's M15 bar closed first, not to the first name."""
+    _swap_a_cap_slot(engine, ea)
+    categories = _categories(engine, ea)
+    assert categories[s004_parity.CATEGORY_CAP_TIE] == 2
     assert not set(categories) & set(s004_parity.FAIL_CATEGORIES)
 
 

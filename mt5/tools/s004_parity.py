@@ -31,11 +31,17 @@ Every trade is matched on (symbol, entry time) and checked on two levels:
            FAILURE (that is what Engine.mqh is).
   status   whether the live layer TOOK the trade: the Asia-window filter and the
            portfolio-wide daily cap of backtest/run_s004_intraday.py, which the
-           EA has to reproduce online, in symbol-name order on ties. Known,
-           explained live-only outcomes are classified, not failed:
+           EA has to reproduce online. Known, explained live-only outcomes are
+           classified, not failed:
              ea_missed_fill   the engine's price was touched but no position
                               came back (a restart mid-bar, or a reject)
              ea_halted        the account guard had already stopped trading
+             cap_tie          the day's last slot went to a different pair. The
+                              backtest ties by symbol name because it sorts
+                              ["time_in", "symbol"]; the EA reacts to each
+                              symbol's own closed bar, so a pair whose M15 bar
+                              lands a poll later loses the slot. Only a balanced
+                              swap inside one day qualifies.
            anything else is a FAILURE.
 
 A shadow pass (InpTradeEnabled=false) is the intended input: the EA then still
@@ -76,6 +82,7 @@ STATUSES_COUNTED = (STATUS_TAKEN, STATUS_SHADOW)
 CATEGORY_MATCH = "match"
 CATEGORY_MISSED_FILL = "ea_missed_fill"
 CATEGORY_HALTED = "ea_halted"
+CATEGORY_CAP_TIE = "cap_tie"                # the day's last slot went to another pair
 CATEGORY_FAIL_MISSING = "FAIL_missing"      # the engine traded, the EA did not report it
 CATEGORY_FAIL_EXTRA = "FAIL_extra"          # the EA reported a trade the engine never took
 CATEGORY_FAIL_FIELDS = "FAIL_fields"
@@ -237,6 +244,41 @@ def _status_category(ea_status: str, expected_status: str) -> str:
     return CATEGORY_MATCH if ea_status == expected_status else CATEGORY_FAIL_STATUS
 
 
+def _reclassify_cap_ties(report: pd.DataFrame) -> pd.DataFrame:
+    """Turn a balanced swap of a day's cap slots into `cap_tie`.
+
+    The backtest breaks a tie by symbol name, because it sorts
+    ["time_in", "symbol"]; the live layer cannot, because it reacts to each
+    symbol's own closed bar and a pair whose M15 bar lands a poll later has
+    already lost the slot. The decisions are identical -- only who got the
+    slot differs -- so this is a live-only outcome, not a port defect.
+
+    Only a *balanced* day qualifies: as many trades demoted to `virtual_cap`
+    as promoted out of it. An unbalanced day means the EA spent a different
+    number of slots than the cap allows, which is a real failure and stays
+    FAIL_status.
+    """
+    if report.empty:
+        return report
+    is_status_fail = report["category"] == CATEGORY_FAIL_STATUS
+    lost = is_status_fail & report["expected_status"].isin(STATUSES_COUNTED) \
+        & (report["ea_status"] == STATUS_VIRTUAL_CAP)
+    won = is_status_fail & (report["expected_status"] == STATUS_VIRTUAL_CAP) \
+        & report["ea_status"].isin(STATUSES_COUNTED)
+    day = report["time_in"].dt.normalize()
+    for date in day[lost | won].unique():
+        same_day = day == date
+        lost_today, won_today = report.index[lost & same_day], report.index[won & same_day]
+        if len(lost_today) != len(won_today) or not len(lost_today):
+            continue
+        report.loc[lost_today.union(won_today), "category"] = CATEGORY_CAP_TIE
+        partners = ", ".join(sorted(report.loc[won_today, "symbol"]))
+        report.loc[lost_today, "detail"] = f"the day's slot went to {partners} instead"
+        report.loc[won_today, "detail"] = \
+            f"took the slot the backtest gave to {', '.join(sorted(report.loc[lost_today, 'symbol']))}"
+    return report
+
+
 def compare(engine: pd.DataFrame, ea: pd.DataFrame, since: pd.Timestamp | None,
             until: pd.Timestamp | None) -> pd.DataFrame:
     """One row per trade either side reported inside the compared window."""
@@ -286,8 +328,10 @@ def compare(engine: pd.DataFrame, ea: pd.DataFrame, since: pd.Timestamp | None,
                          ea_status=ea_row["status"], category=CATEGORY_FAIL_EXTRA,
                          detail="the EA reported a trade the engine never took"))
     report = pd.DataFrame(rows)
-    return report.sort_values(["time_in", "symbol"]).reset_index(drop=True) \
-        if not report.empty else report
+    if report.empty:
+        return report
+    report = report.sort_values(["time_in", "symbol"]).reset_index(drop=True)
+    return _reclassify_cap_ties(report)
 
 
 def slippage(ea: pd.DataFrame) -> dict:

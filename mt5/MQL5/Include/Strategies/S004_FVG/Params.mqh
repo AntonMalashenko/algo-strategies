@@ -21,7 +21,7 @@
 #define S004_COST_INCLUSIVE_SIZING           true         // prop rule 2: size on (stop + spread), so a full stop is exactly -1R
 #define S004_DEFAULT_MAX_TRADES_PER_DAY      2            // prop rule 3 (EA input default): entries per session day across ALL symbols, not per symbol
 #define S004_SYMBOL_COUNT                    7            // S004_INTRADAY.pairs count
-#define S004_SYMBOLS                         "GBPJPY,EURUSD,USDCHF,GBPUSD,EURJPY,USDJPY,AUDUSD" // S004_INTRADAY.pairs; entry order on ties is by symbol name, not this order
+#define S004_SYMBOLS                         "GBPJPY,EURUSD,USDCHF,GBPUSD,EURJPY,USDJPY,AUDUSD" // S004_INTRADAY.pairs; ties are ordered by symbol name, not by this order
 #define S004_CLOCK_TZ_RULE                   TZ_EET_EU_DST // s004_config.SESSION_TZ Europe/Bucharest (measured, see mt5/tools/s004_clock_probe.py)
 #define S004_MAGIC_PREFIX                    "S004"       // s004_config.MAGIC (labels)
 #define S004_DEFAULT_RISK_PCT                1.0          // S004_INTRADAY.risk_pct (EA input default)

@@ -630,6 +630,7 @@ public:
    // Symbols come from Params.mqh (S004_SYMBOLS) and are sorted, because ties
    // on the same bar are resolved by symbol name in the backtest
    // (sort_values(["time_in", "symbol"])) and the daily cap depends on it.
+   // Live this only orders the symbols that share one poll pass; see Poll().
    bool              Init(const S004Settings &settings)
      {
       m_cfg=settings;
@@ -783,7 +784,10 @@ public:
         {
          // all symbols for the same bar, in name order: that is the backtest's
          // tie-break (sort_values(["time_in", "symbol"])) and it decides which
-         // symbol gets the last slot of the daily cap
+         // symbol gets the last slot of the daily cap. The order only holds
+         // among the symbols whose bar has already closed by this pass -- a
+         // pair whose M15 bar arrives a poll later has lost the slot already.
+         // Deliberate: see mt5/README.md, the `cap_tie` outcome.
          for(int i=0; i<m_count; i++)
             if(NextBarFor(i)==bar_time)
                FeedBar(i,bar_time,cycle);

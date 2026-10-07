@@ -203,8 +203,8 @@ bash mt5/tools/run_selftest.sh          # expect 12132 passed, 0 failed, 1102 tr
 ### Shadow pass + parity (phase D)
 
 The self-test proves `Engine.mqh`; the shadow pass proves the live layer around
-it — the Asia-window filter, the portfolio-wide daily cap and its symbol-name
-tie-break — without sending a single order.
+it — the Asia-window filter and the portfolio-wide daily cap — without sending
+a single order.
 
 1. **Tester.** Strategy Tester → `Experts/AlgoTrading/S004_FVG`, any of the seven
    symbols as the chart symbol, M15, model "1 minute OHLC" (the EA only ever
@@ -214,21 +214,44 @@ tie-break — without sending a single order.
    Set `InpServerTzRule` to the **broker's** rule, not the strategy's — S004
    decides on its own EET/EEST-with-European-DST clock and `Runtime.mqh`
    converts. The pass rewrites `<strategy>_trades.csv` from scratch.
-2. **Bars.** Run `Scripts/AlgoTrading/ExportM1` once per pair (`InpSymbol`), over
-   at least the tested window.
-3. **Diff.**
+2. **Bars.** Run `Scripts/AlgoTrading/ExportM1` once, with every pair in
+   `InpSymbol` as a comma-separated list, over at least the tested window.
+3. **Diff.** Pass the tester's "from" date as `--ea-start` so the Python engine
+   starts from the same bar the EA's warmup did — otherwise it builds zones out
+   of history the EA never saw and reports trades it could not have taken.
 
 ```bash
 .venv/bin/python -m mt5.tools.s004_parity \
   --bars "<Common>/Files/AlgoTrading/exports" \
   --ea-trades "<Common>/Files/AlgoTrading/logs/S004-mt5-acct<login>/S004-mt5-acct<login>_trades.csv" \
-  --rule EET_US_DST --out reports/s004_mt5_parity.csv
+  --rule EET_US_DST --ea-start "2025.07.09 00:00" --warmup-bars 1000 \
+  --out reports/s004_mt5_parity.csv
 ```
 
 Exit code 0 means every trade matched on price, exit and R *and* on whether the
-live layer would have taken it. `ea_missed_fill` and `ea_halted` are reported
-but not failed — they are live-only outcomes the backtest cannot have. Anything
-`FAIL_*` is a real divergence.
+live layer would have taken it. Three categories are reported but not failed —
+they are live-only outcomes the backtest cannot have:
+
+| category | what it is |
+| --- | --- |
+| `ea_missed_fill` | the engine's price was touched but no position came back |
+| `ea_halted` | the account guard had already stopped trading |
+| `cap_tie` | the day's last cap slot went to a different pair |
+
+Anything `FAIL_*` is a real divergence.
+
+**About `cap_tie`.** The backtest resolves a tie by symbol name, because it
+sorts `["time_in", "symbol"]`. The EA cannot: it reacts to each symbol's own
+closed M15 bar, and a pair whose bar lands one poll later has already lost the
+slot. `Poll()` does order the symbols it has by name, so the tie-break holds
+*within* a pass, not across passes. This is accepted, not fixed: waiting for
+every pair before acting would delay entries into the next bar and cost real
+fills, to match an ordering that is an artefact of the backtest's sort rather
+than a rule of the strategy. The first shadow pass (FundingPips-SIM1,
+2025.07.09–2026.10.04, 2218 trades) had 36 such rows over 18 days — the EA took
+−1.71R where the backtest took +12.73R, a sign that is luck, not bias. The
+harness only accepts a *balanced* swap inside one day; an unbalanced one means
+the EA spent the wrong number of slots and still fails.
 
 ### Live checklist (S004, prop account)
 
