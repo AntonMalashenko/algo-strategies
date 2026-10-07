@@ -301,6 +301,22 @@ class StrategyConfig:
 
     # --- pre-entry day filters (raise net profitability / cut drawdown) ---
     max_height: float | None = None  # skip day if Frankfurt height > this (points)
+    # Points vs bps-of-price cap -- TESTED 2026-10-05, NOT ADOPTED (inconclusive).
+    # A point cap drifts with the index level: 100pt was ~63bps of price in 2023
+    # and ~40bps in 2026, so it skipped 0/10/41/29 days in 2023/24/25/26.
+    # Scale-invariant alternative tested by post-filtering engine output on
+    # height/mid (exactly equivalent: no cross-day state), live preset
+    # WORKING_S007_NEWSSAFE_MAX8_BE05_OFF2, fixed engine, Gate-2 bps costs,
+    # Dukascopy 2023-06-26..2026-08-11 (backtest/run_s007_height_bps.py):
+    #   no cap        total  +32.7R  maxDD -103.6R  yrs -24.6/-48.0/+57.4/+47.9
+    #   100pt (live)  total  +54.3R  maxDD  -71.1R  yrs -24.6/-34.6/+85.4/+28.1
+    #   48.6bps (=100pt at sample-mean price, no tuning)
+    #                 total  +62.4R  maxDD  -80.0R  yrs -18.6/-43.5/+79.4/+45.0
+    # The two caps disagree on only 32 days; the +8.0R difference has a
+    # bootstrap P(diff<=0)=0.33 (SE ~19R) -- noise. Both threshold grids are
+    # jagged, not a plateau (pts<=90 +1.2R vs pts<=100 +54.3R; bps<=35 -22.6R
+    # vs bps<=55 +86.3R): the result hinges on a handful of 8-position days.
+    # bps is the more principled unit, but nothing here justifies switching.
     # TESTED 2026-07-22 and REJECTED as a day-quality filter: sweeping
     # min_height in {5..40} on BASELINE_S007/WORKING_S007 (net, real spread,
     # Dukascopy 2023-2026) nudges the aggregate net R/day up slightly at low
