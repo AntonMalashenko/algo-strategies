@@ -114,6 +114,27 @@ class Trade:
     leg: int = 1              # 1 = primary trade; 2 = reversal leg (cfg.reversal_mode; never for ORB_BASE)
 
 
+GER40_DUKA_LONG_DIR = "duka_long"   # data/GER40/<this>/GER40_Dukascopy_M1_*.csv.gz
+
+
+def load_ger40_duka_long_m1(ger40_dir: Path) -> pd.DataFrame:
+    """Load data/GER40/duka_long/GER40_Dukascopy_M1_*.csv.gz (S021.2 / ORB_DAX).
+
+    Dukascopy deuidxeur bid M1, fetched 2026-10-06 (2015-01-01..2026-10-05), already
+    converted from UTC to Europe/Kyiv local time (date,time,open,high,low,close) by the
+    same conversion as scripts/build_ger40_dukascopy_m1.py. Naive Kyiv-local labels: the
+    DAX cash open sits at 10:00 in every season, which is what ORB_DAX anchors on.
+    Split into several files only to stay under the device-bridge transfer limit.
+    """
+    files = sorted((Path(ger40_dir) / GER40_DUKA_LONG_DIR).glob("GER40_Dukascopy_M1_*.csv.gz"))
+    if not files:
+        raise FileNotFoundError(f"No GER40_Dukascopy_M1_*.csv.gz under {ger40_dir}/{GER40_DUKA_LONG_DIR}")
+    m1 = pd.concat(pd.read_csv(p) for p in files)
+    m1.index = pd.to_datetime(m1["date"] + " " + m1["time"])
+    m1 = m1[~m1.index.duplicated(keep="last")].sort_index()
+    return m1[["open", "high", "low", "close"]]
+
+
 def _day_session(day_bars: pd.DataFrame, d: pd.Timestamp, cfg: OrbConfig) -> pd.DataFrame | None:
     lo = pd.Timestamp.combine(d.date(), cfg.session_open)
     hi = pd.Timestamp.combine(d.date(), cfg.session_close)

@@ -199,3 +199,26 @@ ORB_REV_FADE = ORB_BASE.with_(reversal_mode=REV_FADE)
 ORB_REV_SAR = ORB_BASE.with_(reversal_mode=REV_SAR)
 ORB_REV_FLIP_OPP = ORB_BASE.with_(reversal_mode=REV_FLIP_OPPOSITE)
 ORB_REV_FLIP_OPEN = ORB_BASE.with_(reversal_mode=REV_FLIP_OPEN)
+
+# S021.2 -- the SAME frozen ORB rules on DAX (GER40), tracked as a preset on this engine
+# (precedent: S021.1, decisions-log 2026-09-24), added 2026-10-06 at Anton's request
+# ("дополним 021 даксом"). Nothing about the rules is re-decided: only the session clock moves
+# to the DAX cash session. Data clock is Europe/Kyiv local time (DST-aware, see
+# engine.load_ger40_duka_long_m1); Xetra opens 09:00 CET/CEST, and Kyiv and Frankfurt switch
+# DST on the same EU dates, so the cash open is 10:00 Kyiv ALL YEAR -- measured 2026-10-06 on
+# Dukascopy 2015-2026: the minute-over-minute volatility jump at 10:00 Kyiv is x1.7-3.6 in every
+# winter AND every summer, with no seasonal hour shift. Entry cutoff keeps ORB_BASE's
+# "open + 5h" (09:30 -> 14:29); the exit is the last bar before the 17:30 CET cash close.
+# TESTED 2026-10-06 (backtest/run_s021_dax.py, Dukascopy 2015-01..2026-10, 1bp frozen cost) --
+# NOT PROMOTED. All years: +0.030R/trade, +87.8R, maxDD -22.9R, 8/12 years positive. But the
+# 2023-06..2026-08 window that was looked at first carries most of it (+0.081R/trade); on the
+# untouched rest (2015..2023-06 + 2026-08-12..) it is +0.011R/trade, 5/10 years positive, and
+# the newest 2026-08-12..10-05 stretch is -11R. Daily-R correlation with NAS ORB_BASE -0.03.
+# FTMO emulator: DAX alone is worse than NAS alone at every risk level; NAS+DAX at r% beats NAS
+# alone at r%, but loses to NAS alone at the same total daily risk (2r%), and from 2.5% per
+# trade the two-stop day (-5.1%) breaches the -5% daily limit (daily busts 0 -> 29 per 3y).
+DAX_SESSION_OPEN = time(10, 0)     # Xetra cash open, Europe/Kyiv clock, year-round
+DAX_ENTRY_CUTOFF = time(14, 59)    # open + 5h, same offset as ORB_BASE
+DAX_SESSION_CLOSE = time(18, 29)   # last M1 bar before the 17:30 CET Xetra close
+ORB_DAX = ORB_BASE.with_(session_open=DAX_SESSION_OPEN, entry_cutoff=DAX_ENTRY_CUTOFF,
+                         session_close=DAX_SESSION_CLOSE)
