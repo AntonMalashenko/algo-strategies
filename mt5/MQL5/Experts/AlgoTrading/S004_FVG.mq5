@@ -20,6 +20,9 @@
 //| account's survival is made of: a full stop costs exactly the     |
 //| risk, so the worst planned day is cap x risk. The expert refuses |
 //| a pair beyond S004_DAILY_RISK_BUDGET_PCT.                        |
+//|                                                                  |
+//| That product is also the ONLY risk control here: the account     |
+//| guard ships OFF on purpose, see the input group below.           |
 //| Docs: mt5/README.md                                              |
 //+------------------------------------------------------------------+
 #property copyright "AlgoTrading (Anton Malashenko)"
@@ -33,10 +36,28 @@ input group "Sizing (tunable; cap x risk must stay within the daily budget)"
 input double       InpRiskPct         = S004_DEFAULT_RISK_PCT;            // Risk per trade, % of balance
 input int          InpMaxTradesPerDay = S004_DEFAULT_MAX_TRADES_PER_DAY;  // Max REAL entries per day, all pairs together
 
-input group "Account guard (own limits, tighter than the firm's)"
+// OFF BY DEFAULT, AND THAT IS THE DECISION, not an oversight (2026-10-07,
+// measured by backtest/run_s004_guard_modes.py).
+//
+// The DAILY limit needs no guard: cap x risk already is a hard planned worst
+// day, and both legs on the account are sized so their sum clears the firm's.
+//
+// The OVERALL limit is the interesting one, and every guard for it loses money,
+// because any rule that stops sizing near the limit is ABSORBING -- with no
+// trades the equity cannot move, the room never reopens, and the account is
+// finished without ever breaching anything. A breach is the opposite: it costs
+// one entry fee and the challenge restarts. Over 3 years, $10k, FundingPips-like
+// 8/5, median payout: no guard +23,859 at 6.98 breaches; stop-at-one-trade-left
+// +827; shrink-the-size-to-fit +4,723 -- and the guarded accounts spend 70-90%
+// of their days dead. Paying the fees is the cheap side of that trade.
+//
+// This flips if a breach ever stops being cheap: a higher entry fee, a limit on
+// retries, or a funded account large enough that losing the status costs more
+// than the restart. Then re-run the script before turning these back on.
+input group "Account guard (off: see the note above before enabling)"
 input double       InpInitialBalance     = 0.0;      // Initial balance (0 = first deposit in history)
-input double       InpDailyGuardPct      = 0.0;      // Daily loss guard, % of initial (0 = off)
-input double       InpMaxGuardPct        = 0.0;      // Max loss guard, % of initial (0 = off)
+input double       InpDailyGuardPct      = 0.0;      // Daily loss guard, % of initial (0 = off, deliberate)
+input double       InpMaxGuardPct        = 0.0;      // Max loss guard, % of initial (0 = off, deliberate)
 input ENUM_TZ_RULE InpDayResetRule       = TZ_FIXED; // Firm's day boundary timezone
 input int          InpDayResetFixedHours = 3;        // ... fixed offset hours (FundingPips: UTC+3)
 

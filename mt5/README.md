@@ -233,6 +233,14 @@ but not failed — they are live-only outcomes the backtest cannot have. Anythin
 - `InpRiskPct` × `InpMaxTradesPerDay` is the worst planned day; the EA refuses
   to start if it exceeds `S004_DAILY_RISK_BUDGET_PCT` (S004's share of the
   firm's −5% daily limit). The default pair is 2 × 1.00%.
+- **That product is the whole risk control.** `InpDailyGuardPct` and
+  `InpMaxGuardPct` ship at 0 on purpose: `backtest/run_s004_guard_modes.py`
+  shows every guard on the overall limit is absorbing (no trades → the equity
+  cannot move → the room never reopens), so it trades a cheap, recoverable
+  breach for a dead account. Leave them off unless a breach stops being cheap.
+- Both EAs on one account read the **whole account's** deal history
+  (`AccountGuardRealizedSince`), so if a guard is ever enabled, give each the
+  firm's real limit — never "its share", or they halt twice too early.
 - **Check the `init` event**: `params` (the config sha), the symbol count, the
   warmup size, `trade_enabled`, and the trades-CSV path.
 - Resting limits are deliberately left in place on deinit; `AdoptPositions`

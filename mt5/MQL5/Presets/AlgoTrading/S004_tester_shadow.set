@@ -6,9 +6,12 @@
 ; ever sent to the market. mt5/tools/s004_parity.py then diffs that file
 ; against strategies/fvg_mtf.py re-run on the same bars.
 ;
-; InpTradeEnabled=false is the whole point -- do not flip it here. The account
-; guard is off as well: a guard halt is a live-only decision the backtest knows
-; nothing about, and it would show up as `ea_halted` rows in the report.
+; InpTradeEnabled=false is the whole point -- do not flip it here.
+;
+; The account guard is off, like in live: it is off by DESIGN, not just for the
+; test (see the note in S004_FVG.mq5 and backtest/run_s004_guard_modes.py). A
+; halt is also a live-only decision the backtest knows nothing about, so it
+; would show up as `ea_halted` rows in the parity report.
 ;
 ; InpServerTzRule must be the BROKER's rule, not the strategy's. S004 decides on
 ; its own EET/EEST clock with EUROPEAN DST dates; the runtime converts. Most
