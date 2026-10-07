@@ -12,6 +12,8 @@
 #include "Clock.mqh"
 
 #define TRADEOPS_DEVIATION_POINTS 50   // max slippage for market closes, in _Point units
+#define TRADEOPS_KIND_STOP        1    // bit flags for the pending-order collectors:
+#define TRADEOPS_KIND_LIMIT       2    // S021 rests on stops, S004 rests on limits
 
 struct OwnPosition
   {
@@ -30,6 +32,7 @@ struct OwnOrder
    bool              is_buy;
    double            price;
    double            stop_loss;
+   double            take_profit;
    double            volume;
    datetime          setup_server;     // ORDER_TIME_SETUP
    string            comment;
@@ -80,7 +83,23 @@ int TradeOpsCollectPositions(const string symbol,const long magic,OwnPosition &o
    return found;
   }
 
-int TradeOpsCollectStopOrders(const string symbol,const long magic,OwnOrder &out[])
+bool TradeOpsOrderTypeMatches(const long order_type,const int kinds)
+  {
+   if((kinds & TRADEOPS_KIND_STOP)!=0
+      && (order_type==ORDER_TYPE_BUY_STOP || order_type==ORDER_TYPE_SELL_STOP))
+      return true;
+   if((kinds & TRADEOPS_KIND_LIMIT)!=0
+      && (order_type==ORDER_TYPE_BUY_LIMIT || order_type==ORDER_TYPE_SELL_LIMIT))
+      return true;
+   return false;
+  }
+
+bool TradeOpsOrderIsBuy(const long order_type)
+  {
+   return order_type==ORDER_TYPE_BUY_STOP || order_type==ORDER_TYPE_BUY_LIMIT;
+  }
+
+int TradeOpsCollectOrders(const string symbol,const long magic,const int kinds,OwnOrder &out[])
   {
    ArrayResize(out,0);
    int found=0;
@@ -93,13 +112,14 @@ int TradeOpsCollectStopOrders(const string symbol,const long magic,OwnOrder &out
       if(OrderGetString(ORDER_SYMBOL)!=symbol || OrderGetInteger(ORDER_MAGIC)!=magic)
          continue;
       long order_type=OrderGetInteger(ORDER_TYPE);
-      if(order_type!=ORDER_TYPE_BUY_STOP && order_type!=ORDER_TYPE_SELL_STOP)
+      if(!TradeOpsOrderTypeMatches(order_type,kinds))
          continue;
       OwnOrder order;
       order.ticket=ticket;
-      order.is_buy=(order_type==ORDER_TYPE_BUY_STOP);
+      order.is_buy=TradeOpsOrderIsBuy(order_type);
       order.price=OrderGetDouble(ORDER_PRICE_OPEN);
       order.stop_loss=OrderGetDouble(ORDER_SL);
+      order.take_profit=OrderGetDouble(ORDER_TP);
       order.volume=OrderGetDouble(ORDER_VOLUME_CURRENT);
       order.setup_server=(datetime)OrderGetInteger(ORDER_TIME_SETUP);
       order.comment=OrderGetString(ORDER_COMMENT);
@@ -110,11 +130,21 @@ int TradeOpsCollectStopOrders(const string symbol,const long magic,OwnOrder &out
    return found;
   }
 
+int TradeOpsCollectStopOrders(const string symbol,const long magic,OwnOrder &out[])
+  {
+   return TradeOpsCollectOrders(symbol,magic,TRADEOPS_KIND_STOP,out);
+  }
+
+int TradeOpsCollectLimitOrders(const string symbol,const long magic,OwnOrder &out[])
+  {
+   return TradeOpsCollectOrders(symbol,magic,TRADEOPS_KIND_LIMIT,out);
+  }
+
 // True if the history since `from_server` holds any stop order of ours whose
 // comment starts with `comment_prefix` (placed earlier, then filled or
 // cancelled) -- the "today already handled" check that survives restarts.
 bool TradeOpsHistoryHasOrder(const string symbol,const long magic,const string comment_prefix,
-                             const datetime from_server)
+                             const datetime from_server,const int kinds=TRADEOPS_KIND_STOP)
   {
    if(!HistorySelect(from_server,TimeTradeServer()+CLOCK_SECONDS_PER_DAY))
       return false;
@@ -128,7 +158,7 @@ bool TradeOpsHistoryHasOrder(const string symbol,const long magic,const string c
          || HistoryOrderGetInteger(ticket,ORDER_MAGIC)!=magic)
          continue;
       long order_type=HistoryOrderGetInteger(ticket,ORDER_TYPE);
-      if(order_type!=ORDER_TYPE_BUY_STOP && order_type!=ORDER_TYPE_SELL_STOP)
+      if(!TradeOpsOrderTypeMatches(order_type,kinds))
          continue;
       long state=HistoryOrderGetInteger(ticket,ORDER_STATE);
       if(state==ORDER_STATE_REJECTED)
@@ -175,6 +205,23 @@ public:
       bool sent=is_buy
                 ? m_trade.BuyStop(volume,price,m_symbol,stop_loss,0.0,ORDER_TIME_GTC,0,comment)
                 : m_trade.SellStop(volume,price,m_symbol,stop_loss,0.0,ORDER_TIME_GTC,0,comment);
+      Fill(result,sent);
+      result.ticket=m_trade.ResultOrder();
+     }
+
+   // Resting BUY LIMIT / SELL LIMIT with an attached SL and TP, good till
+   // cancelled. A limit is how a strategy whose backtest fills inside the bar
+   // (S004 enters at the zone edge) reproduces that fill live: the price is
+   // parked in advance, so a touch fills at the modelled level instead of at
+   // the close of the bar the EA noticed it on.
+   void              PlaceLimit(const bool is_buy,const double volume,const double price,
+                                const double stop_loss,const double take_profit,
+                                const string comment,TradeResult &result)
+     {
+      TradeOpsResetResult(result);
+      bool sent=is_buy
+                ? m_trade.BuyLimit(volume,price,m_symbol,stop_loss,take_profit,ORDER_TIME_GTC,0,comment)
+                : m_trade.SellLimit(volume,price,m_symbol,stop_loss,take_profit,ORDER_TIME_GTC,0,comment);
       Fill(result,sent);
       result.ticket=m_trade.ResultOrder();
      }

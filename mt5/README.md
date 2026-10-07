@@ -61,6 +61,10 @@ mt5/
     s004_clock_probe.py          measures which timezone the S004 data is stamped in
     s004_fixtures.py             S004 self-test fixtures: the engine's bars + its trades
     run_selftest.sh              runs a *_SelfTest script headlessly in a throwaway terminal
+                                 (built and compiled from the repo, never from the live terminal)
+    compile.sh                   compiles every .mq5 from the repo in a throwaway terminal --
+                                 the check to run after touching a shared AlgoCore header
+    _mt5_env.sh                  shared wine/terminal discovery + the sandbox helpers
     deploy.sh / deploy.ps1       one-command deploy: generate, test, copy, compile (--watch / -Watch)
     install_mac.sh               copy (default) or link sources/presets/fixtures into a terminal
 tests/mt5/                       pytest for the tools (repo testpaths = tests/)

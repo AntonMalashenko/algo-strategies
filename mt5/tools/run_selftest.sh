@@ -11,8 +11,10 @@
 # no profiles (so no chart EA can load and place an order), runs the script
 # from [StartUp] and reads the JSON the script leaves in <Common>/Files.
 #
-# Compile first (mt5/tools/deploy.sh, or MetaEditor F7): this runs the .ex5
-# already in the live data folder. Fixtures are taken from the repo.
+# The sandbox is built from the REPO: sources are copied in and compiled
+# there (mt5/tools/compile.sh shares the primitive), so what runs is what is
+# checked in, and no deploy to the trading terminal is needed first. Fixtures
+# come from the repo too.
 #
 # Env: MT5_WINE, MT5_WINEPREFIX -- same meaning as in deploy.sh.
 set -uo pipefail
@@ -24,34 +26,19 @@ KEEP=0
 for arg in "$@"; do [[ "$arg" == "--keep" ]] && KEEP=1; done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/../.." && pwd)"
-TERMINAL_SUBDIR="drive_c/Program Files/MetaTrader 5"
+# shellcheck source=mt5/tools/_mt5_env.sh
+. "$HERE/_mt5_env.sh" || exit 2
+REPO="$MT5_REPO"
+terminal="$MT5_TERMINAL"
+prefix="$MT5_PREFIX"
+wine="$MT5_WINE_BIN"
+common="$MT5_COMMON"
 SANDBOX_NAME="algotrading_selftest"
 SANDBOX_SUBDIR="drive_c/$SANDBOX_NAME"
 RESULT_SUBPATH="AlgoTrading/selftest/${SCRIPT_NAME}.json"
 TIMEOUT_SECONDS=600
 POLL_SECONDS=3
 
-prefix="${MT5_WINEPREFIX:-$HOME/Library/Application Support/net.metaquotes.wine.metatrader5}"
-[[ -d "$prefix/$TERMINAL_SUBDIR" ]] || prefix="$HOME/.mt5"
-terminal="$prefix/$TERMINAL_SUBDIR"
-wine="${MT5_WINE:-}"
-if [[ -z "$wine" ]]; then
-  wine="/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64"
-  [[ -x "$wine" ]] || wine="$(command -v wine64 || command -v wine || true)"
-fi
-if [[ ! -d "$terminal" || ! -x "$wine" ]]; then
-  echo "no terminal ($terminal) or wine ($wine); set MT5_WINEPREFIX / MT5_WINE" >&2
-  exit 2
-fi
-
-# Wine maps FILE_COMMON to the Wine user's own AppData, and a prefix often
-# carries a stale "user" profile next to the real one -- prefer $USER's.
-common=""
-for candidate in "$prefix/drive_c/users/$USER/AppData/Roaming/MetaQuotes/Terminal/Common/Files" \
-                 $(find "$prefix/drive_c/users" -maxdepth 8 -type d -path '*MetaQuotes/Terminal/Common/Files' 2>/dev/null); do
-  [[ -d "$candidate" ]] && { common="$candidate"; break; }
-done
 if [[ -z "$common" ]]; then
   echo "Common/Files not found under $prefix -- start the terminal once" >&2
   exit 2
@@ -70,26 +57,21 @@ sandbox="$prefix/$SANDBOX_SUBDIR"
 # A sandbox terminal left over from an interrupted run still holds the folder,
 # and MT5 silently drops the second instance -- so the run would just time out.
 # Wine's preloader ignores the first TERM often enough to need the follow-up.
-stop_sandbox() {
-  for attempt in 1 2 3; do
-    local pids; pids="$(pgrep -f "$SANDBOX_NAME" 2>/dev/null || true)"
-    [[ -z "$pids" ]] && return 0
-    for pid in $pids; do
-      if [[ $attempt -eq 1 ]]; then kill "$pid" 2>/dev/null; else kill -9 "$pid" 2>/dev/null; fi
-    done
-    sleep 3
-  done
-  [[ -z "$(pgrep -f "$SANDBOX_NAME" 2>/dev/null || true)" ]]
-}
-if ! stop_sandbox; then
+if ! mt5_stop_sandbox "$SANDBOX_NAME"; then
   echo "a sandbox terminal from an earlier run will not die -- kill it by hand" >&2
   exit 2
 fi
 rm -rf "$sandbox"
 mkdir -p "$sandbox/MQL5"
-cp "$terminal/terminal64.exe" "$sandbox/"
+cp "$terminal/terminal64.exe" "$terminal/MetaEditor64.exe" "$sandbox/"
 cp -R "$terminal/config" "$sandbox/"
-cp -R "$terminal/MQL5/Include" "$terminal/MQL5/Scripts" "$sandbox/MQL5/"
+cp -R "$terminal/MQL5/Include" "$sandbox/MQL5/"      # the standard library
+cp -R "$REPO/mt5/MQL5/Include/." "$sandbox/MQL5/Include/"
+mkdir -p "$sandbox/MQL5/Scripts"
+cp -R "$REPO/mt5/MQL5/Scripts/." "$sandbox/MQL5/Scripts/"
+# build the self-test from the repo, so a stale .ex5 can never be what passes
+mt5_compile_in "$sandbox" "$SANDBOX_NAME" "Scripts/AlgoTrading/${SCRIPT_NAME}.mq5" || {
+  mt5_stop_sandbox "$SANDBOX_NAME"; rm -rf "$sandbox"; exit 1; }
 # no profiles/ and no Experts: nothing can attach to a chart and trade
 printf '[Common]\nNewsEnable=false\n[Experts]\nAllowLiveTrading=false\nEnabled=false\nAccount=false\nProfile=false\n[StartUp]\nSymbol=EURUSD\nPeriod=M15\nScript=AlgoTrading\\%s\n' \
   "$SCRIPT_NAME" > "$sandbox/config/selftest.ini"
@@ -111,6 +93,6 @@ done
 [[ $status -eq 1 && ! -f "$result" ]] && echo "$SCRIPT_NAME: no result after ${TIMEOUT_SECONDS}s" >&2
 
 for pid in $(pgrep -f "$SANDBOX_NAME" 2>/dev/null || true); do kill "$pid" 2>/dev/null; done
-stop_sandbox || echo "warning: a sandbox terminal is still running" >&2
+mt5_stop_sandbox "$SANDBOX_NAME" || echo "warning: a sandbox terminal is still running" >&2
 [[ $KEEP -eq 1 ]] || rm -rf "$sandbox"
 exit $status
