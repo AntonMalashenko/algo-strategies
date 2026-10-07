@@ -1,0 +1,44 @@
+; S004 FVG -- FundingPips 2-Step Standard $10K, EVALUATION phases (MT5, live).
+; The second leg of the prop portfolio: S021 runs on the same account with its
+; own magic, so the firm's -5% day is spent by BOTH strategies together.
+;
+; InpRiskPct=0.5, not the researched 1.0. The grid (backtest/run_s004_risk_grid.py)
+; says 1.0 earns more -- median +23,859 against +14,920 over 3 years -- but busts
+; 6.98 challenges per 3 years against 3.18. That is the strategy's own risk, and
+; it is not why this file says 0.5: the live layer has never filled a real order.
+; The shadow pass proved the DECISIONS (2182 match, 0 field divergences), not the
+; executions, so slippage and missed limit fills are still unmeasured. 0.5 is the
+; price of watching. Raise it to 1.0 -- an input, no rebuild -- once enough real
+; fills have been compared with mt5/tools/s004_parity.py.
+;
+; Worst planned day on the account: S004 2 x 0.50% + S021 1.00% = 2.00%, against
+; the firm's 5%. At InpRiskPct=1.0 that becomes 3.00%.
+;
+; The account guard stays OFF by design, not by oversight: an account near the
+; daily limit that refuses to trade is a frozen account, and the arithmetic above
+; is the control instead. See the note in S004_FVG.mq5 and
+; backtest/run_s004_guard_modes.py.
+;
+; InpServerTzRule is the BROKER's rule (EET with US DST on prop servers), not
+; S004's own clock -- the runtime converts. The EA's `init` event logs
+; server_offset_expected_s and server_offset_observed_s: they must agree.
+;
+; Attach to ONE chart, any symbol, any timeframe. The EA subscribes to all seven
+; pairs itself and refuses a second instance with the same magic.
+;
+; Enum codes: ServerTzRule/DayResetRule 0=UTC 1=FIXED 2=EET_US_DST 3=EET_EU_DST 4=CET_EU_DST
+InpRiskPct=0.5
+InpMaxTradesPerDay=2
+InpInitialBalance=10000.0
+InpDailyGuardPct=0.0
+InpMaxGuardPct=0.0
+InpDayResetRule=1
+InpDayResetFixedHours=3
+InpServerTzRule=2
+InpServerFixedHours=0
+InpMagic=4004
+InpWarmupBars=1000
+InpTradeEnabled=true
+InpWriteTradesCsv=true
+InpLogToCommon=true
+InpTimerSeconds=5

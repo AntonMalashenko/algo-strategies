@@ -255,11 +255,30 @@ the EA spent the wrong number of slots and still fails.
 
 ### Live checklist (S004, prop account)
 
+- **Preset:** `Presets/AlgoTrading/S004_fundingpips_10k_eval.set`. Attach to
+  **one** chart, any symbol, any timeframe — the EA subscribes to all seven
+  pairs itself. Do not start from `S004_tester_shadow.set`: it has
+  `InpTradeEnabled=false` and `InpTimerSeconds=60`.
+- **`InpRiskPct` ships at 0.5, not the researched 1.0.** Not because of the
+  strategy's own risk (`run_s004_risk_grid.py` prices that trade-off: 1.0 earns
+  a median +23,859 over 3 years against +14,920, and busts 6.98 challenges
+  against 3.18) but because the live layer has never filled a real order. The
+  shadow pass proved the decisions, not the executions. Raise it to 1.0 — an
+  input, no rebuild — once enough real fills have been through
+  `s004_parity.py` with acceptable slippage and no `FAIL_*`.
+- **`InpServerTzRule` is the broker's rule**, not S004's own clock. Prop servers
+  are normally EET with US DST (`2`); the runtime converts. The `init` event
+  logs `server_offset_expected_s` and `server_offset_observed_s` — they must
+  agree, or the Asia window moves by an hour on the weeks the two DST calendars
+  disagree.
 - **One chart only.** A second copy with the same magic is refused
   (`InstanceLock`), because both would park limits on the same zones.
 - `InpRiskPct` × `InpMaxTradesPerDay` is the worst planned day; the EA refuses
   to start if it exceeds `S004_DAILY_RISK_BUDGET_PCT` (S004's share of the
-  firm's −5% daily limit). The default pair is 2 × 1.00%.
+  firm's −5% daily limit). Count S021's leg too: it spends the same −5% day on
+  the same account, so 2 × 0.50% + its 1.00% is 2.00% of the firm's 5%.
+- The daily cap rolls over on S004's **session clock**, not on
+  `InpDayResetRule` — that input only feeds the (disabled) guards.
 - **That product is the whole risk control.** `InpDailyGuardPct` and
   `InpMaxGuardPct` ship at 0 on purpose: `backtest/run_s004_guard_modes.py`
   shows every guard on the overall limit is absorbing (no trades → the equity
