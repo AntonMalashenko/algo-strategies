@@ -1,0 +1,73 @@
+# Posts the day's S021 order prices to Telegram, so the plan arrives whether or
+# not a laptop happens to be awake. What it sends and how to act on it:
+# mt5/docs/SETUP.md section 7.2.
+#
+# ONE UTC cron line, deliberately. GitHub's scheduler has no notion of DST, but
+# the New York cash open moves with it -- 13:30 UTC under EDT, 14:30 under EST.
+# Rather than maintaining two seasonal cron lines (and remembering to swap them
+# twice a year, on dates that differ between the US and the EU), this fires
+# ahead of the EARLIEST possible open and lets the tool's own DST-aware
+# wait_for_open() hold until the real one. deployment/schedule.yml solves the
+# same problem for the S021 bot the same way, via `tz: UTC` plus a wide window.
+#
+# The early start is also what absorbs GitHub's scheduling delay, which the
+# docs explicitly refuse to bound: starting late only eats into the wait. Even
+# a start AFTER the open still produces correct numbers -- by then the 09:30
+# bar is plain history -- the message just arrives late.
+#
+# A US market holiday fails the run (no 09:30 bar) and so emails a red result.
+# That is intended: silence and breakage look identical otherwise.
+
+name: S021 signal
+
+on:
+  schedule:
+    - cron: "5 13 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      no_wait:
+        description: "Compute now instead of waiting for the open (for testing)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: s021-signal
+  cancel-in-progress: false
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    # Winter is the long case: a 13:05 UTC start against a 14:30:40 UTC open is
+    # ~85 minutes of waiting. 120 leaves headroom without letting a wedged HTTP
+    # request sit through the 6-hour default.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Deliberately not requirements.txt: this path imports nothing heavier
+      # than a frozen dataclass config (strategies/orb_intraday/config.py), so
+      # pandas and friends would be a minute of install time for nothing.
+      - name: Install dependencies
+        run: pip install requests "python-dotenv>=1.0"
+
+      - name: Compute the levels and send them
+        env:
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+          # Not a secret, just which host to talk to. "0" = live; the demo host
+          # answers 401 error.null.accountId when the account has no demo side.
+          CAPITAL_DEMO: "0"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -m mt5.tools.s021_capital --telegram \
+            ${{ inputs.no_wait && '--no-wait' || '' }}
