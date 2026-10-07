@@ -419,7 +419,7 @@ platform, and a wrong size is a worse failure than no size.
 ### Fully standalone, on the broker's own feed
 
 `s021_manual.py` still needs MT5 running somewhere for ADR14, and the open typed in.
-`python -m mt5.tools.s021_capital` removes both: started any time before the open, it
+`python -m tools.s021_capital` removes both: started any time before the open, it
 works out when the New York open is, waits for it, pulls the history and the open from
 Capital.com's REST API and prints the same block. Credentials live in `.env`
 (`CAPITAL_API_KEY`, `CAPITAL_IDENTIFIER`, `CAPITAL_PASSWORD`, `CAPITAL_DEMO`) — see

@@ -20,9 +20,9 @@ Credentials come from the environment (never passed on the command line, never l
     CAPITAL_DEMO          1 (default) for the demo endpoint, 0 for live
 
 Usage:
-    python -m mt5.tools.s021_capital                  # wait for the open, then print
-    python -m mt5.tools.s021_capital --no-wait        # compute now, open must have passed
-    python -m mt5.tools.s021_capital --search nasdaq  # find the right epic, then exit
+    python -m tools.s021_capital                  # wait for the open, then print
+    python -m tools.s021_capital --no-wait        # compute now, open must have passed
+    python -m tools.s021_capital --search nasdaq  # find the right epic, then exit
 """
 from __future__ import annotations
 
@@ -177,15 +177,21 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        api = connect()
         if args.search:
+            api = connect()
             for epic, name in api.search(args.search):
                 print(f"{epic:<20} {name}")
             return 0
 
+        # Login AFTER the wait, not before: a Capital.com token lives 10 minutes (see
+        # CapitalSession's docstring), but the wait for the open can run up to ~85
+        # minutes in winter (s021_signal.yml's own worst case) -- logging in first would
+        # hand session_ranges()/open_price() a token that expired long before their
+        # first request, failing every scheduled run with HTTP 401.
         today = datetime.now(NY).date()
         if not args.no_wait:
             wait_for_open(today, args.open_delay)
+        api = connect()
 
         ranges = session_ranges(api, args.epic, today, ORB_BASE.adr_window)
         if len(ranges) < ORB_BASE.adr_window:

@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from mt5.tools import s021_capital as cap
+from tools import s021_capital as cap
 from strategies.orb_intraday.config import ORB_BASE
 
 FULL_SESSION_BARS = 78          # 390 minutes / 5
@@ -92,3 +92,22 @@ def test_connect_names_the_missing_variables_without_touching_their_values(monke
     with pytest.raises(cap.CapitalError) as excinfo:
         cap.connect()
     assert "CAPITAL_API_KEY" in str(excinfo.value)
+
+
+def test_main_logs_in_after_waiting_for_the_open_not_before(monkeypatch):
+    """A Capital.com token lives 10 minutes; the wait for the open can run much longer
+    (up to ~85 minutes in winter). connect() must happen after wait_for_open(), or the
+    token handed to session_ranges()/open_price() is already dead on every scheduled run.
+    """
+    order: list[str] = []
+    monkeypatch.setattr(cap, "wait_for_open", lambda *a, **k: order.append("wait"))
+    monkeypatch.setattr(cap, "connect", lambda *a, **k: order.append("connect") or object())
+    stub_ranges = [(date(2026, 1, d), 100.0) for d in range(1, ORB_BASE.adr_window + 1)]
+    monkeypatch.setattr(cap, "session_ranges", lambda *a, **k: stub_ranges)
+    monkeypatch.setattr(cap, "open_price", lambda *a, **k: 20_000.0)
+    monkeypatch.setattr(cap, "deliver", lambda *a, **k: None)
+    monkeypatch.setattr(cap.sys, "argv", ["s021_capital.py"])
+
+    assert cap.main() == 0
+    assert order == ["wait", "connect"]
+

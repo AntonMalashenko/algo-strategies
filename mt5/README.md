@@ -66,7 +66,6 @@ mt5/
     s021_fixtures.py             self-test fixtures from histdata + the engine
     s021_parity.py               engine vs EA on the broker's own bars
     s021_manual.py               order prices for trading S021 by hand on another account
-    s021_capital.py              the same, fully standalone on Capital.com's own feed
     s004_clock_probe.py          measures which timezone the S004 data is stamped in
     s004_fixtures.py             S004 self-test fixtures: the engine's bars + its trades
     s004_parity.py               engine vs EA on the broker's own bars (shadow tester pass)
@@ -79,6 +78,11 @@ mt5/
                                  takes program names ("S004", "s004_fvg", a path under MQL5) to
                                  deploy a subset -- all of them when given none
     install_mac.sh               copy (default) or link sources/presets/fixtures into a terminal
+
+tools/s021_capital.py            S021 order prices with no MT5 dependency at all -- a
+                                 standalone Capital.com REST client (run from the repo root:
+                                 python -m tools.s021_capital); see its own docstring, and
+                                 .github/workflows/s021_signal.yml for the scheduled Telegram push
 tests/mt5/                       pytest for the tools (repo testpaths = tests/)
 ```
 

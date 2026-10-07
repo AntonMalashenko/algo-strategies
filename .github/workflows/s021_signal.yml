@@ -69,5 +69,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -m mt5.tools.s021_capital --telegram \
+          python -m tools.s021_capital --telegram \
             ${{ inputs.no_wait && '--no-wait' || '' }}
