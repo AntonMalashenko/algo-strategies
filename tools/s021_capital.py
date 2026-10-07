@@ -36,7 +36,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
-from mt5.tools.s021_manual import deliver, levels_from_adr
+from tools.orb_levels import deliver, levels_from_adr
 from strategies.orb_intraday.config import ORB_BASE
 
 NY = ZoneInfo("America/New_York")

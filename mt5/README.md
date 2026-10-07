@@ -83,6 +83,9 @@ tools/s021_capital.py            S021 order prices with no MT5 dependency at all
                                  standalone Capital.com REST client (run from the repo root:
                                  python -m tools.s021_capital); see its own docstring, and
                                  .github/workflows/s021_signal.yml for the scheduled Telegram push
+tools/orb_levels.py               the geometry + Telegram formatting shared by s021_manual.py
+                                 and s021_capital.py -- no MT5 dependency either; s021_manual.py
+                                 only adds latest_levels(), which reads the EA's own log files
 tests/mt5/                       pytest for the tools (repo testpaths = tests/)
 ```
 
