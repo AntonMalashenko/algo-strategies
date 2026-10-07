@@ -22,18 +22,13 @@
 # zero-drift proxy for Frankfurt/DAX local time, not something to "fix").
 
 strategies:
-  # name must match webapp Strategy.name -- dispatched as
-  # `python -m webapp.runner --strategy <name>`, which itself queries the DB
-  # for enabled AccountStrategy rows and fans out per account. The schedule
-  # here is a property of the STRATEGY (one job per strategy, not per
-  # account/user) -- scripts/s007_tick.py::in_session() derives its window
-  # from bot/s007_config.py's TRADE_START/EXIT_END ("10:00"/"14:24" since the
-  # 2026-09-02 ALGODEV-37 cutover to the news-safe MAX8_BE05 preset). The
-  # cron hours below are deliberately WIDER (until 16:59): a cycle after
-  # EXIT_END is a cheap flatten/no-op, and the slack means a clock/config
-  # drift can't leave positions unflattened.
-  - name: S007
-    schedule: "* 10-16 * * 1-5"
+  # S007 taken out of operation entirely (maintainer request, 2026-10-07):
+  # both AccountStrategy rows (ctrader-47939312, ftmo-17211983) set
+  # enabled=0 in the DB, both compose daemons (s007-daemon,
+  # s007-live-daemon) removed from docker-compose.yml, and this cron entry
+  # removed so scheduler_tick never dispatches it at all. Strategy code
+  # (strategies/ger40_lonfra/) and its Confluence passport stay in place --
+  # archived, not deleted -- in case this gets revisited.
   # S009 rebalances at most once a day (a new closed UTC day). It has a
   # cheap "already up to date, skip" check (added 2026-08-18, see
   # decisions-log.md same date, bot/s009_paper.py::run_cycle_for_account)
