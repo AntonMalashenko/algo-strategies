@@ -82,9 +82,11 @@ config, which stays one static job forever (see docker-compose.yml).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -111,6 +113,49 @@ DEFAULT_TIMEOUT_S = 55.0
 # but it must not be what pushes a worker past the coordinator's kill line.
 SYNC_BUDGET_S = 25.0
 MIN_SYNC_BUDGET_S = 8.0
+
+# ALGODEV-45 step 4: one account_strategy must never be traded by two
+# processes at once. With the persistent daemon
+# (scripts/s007_live_daemon.py) holding one session open all session long
+# while Ofelia also dispatches a cold-connect tick every minute, that stops
+# being hypothetical: both would run decide() against the same account
+# seconds apart, neither seeing the other's just-placed order, and the
+# account would get double size. Commenting the cron job out at cutover is
+# the intent; this lock is what makes it true even if someone re-enables it,
+# runs the runner by hand, or a stale container survives a redeploy.
+#
+# Same mechanism as webapp/ctrader_tokens.py's per-account token lock
+# (fcntl.flock on a file under the shared data/ bind mount): every trading
+# process runs in the same Podman VM, and the kernel drops the lock when its
+# holder dies, so a crashed daemon needs no stale-lock cleanup.
+# Resolved against ROOT at call time, not import time, so a test that
+# repoints runner.ROOT at a tmp dir does not reach into the real data/.
+CYCLE_LOCK_SUBDIR = "data/.cycle_locks"
+
+
+@contextmanager
+def cycle_lock(account_strategy_id: int):
+    """Exclusive, NON-BLOCKING trading lock for one account_strategy.
+
+    Yields True when held, False when another process holds it -- the caller
+    must then skip the cycle entirely, not wait: a minute-cadence tick that
+    queued behind a daemon's whole session would fire late against stale bars,
+    which is worse than not firing at all. Held for the caller's lifetime:
+    the daemon takes it at startup for the whole run, a one-shot worker takes
+    it for one cycle.
+    """
+    lock_dir = ROOT / CYCLE_LOCK_SUBDIR
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_dir / f"account-strategy-{account_strategy_id}.lock", "a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def _log_event(session, kind: LogKind, *, message: str | None = None,
@@ -189,7 +234,26 @@ def _token_persister(session, acc: Account):
     return token_persister(session, acc)
 
 
-def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
+def _worker_s007(link: AccountStrategy, session, budget_s: float | None, api=None) -> int:
+    """Take the per-account trading lock, then run one S007 cycle.
+
+    `api` is not None only for scripts/s007_live_daemon.py, which already
+    holds that lock for its whole run -- re-taking it here would deadlock
+    against itself (flock conflicts across two open file descriptions even
+    inside one process), so the daemon goes straight through.
+    """
+    if api is not None:
+        return _s007_cycle(link, session, budget_s, api)
+    with cycle_lock(link.id) as held:
+        if not held:
+            print(f"[runner] account_strategy {link.id}: another process is already "
+                  f"trading this account (persistent daemon?) -- skipping this tick")
+            session.close()
+            return 0
+        return _s007_cycle(link, session, budget_s, None)
+
+
+def _s007_cycle(link: AccountStrategy, session, budget_s: float | None, api) -> int:
     """Run one S007/CTRADER cycle for one (account, strategy) DB row.
 
     Fail-fast: a broker mismatch, or a credential error raised while
@@ -216,6 +280,13 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
     reached. The marker is a plain `link.status` string ("settled:<local
     date>") -- no separate state file/table needed, and a new day's first
     tick naturally has a stale date and runs normally.
+
+    `api` (ALGODEV-45 step 4): an already-connected CTraderS007 owned by
+    scripts/s007_live_daemon.py's persistent session. None (the Ofelia
+    cold-connect dispatch, unchanged) makes run_s007_cycle build its own
+    throwaway client. Nothing else in this worker differs between the two --
+    that is the point: the daemon reuses this exact function, including all
+    the DB bookkeeping below, instead of growing a parallel copy of it.
     """
     started = time.monotonic()
     account_strategy_id = link.id
@@ -269,7 +340,8 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
         # S007 row at the time, id=1, was already "execute").
         broker_mode=link.broker_mode or "off",
         account_limits=_account_limits(acc),
-        on_token_refreshed=_token_persister(session, acc))
+        on_token_refreshed=_token_persister(session, acc),
+        api=api)
 
     for a in result["actions"]:
         if a["kind"] == "open":
@@ -317,14 +389,16 @@ def _worker_s007(link: AccountStrategy, session, budget_s: float | None) -> int:
     # instead of only what this runner intended -- see webapp/sync_positions.py.
     #
     # Deliberately AFTER session.close() and outside the ok/error decision:
-    #   * as a SUBPROCESS, because this process has already spent its Twisted
-    #     reactor on the cycle and a reactor cannot be run twice
-    #     (ReactorNotRestartable);
+    #   * as a SUBPROCESS when this worker owned the session, because it has
+    #     already spent its Twisted reactor on the cycle and a reactor cannot
+    #     be run twice (ReactorNotRestartable). Under the live daemon (`api`
+    #     is not None) that constraint is gone and the sync runs in-process on
+    #     the still-open session -- see _sync_after_cycle;
     #   * it can never change this worker's exit code. A broker hiccup while
     #     re-reading positions does not mean the trading cycle failed, and
     #     letting it flip the row to status='error' would be a lie about the
     #     thing that actually matters.
-    _sync_after_cycle(account_strategy_id, started, budget_s)
+    _sync_after_cycle(account_strategy_id, started, budget_s, api)
     return 0 if ok else 1
 
 
@@ -558,7 +632,8 @@ def _worker_orb(link: AccountStrategy, session, budget_s: float | None) -> int:
         magic=strat.name, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env,
         daily_risk_cap_pct=link.daily_risk_cap_pct, initial_balance=link.initial_balance,
         account_limits=_account_limits(acc),
-        on_token_refreshed=_token_persister(session, acc))
+        on_token_refreshed=_token_persister(session, acc),
+        api=api)
 
     for a in result["actions"]:
         if a["kind"] == "open":
@@ -629,17 +704,40 @@ def run_worker(account_strategy_id: int, budget_s: float | None = None) -> int:
 
 
 def _sync_after_cycle(account_strategy_id: int, started: float,
-                      budget_s: float | None) -> None:
+                      budget_s: float | None, api=None) -> None:
     """Spend whatever is left of the tick budget on a position sync.
 
     Skipped rather than truncated when little time remains: a sync killed
     halfway is not a partial sync of the DB (apply_snapshot commits once, at
     the end) but simply a wasted subprocess, and it would leave the
     coordinator's kill landing on us instead. The next cycle syncs anyway.
+
+    `api` (ALGODEV-45 step 4): with a persistent session there is no reason
+    for the subprocess at all. It only ever existed because a one-shot worker
+    had already spent its Twisted reactor on the trading cycle and a reactor
+    cannot be run twice -- the daemon's reactor is still running, so the sync
+    reads straight through the open connection. Keeping the subprocess here
+    would have handed back most of the saving: a fresh TCP+TLS+auth handshake
+    every single minute, which is exactly what this ticket set out to stop.
     """
-    from webapp.sync_positions import spawn_sync_worker   # local: avoids a
-    # webapp.runner <-> webapp.sync_positions import cycle (sync_positions
-    # imports _log_event from here).
+    from webapp.sync_positions import spawn_sync_worker, sync_account_strategy
+    # local: avoids a webapp.runner <-> webapp.sync_positions import cycle
+    # (sync_positions imports _log_event from here).
+
+    if api is not None:
+        session = get_session()
+        try:
+            link = session.get(AccountStrategy, account_strategy_id)
+            if link is not None:
+                sync_account_strategy(session, link, api=api)
+        except Exception as e:                   # noqa: BLE001 -- a failed
+            # re-read of positions does not mean the trading cycle failed;
+            # same policy as the subprocess branch below.
+            print(f"[runner] account_strategy {account_strategy_id}: in-session "
+                  f"position sync failed: {e!r} (cycle result unaffected)")
+        finally:
+            session.close()
+        return
 
     budget = SYNC_BUDGET_S if budget_s is None else (budget_s - (time.monotonic() - started))
     budget = min(budget, SYNC_BUDGET_S)

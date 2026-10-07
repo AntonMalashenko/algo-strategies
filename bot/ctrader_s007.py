@@ -36,6 +36,14 @@ PRICE_SCALE = 100000.0   # Open API trendbar/price integers = human_price * 1e5
 
 
 class CTraderS007(CTraderAdapter):
+    # True once _run_persistent owns this adapter's session (ALGODEV-45
+    # step 4) -- run_live_cycle then routes the cycle onto that reactor
+    # instead of opening its own. Class-level so BOTH __init__ paths below
+    # (and stop_persistent called before any session started) see a defined
+    # value rather than raising AttributeError.
+    _persistent = False
+    _persistent_stopped = False
+
     def __init__(self, creds: dict | None = None, require_account: bool = True,
                  on_token_refreshed=None):
         """creds=None -> read from .env (single-account mode, same as S004).
@@ -325,45 +333,57 @@ class CTraderS007(CTraderAdapter):
 
         Returns {"positions", "deals", "symbols_by_id", "lot_sizes",
         "fetched_at"}; positions/deals carry `symbol` and `volume_lots`.
+
+        On a persistent session (ALGODEV-45 step 4) this runs on the daemon's
+        existing connection instead of opening its own -- that is what lets
+        the end-of-cycle sync stop being a per-minute subprocess with its own
+        full handshake, which would have given back most of what holding one
+        session open was supposed to save.
         """
+        if self._persistent:
+            from twisted.internet import reactor, threads
+            return threads.blockingCallFromThread(
+                reactor, self._sync_snapshot_step, days)
+
         def work(done):
-            @defer.inlineCallbacks
-            def flow():
-                yield self._load_symbols()
-                by_id = {ls.symbolId: name for name, ls in self._symbols.items()}
-
-                positions = yield self._reconcile_step()
-
-                now = datetime.now(timezone.utc)
-                deals = []
-                start = now - timedelta(days=max(1, int(days)))
-                while start < now:
-                    end = min(start + timedelta(days=self._DEAL_WINDOW_DAYS), now)
-                    chunk = yield self._deal_list_step(
-                        int(start.timestamp() * 1000), int(end.timestamp() * 1000))
-                    deals.extend(chunk)
-                    start = end
-
-                need = ({p["symbol_id"] for p in positions}
-                        | {d["symbol_id"] for d in deals})
-                lot_sizes = yield self._lot_sizes_step(sorted(need))
-
-                for p in positions:
-                    p["symbol"] = by_id.get(p["symbol_id"], "")
-                    p["volume_lots"] = self._lots_from_volume(
-                        p["volume"], lot_sizes.get(p["symbol_id"]))
-                for dl in deals:
-                    dl["symbol"] = by_id.get(dl["symbol_id"], "")
-                    dl["volume_lots"] = self._lots_from_volume(
-                        dl["closed_volume"], lot_sizes.get(dl["symbol_id"]))
-
-                return dict(positions=positions, deals=deals,
-                            symbols_by_id=by_id, lot_sizes=lot_sizes,
-                            fetched_at=now)
-
-            d = flow()
+            d = self._sync_snapshot_step(days)
             d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
         return self._run(work)
+
+    @defer.inlineCallbacks
+    def _sync_snapshot_step(self, days: int):
+        """sync_snapshot's body, on an already-connected session."""
+        yield self._load_symbols()
+        by_id = {ls.symbolId: name for name, ls in self._symbols.items()}
+
+        positions = yield self._reconcile_step()
+
+        now = datetime.now(timezone.utc)
+        deals = []
+        start = now - timedelta(days=max(1, int(days)))
+        while start < now:
+            end = min(start + timedelta(days=self._DEAL_WINDOW_DAYS), now)
+            chunk = yield self._deal_list_step(
+                int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+            deals.extend(chunk)
+            start = end
+
+        need = ({p["symbol_id"] for p in positions}
+                | {d["symbol_id"] for d in deals})
+        lot_sizes = yield self._lot_sizes_step(sorted(need))
+
+        for p in positions:
+            p["symbol"] = by_id.get(p["symbol_id"], "")
+            p["volume_lots"] = self._lots_from_volume(
+                p["volume"], lot_sizes.get(p["symbol_id"]))
+        for dl in deals:
+            dl["symbol"] = by_id.get(dl["symbol_id"], "")
+            dl["volume_lots"] = self._lots_from_volume(
+                dl["closed_volume"], lot_sizes.get(dl["symbol_id"]))
+
+        return dict(positions=positions, deals=deals,
+                    symbols_by_id=by_id, lot_sizes=lot_sizes,
+                    fetched_at=now)
 
     @staticmethod
     def _check_response(resp):
@@ -548,208 +568,237 @@ class CTraderS007(CTraderAdapter):
         vary run to run -- actions themselves are still placed sequentially
         (see the loop below), not parallelized.
         """
+        if self._persistent:
+            # ALGODEV-45 step 4: the session is already connected and owned by
+            # a daemon's reactor running in another thread. Hand the work to
+            # that reactor and block THIS thread for the answer, so the whole
+            # synchronous caller chain above (bot/s007_paper.py ::
+            # run_cycle_for_account -> webapp/runner.py::_worker_s007) keeps
+            # its exact shape and logic instead of being duplicated in an
+            # async flavour. Call only from a reactor worker thread, never
+            # from the reactor thread itself (that would deadlock).
+            from twisted.internet import reactor, threads
+            return threads.blockingCallFromThread(
+                reactor, self.live_tick_step, symbol_candidates, history_days, decide)
+
         def work(done):
-            @defer.inlineCallbacks
-            def flow():
-                # ALGODEV-44: per-step wall-clock timings, to find out where
-                # the reported up-to-20s cycle time actually goes (network
-                # round trips, the SDK's own send-queue throttle, or decide()
-                # itself) -- Phase 0. Confirmed live (2026-09-16/17) that the
-                # SDK's send-queue throttle, not decide() or real network
-                # latency, dominates -- see the parallel-reads block below
-                # (Phase 1) for the fix that follows from that. `t` is reset
-                # after each SEQUENTIALLY measured step; self._session_timings
-                # (connect/app-auth/account-auth, populated by
-                # CTraderAdapter._run before flow() ever starts) is merged in
-                # at the end so callers get one complete picture.
-                timings: dict = {}
-                t = time.monotonic()
-
-                yield self._load_symbols()
-                timings["load_symbols_ms"] = round((time.monotonic() - t) * 1000, 1)
-                t = time.monotonic()
-
-                up = {n.upper() for n in self._symbols.keys()}
-                symbol = None
-                for c in symbol_candidates:
-                    if c.upper() in up:
-                        symbol = c
-                        break
-                if symbol is None:
-                    raise RuntimeError(
-                        f"none of {symbol_candidates} found; broker symbols "
-                        f"e.g. {sorted(self._symbols.keys())[:15]}")
-
-                # ALGODEV-44 Phase 1: the five reads below (contract metadata,
-                # balance, M1 bars, open positions, closing deals) depend only
-                # on _load_symbols() above, not on each other -- confirmed by
-                # live timings (2026-09-16/17): each cost ~0.75-1.2s fired
-                # sequentially, dominated by the ctrader-open-api SDK's own
-                # send-queue throttle (TcpProtocol._sendStrings, a 1s
-                # LoopingCall flushing up to 5 queued messages -- see
-                # client.py/tcpProtocol.py in the installed SDK), not real
-                # network/server latency (a plain balance query and a full M1
-                # history fetch cost almost the same). Firing them together
-                # via gatherResults lets the SDK flush most of them in the
-                # SAME 1s tick instead of one tick each -- ~6s of sequential
-                # reads measured live collapsing toward ~1-2s. `_timed` records
-                # each one's OWN elapsed time (not shared/reset like the
-                # `t`-based timings elsewhere in this method), since they now
-                # resolve concurrently, not in sequence.
-                def _timed(d, key):
-                    t0 = time.monotonic()
-
-                    def record(result):
-                        timings[key] = round((time.monotonic() - t0) * 1000, 1)
-                        return result
-                    d.addCallback(record)
-                    return d
-
-                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                # Closing deals over the last 24h: the only place a position
-                # that opened AND closed between two reconcile snapshots still
-                # exists, with its real fill price. decide() matches them to
-                # its own opened-today labels by position_id for the
-                # day-level risk budget (see bot/s007_paper.py::decide,
-                # 2026-09-02 incident) -- a fetch failure must not kill the
-                # trading cycle, so fall back to [] (decide then uses its own
-                # logged planned-entry risk). The errback is attached BEFORE
-                # this joins the gatherResults call below so a deal-list
-                # failure can never fail the other four reads (consumeErrors
-                # only protects against an UNCONSUMED failure spamming
-                # "Unhandled error in Deferred" -- it does not add
-                # per-deferred fallback values on its own).
-                d_deal_list = self._deal_list_step(now_ms - 24 * 3600 * 1000, now_ms)
-                d_deal_list.addErrback(lambda f: [])
-
-                # Fetched once per cycle (not per order) -- see _place_market_step's
-                # full_symbol param and bot/risk.py for how these two feed sizing.
-                #
-                # KNOWN GAP (documented, not fixed): unlike bot/s009_paper.py's
-                # drop_forming, nothing here excludes the most-recently-closed
-                # M1 bar even when the cycle queries it only seconds after it
-                # closed -- entry detection (strategies/ger40_lonfra/setups.py
-                # ::find_setup) trusts that bar's close at face value. Found
-                # live 2026-08-31 10:03 Kyiv: a B-down setup's live order used
-                # entry=26440.6 (from the bar closed 4s earlier) with
-                # tp=26442.6 -- cTrader rejected it (TRADING_BAD_STOPS: TP
-                # must be < entry on a SELL). The 10:05 cycle re-scanned with
-                # 2 more bars available and resolved the SAME setup as
-                # already-tp'd at entry=26469.1 -- a different bar than the
-                # one used 2 minutes earlier, consistent with that bar's
-                # close not having fully settled broker-side at query time.
-                # Even a perfect fix here likely wouldn't have caught this
-                # specific trade live: by 10:05 the whole move (entry->TP)
-                # had already happened within already-elapsed bars -- same
-                # "too fast for a 1-minute poll" class as the ghost-trade
-                # reasoning behind promoting WORKING_S007_LIQFLOOR (see that
-                # preset's own comment, decisions-log.md 2026-08-11/12). No
-                # code changed for this -- touching find_setup's bar window
-                # is a signal-engine behavior change and needs backtest
-                # validation (Gate 0/1) first, not a quick live patch.
-                t_parallel = time.monotonic()
-                try:
-                    full_symbol, balance, m1, positions, closed_deals = yield defer.gatherResults(
-                        [_timed(self._get_full_symbol_step(symbol), "full_symbol_ms"),
-                         _timed(self._get_balance_step(), "balance_ms"),
-                         _timed(self._get_m1_step(symbol, history_days), "m1_ms"),
-                         _timed(self._reconcile_step(), "reconcile_ms"),
-                         _timed(d_deal_list, "deal_list_ms")],
-                        consumeErrors=True)
-                except defer.FirstError as fe:
-                    # Unwrap: a bare FirstError hides which of the 4 required
-                    # reads actually failed and why (deal_list can't reach
-                    # here, its own errback above already turned failure into
-                    # a successful [] -- so a FirstError only ever means one
-                    # of full_symbol/balance/m1/reconcile genuinely failed).
-                    raise fe.subFailure.value from fe.subFailure.value
-                timings["parallel_read_ms"] = round((time.monotonic() - t_parallel) * 1000, 1)
-                t = time.monotonic()
-                # Correct in THIS SYMBOL's own quote currency (EUR for
-                # GER40/DE40) -- NOT yet converted to the account's deposit
-                # currency. bot/s007_paper.py::decide() applies that
-                # conversion (C.EUR_TO_USD_FX_RATE_APPROX) before using this
-                # for any risk math; see decisions-log.md 2026-07-23.
-                money_per_point_per_lot = full_symbol.lotSize
-
-                actions = decide(symbol, m1, positions, balance, money_per_point_per_lot,
-                                 closed_deals=closed_deals,
-                                 broker_min_lot=broker_min_lot(full_symbol))
-                # decide() is pure Python (no I/O, see its own docstring) --
-                # timed anyway so a slow cycle can be told apart from "the
-                # engine itself is slow" vs. "the network/broker is slow"
-                # instead of assuming it's always the latter.
-                timings["decide_ms"] = round((time.monotonic() - t) * 1000, 1)
-
-                results = []
-                placed_ok = False
-                action_timings = []
-                for a in actions:
-                    t_action = time.monotonic()
-                    try:
-                        if a["kind"] == "place":
-                            r = yield self._place_market_step(
-                                symbol, a["side"], a["sl"], a["tp"], a["volume_lots"], a["label"],
-                                full_symbol=full_symbol)
-                            placed_ok = True
-                        elif a["kind"] == "amend":
-                            r = yield self._amend_position_sltp_step(
-                                a["position_id"], a["sl"], a["tp"],
-                                digits=full_symbol.digits)
-                        else:
-                            r = yield self._close_position_step(a["position_id"], a["volume"])
-                        results.append(dict(action=a, result=r, error=None))
-                    except Exception as e:
-                        results.append(dict(action=a, result=None, error=e))
-                    action_timings.append(dict(
-                        kind=a["kind"], label=a.get("label"),
-                        duration_ms=round((time.monotonic() - t_action) * 1000, 1)))
-                timings["actions_total_ms"] = round(
-                    sum(x["duration_ms"] for x in action_timings), 1)
-
-                # ALGODEV-39: a fresh placement's REAL fill price/stop is only
-                # ever visible via reconcile() -- the `positions` snapshot
-                # above was fetched BEFORE this cycle's own orders, and the
-                # NewOrderReq response only carries positionId (see
-                # bot/s007_paper.py's `pid` extraction), not price. One extra
-                # reconcile call, same session, only when this cycle actually
-                # placed something, so the caller can log/use the broker's
-                # real entry immediately instead of waiting a full cycle for
-                # `have` to catch up. A fetch failure here must not fail
-                # orders that already succeeded -- fall back to the
-                # pre-orders snapshot (caller then falls back to its own
-                # planned values, same as before this existed).
-                post_positions = positions
-                t = time.monotonic()
-                if placed_ok:
-                    try:
-                        post_positions = yield self._reconcile_step()
-                    except Exception:
-                        post_positions = positions
-                timings["post_reconcile_ms"] = round((time.monotonic() - t) * 1000, 1)
-
-                # self._session_timings (connect_ms/app_auth_ms/account_auth_ms)
-                # was populated by CTraderAdapter._run before flow() started --
-                # merge last so a caller sees one flat dict for the whole
-                # session, not two.
-                timings.update(self._session_timings)
-
-                return dict(symbol=symbol, m1=m1, positions=positions,
-                            post_positions=post_positions,
-                            actions=actions, results=results, balance=balance,
-                            money_per_point_per_lot=money_per_point_per_lot,
-                            timings=timings, action_timings=action_timings)
-
-            d = flow()
+            d = self.live_tick_step(symbol_candidates, history_days, decide)
             d.addCallbacks(lambda r: done(r), lambda f: done(error=f))
         return self._run(work)
 
-    # ---------- ALGODEV-45 step 2: persistent-session observation daemon ----------
+    @defer.inlineCallbacks
+    def live_tick_step(self, symbol_candidates, history_days: int, decide):
+        """The body of ONE live cycle, on an already-connected session.
+
+        Split out of run_live_cycle (ALGODEV-45 step 4) so the persistent
+        daemon and the per-minute cold-connect worker execute the SAME code;
+        the only difference between them is who owns the connection. Returns
+        run_live_cycle's result dict -- see that method for the full contract.
+        """
+        # ALGODEV-44: per-step wall-clock timings, to find out where
+        # the reported up-to-20s cycle time actually goes (network
+        # round trips, the SDK's own send-queue throttle, or decide()
+        # itself) -- Phase 0. Confirmed live (2026-09-16/17) that the
+        # SDK's send-queue throttle, not decide() or real network
+        # latency, dominates -- see the parallel-reads block below
+        # (Phase 1) for the fix that follows from that. `t` is reset
+        # after each SEQUENTIALLY measured step; self._session_timings
+        # (connect/app-auth/account-auth, populated by
+        # CTraderAdapter._run before flow() ever starts) is merged in
+        # at the end so callers get one complete picture.
+        timings: dict = {}
+        t = time.monotonic()
+
+        yield self._load_symbols()
+        timings["load_symbols_ms"] = round((time.monotonic() - t) * 1000, 1)
+        t = time.monotonic()
+
+        up = {n.upper() for n in self._symbols.keys()}
+        symbol = None
+        for c in symbol_candidates:
+            if c.upper() in up:
+                symbol = c
+                break
+        if symbol is None:
+            raise RuntimeError(
+                f"none of {symbol_candidates} found; broker symbols "
+                f"e.g. {sorted(self._symbols.keys())[:15]}")
+
+        # ALGODEV-44 Phase 1: the five reads below (contract metadata,
+        # balance, M1 bars, open positions, closing deals) depend only
+        # on _load_symbols() above, not on each other -- confirmed by
+        # live timings (2026-09-16/17): each cost ~0.75-1.2s fired
+        # sequentially, dominated by the ctrader-open-api SDK's own
+        # send-queue throttle (TcpProtocol._sendStrings, a 1s
+        # LoopingCall flushing up to 5 queued messages -- see
+        # client.py/tcpProtocol.py in the installed SDK), not real
+        # network/server latency (a plain balance query and a full M1
+        # history fetch cost almost the same). Firing them together
+        # via gatherResults lets the SDK flush most of them in the
+        # SAME 1s tick instead of one tick each -- ~6s of sequential
+        # reads measured live collapsing toward ~1-2s. `_timed` records
+        # each one's OWN elapsed time (not shared/reset like the
+        # `t`-based timings elsewhere in this method), since they now
+        # resolve concurrently, not in sequence.
+        def _timed(d, key):
+            t0 = time.monotonic()
+
+            def record(result):
+                timings[key] = round((time.monotonic() - t0) * 1000, 1)
+                return result
+            d.addCallback(record)
+            return d
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        # Closing deals over the last 24h: the only place a position
+        # that opened AND closed between two reconcile snapshots still
+        # exists, with its real fill price. decide() matches them to
+        # its own opened-today labels by position_id for the
+        # day-level risk budget (see bot/s007_paper.py::decide,
+        # 2026-09-02 incident) -- a fetch failure must not kill the
+        # trading cycle, so fall back to [] (decide then uses its own
+        # logged planned-entry risk). The errback is attached BEFORE
+        # this joins the gatherResults call below so a deal-list
+        # failure can never fail the other four reads (consumeErrors
+        # only protects against an UNCONSUMED failure spamming
+        # "Unhandled error in Deferred" -- it does not add
+        # per-deferred fallback values on its own).
+        d_deal_list = self._deal_list_step(now_ms - 24 * 3600 * 1000, now_ms)
+        d_deal_list.addErrback(lambda f: [])
+
+        # Fetched once per cycle (not per order) -- see _place_market_step's
+        # full_symbol param and bot/risk.py for how these two feed sizing.
+        #
+        # KNOWN GAP (documented, not fixed): unlike bot/s009_paper.py's
+        # drop_forming, nothing here excludes the most-recently-closed
+        # M1 bar even when the cycle queries it only seconds after it
+        # closed -- entry detection (strategies/ger40_lonfra/setups.py
+        # ::find_setup) trusts that bar's close at face value. Found
+        # live 2026-08-31 10:03 Kyiv: a B-down setup's live order used
+        # entry=26440.6 (from the bar closed 4s earlier) with
+        # tp=26442.6 -- cTrader rejected it (TRADING_BAD_STOPS: TP
+        # must be < entry on a SELL). The 10:05 cycle re-scanned with
+        # 2 more bars available and resolved the SAME setup as
+        # already-tp'd at entry=26469.1 -- a different bar than the
+        # one used 2 minutes earlier, consistent with that bar's
+        # close not having fully settled broker-side at query time.
+        # Even a perfect fix here likely wouldn't have caught this
+        # specific trade live: by 10:05 the whole move (entry->TP)
+        # had already happened within already-elapsed bars -- same
+        # "too fast for a 1-minute poll" class as the ghost-trade
+        # reasoning behind promoting WORKING_S007_LIQFLOOR (see that
+        # preset's own comment, decisions-log.md 2026-08-11/12). No
+        # code changed for this -- touching find_setup's bar window
+        # is a signal-engine behavior change and needs backtest
+        # validation (Gate 0/1) first, not a quick live patch.
+        t_parallel = time.monotonic()
+        try:
+            full_symbol, balance, m1, positions, closed_deals = yield defer.gatherResults(
+                [_timed(self._get_full_symbol_step(symbol), "full_symbol_ms"),
+                 _timed(self._get_balance_step(), "balance_ms"),
+                 _timed(self._get_m1_step(symbol, history_days), "m1_ms"),
+                 _timed(self._reconcile_step(), "reconcile_ms"),
+                 _timed(d_deal_list, "deal_list_ms")],
+                consumeErrors=True)
+        except defer.FirstError as fe:
+            # Unwrap: a bare FirstError hides which of the 4 required
+            # reads actually failed and why (deal_list can't reach
+            # here, its own errback above already turned failure into
+            # a successful [] -- so a FirstError only ever means one
+            # of full_symbol/balance/m1/reconcile genuinely failed).
+            raise fe.subFailure.value from fe.subFailure.value
+        timings["parallel_read_ms"] = round((time.monotonic() - t_parallel) * 1000, 1)
+        t = time.monotonic()
+        # Correct in THIS SYMBOL's own quote currency (EUR for
+        # GER40/DE40) -- NOT yet converted to the account's deposit
+        # currency. bot/s007_paper.py::decide() applies that
+        # conversion (C.EUR_TO_USD_FX_RATE_APPROX) before using this
+        # for any risk math; see decisions-log.md 2026-07-23.
+        money_per_point_per_lot = full_symbol.lotSize
+
+        actions = decide(symbol, m1, positions, balance, money_per_point_per_lot,
+                         closed_deals=closed_deals,
+                         broker_min_lot=broker_min_lot(full_symbol))
+        # decide() is pure Python (no I/O, see its own docstring) --
+        # timed anyway so a slow cycle can be told apart from "the
+        # engine itself is slow" vs. "the network/broker is slow"
+        # instead of assuming it's always the latter.
+        timings["decide_ms"] = round((time.monotonic() - t) * 1000, 1)
+
+        results = []
+        placed_ok = False
+        action_timings = []
+        for a in actions:
+            t_action = time.monotonic()
+            try:
+                if a["kind"] == "place":
+                    r = yield self._place_market_step(
+                        symbol, a["side"], a["sl"], a["tp"], a["volume_lots"], a["label"],
+                        full_symbol=full_symbol)
+                    placed_ok = True
+                elif a["kind"] == "amend":
+                    r = yield self._amend_position_sltp_step(
+                        a["position_id"], a["sl"], a["tp"],
+                        digits=full_symbol.digits)
+                else:
+                    r = yield self._close_position_step(a["position_id"], a["volume"])
+                results.append(dict(action=a, result=r, error=None))
+            except Exception as e:
+                results.append(dict(action=a, result=None, error=e))
+            action_timings.append(dict(
+                kind=a["kind"], label=a.get("label"),
+                duration_ms=round((time.monotonic() - t_action) * 1000, 1)))
+        timings["actions_total_ms"] = round(
+            sum(x["duration_ms"] for x in action_timings), 1)
+
+        # ALGODEV-39: a fresh placement's REAL fill price/stop is only
+        # ever visible via reconcile() -- the `positions` snapshot
+        # above was fetched BEFORE this cycle's own orders, and the
+        # NewOrderReq response only carries positionId (see
+        # bot/s007_paper.py's `pid` extraction), not price. One extra
+        # reconcile call, same session, only when this cycle actually
+        # placed something, so the caller can log/use the broker's
+        # real entry immediately instead of waiting a full cycle for
+        # `have` to catch up. A fetch failure here must not fail
+        # orders that already succeeded -- fall back to the
+        # pre-orders snapshot (caller then falls back to its own
+        # planned values, same as before this existed).
+        post_positions = positions
+        t = time.monotonic()
+        if placed_ok:
+            try:
+                post_positions = yield self._reconcile_step()
+            except Exception:
+                post_positions = positions
+        timings["post_reconcile_ms"] = round((time.monotonic() - t) * 1000, 1)
+
+        # self._session_timings (connect_ms/app_auth_ms/account_auth_ms)
+        # was populated by CTraderAdapter._run before this step started --
+        # merge last so a caller sees one flat dict for the whole
+        # session, not two. SKIPPED in persistent mode (ALGODEV-45 step 4):
+        # there the connect/auth was paid ONCE at daemon startup, so merging
+        # it here would re-report that one-off cost on every tick and make
+        # the persistent session look exactly as slow as the cold-connect
+        # path it replaces -- the opposite of the truth.
+        if not self._persistent:
+            timings.update(self._session_timings)
+        else:
+            timings["session_reused"] = True
+
+        return dict(symbol=symbol, m1=m1, positions=positions,
+                    post_positions=post_positions,
+                    actions=actions, results=results, balance=balance,
+                    money_per_point_per_lot=money_per_point_per_lot,
+                    timings=timings, action_timings=action_timings)
+
+    # ---------- ALGODEV-45: persistent session ----------
     #
-    # Everything below is NEW and ADDITIVE for scripts/s007_daemon.py's shadow-
-    # only observation loop -- run_live_cycle/_run above are NOT touched by any
-    # of this and remain the one and only path that can place/amend/close a
-    # real order. Deliberately duplicates (rather than shares/refactors) the
+    # Added at step 2 for scripts/s007_daemon.py's shadow/paper observation
+    # loop, which only ever calls the read-only shadow_tick_step below. Step 4
+    # (scripts/s007_live_daemon.py) additionally drives the REAL, order-placing
+    # live_tick_step on this same session -- that is the one and only way an
+    # order can leave this class, via run_live_cycle, whoever owns the
+    # connection. Deliberately duplicates (rather than shares/refactors) the
     # small connect+auth bootstrap that CTraderAdapter._run already has: that
     # method is the live trading path for BOTH S007 and S011, real money runs
     # through it every minute, and step 2's own plan (ALGODEV-45) is explicit
@@ -782,6 +831,7 @@ class CTraderS007(CTraderAdapter):
         self._ensure_fresh_token()
         self._session_timings = {}
         self._persistent_stopped = False
+        self._persistent = True
         t_start = time.monotonic()
 
         def mark(key: str, t0: float):

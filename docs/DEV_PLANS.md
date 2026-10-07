@@ -34,6 +34,21 @@ users, each with multiple broker accounts.
   worker would have to spawn a fresh subprocess per account per cycle
   anyway, meaning it degrades to the stateless-tick model with extra layers,
   not a real alternative.
+  **Revisited for S007 (ALGODEV-45, step 4 landed 2026-10-06).** Reason (3)
+  turned out to be backwards: the reactor only cannot be *restarted*, and a
+  daemon never restarts it — it starts one reactor and keeps it, which is
+  what makes a persistent session possible at all. ALGODEV-44 then measured
+  reason (1) honestly and found the connect+auth handshake, paid ~400 times
+  per S007 session, dominated cycle time. S007 now runs as
+  `scripts/s007_live_daemon.py` (compose service `s007-live-daemon`,
+  `--profile s007-live`): one session for the whole trading session, one
+  cycle per tick, calling the unchanged `webapp/runner.py::_worker_s007`
+  with the open client injected. The stateless Ofelia tick is deliberately
+  kept enabled as a fallback and `webapp/runner.py::cycle_lock` guarantees
+  only one of the two can trade an account at a time. This is a per-strategy
+  exception justified by S007's minute cadence, NOT a reversal of the
+  default: S009/S011/S021 are daily/low-cadence and stay stateless, where
+  reasons (1) and (2) still hold.
 - **Granularity = one job per STRATEGY, not per account or per user.** Each
   scheduled tick queries the DB fresh for all `enabled=true` accounts
   belonging to that strategy and fans them out **in parallel** (concurrent

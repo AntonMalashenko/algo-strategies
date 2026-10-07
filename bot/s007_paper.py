@@ -608,7 +608,8 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
                           daily_risk_cap_pct: float | None = None, fx_rate: float | None = None,
                           stop_flag_active=None, initial_balance: float | None = None,
                           broker_mode: str = BROKER_MODE_EXECUTE,
-                          account_limits=None, on_token_refreshed=None) -> dict:
+                          account_limits=None, on_token_refreshed=None,
+                          api=None) -> dict:
     """One S007 reconcile cycle for an arbitrary account, reusing the exact
     decide()/reconcile logic `live()` below uses for the single .env/
     accounts.yml-configured account -- so a DB-registered multi-account run
@@ -656,6 +657,14 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     `skip_account_guard` event if it would breach it. None = no guard,
     behaviour unchanged.
 
+    `api` (ALGODEV-45 step 4): an ALREADY-CONNECTED CTraderS007 whose session
+    is held open by a daemon (scripts/s007_live_daemon.py). None -- every
+    caller before that step, and the CLI still -- constructs a throwaway
+    client here and pays a fresh connect+auth for this one cycle. Everything
+    after this line is identical either way: the daemon exists to change who
+    owns the socket, not what the strategy does, so there is exactly one
+    implementation of the trading rules and one of the result handling.
+
     Returns dict(cycle_id, actions, error, day_done, in_window, filtered,
     manual_stop) -- actions is a list of dicts, each one of
     {kind: "open", label, side, entry, sl, tp, is_add, volume_lots},
@@ -689,7 +698,7 @@ def run_cycle_for_account(creds: dict | None, *, preset: str, risk_pct: float, f
     # get swallowed into the per-cycle except below and silently re-logged
     # every minute forever. Real incident 2026-07-29, see
     # tests/configs/test_accounts_yaml.py and decisions-log.md.
-    api = CTraderS007(creds=creds, on_token_refreshed=on_token_refreshed)
+    api = api or CTraderS007(creds=creds, on_token_refreshed=on_token_refreshed)
     error = None
     try:
         cyc = api.run_live_cycle(symbol_candidates, history_days, decide)

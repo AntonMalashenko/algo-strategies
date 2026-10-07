@@ -144,4 +144,17 @@ log.position(label, "open", ...); log.order(label, "place_market", request=..., 
   launchd (`scripts/com.anton.algo.s007bot.plist`,
   `scripts/s007_loop_install.sh install|uninstall|status`) — see "Risk
   controls" above for how it consumes `day_done`/`filtered`/`manual_stop`.
+- `scripts/s007_live_daemon.py` — the current live driver (ALGODEV-45 step
+  4): holds ONE cTrader session open for the whole trading session and runs
+  one cycle per tick on it, instead of paying a fresh connect + auth every
+  minute. It runs the same `webapp/runner.py::_worker_s007` the stateless
+  tick does, with the open client injected — no strategy logic lives in the
+  daemon. Started as the `s007-live-daemon` compose service
+  (`podman compose --profile s007-live up -d s007-live-daemon`); the Ofelia
+  tick stays enabled as a fallback and `webapp/runner.py::cycle_lock` makes
+  sure only one of the two ever trades the account.
+- `scripts/s007_daemon.py` — the non-trading sibling: same persistent
+  session, but shadow/paper only (`--paper` books to a virtual
+  `PaperBook`). Cannot place an order, asserted by
+  `tests/test_s007_paper_book.py`.
 - Spec: `strategy-spec-S007.md` (project) / `GER40-london-frankfurt/algo/docs/`.

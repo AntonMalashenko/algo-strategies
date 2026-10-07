@@ -232,10 +232,13 @@ def apply_snapshot(session, acc: Account, strat: Strategy, snap: dict,
 
 
 def sync_account_strategy(session, link: AccountStrategy,
-                          days: int = DEFAULT_LOOKBACK_DAYS) -> dict:
+                          days: int = DEFAULT_LOOKBACK_DAYS, api=None) -> dict:
     """Read the broker for one (account, strategy) row and fold it into the
     DB. Commits. Raises on a broker/credential failure -- the caller decides
-    whether that is fatal (worker) or merely logged (end of trading cycle)."""
+    whether that is fatal (worker) or merely logged (end of trading cycle).
+
+    `api` (ALGODEV-45 step 4): an already-connected CTraderS007 to read
+    through, instead of opening a throwaway session here."""
     from webapp.runner import _log_event   # local: keeps this module importable
                                            # (and unit-testable) without bot/
 
@@ -255,8 +258,13 @@ def sync_account_strategy(session, link: AccountStrategy,
     # (this sync runs as its own subprocess right after them, on the same
     # account) -- it used to pass only the bare access token, so it could
     # neither refresh nor survive a token the worker had just rotated.
-    api = CTraderS007(creds=fresh_ctrader_creds(session, acc),
-                      on_token_refreshed=token_persister(session, acc))
+    #
+    # ALGODEV-45 step 4: `api` is passed in (already connected) when the S007
+    # live daemon runs this in-process on its persistent session, which also
+    # makes the credential work above unnecessary -- that session was already
+    # authenticated, with a token renewed on a day-long leeway at startup.
+    api = api or CTraderS007(creds=fresh_ctrader_creds(session, acc),
+                             on_token_refreshed=token_persister(session, acc))
 
     snap = api.sync_snapshot(days=days)
     n = apply_snapshot(session, acc, strat, snap)
