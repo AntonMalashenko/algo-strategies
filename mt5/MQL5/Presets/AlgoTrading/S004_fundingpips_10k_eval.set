@@ -20,8 +20,11 @@
 ; backtest/run_s004_guard_modes.py.
 ;
 ; InpServerTzRule is the BROKER's rule (EET with US DST on prop servers), not
-; S004's own clock -- the runtime converts. The EA's `init` event logs
-; server_offset_expected_s and server_offset_observed_s: they must agree.
+; S004's own clock -- the runtime converts. Unlike S021, S004 does NOT verify
+; this against the terminal, so getting it wrong fails silently: the Asia window
+; moves by an hour for the weeks the US and EU DST calendars disagree. Check it
+; against S021's `init` event on the same server, which logs
+; server_offset_expected_s and server_offset_observed_s.
 ;
 ; Attach to ONE chart, any symbol, any timeframe. The EA subscribes to all seven
 ; pairs itself and refuses a second instance with the same magic.

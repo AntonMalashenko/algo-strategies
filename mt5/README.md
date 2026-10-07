@@ -267,10 +267,16 @@ the EA spent the wrong number of slots and still fails.
   input, no rebuild — once enough real fills have been through
   `s004_parity.py` with acceptable slippage and no `FAIL_*`.
 - **`InpServerTzRule` is the broker's rule**, not S004's own clock. Prop servers
-  are normally EET with US DST (`2`); the runtime converts. The `init` event
-  logs `server_offset_expected_s` and `server_offset_observed_s` — they must
-  agree, or the Asia window moves by an hour on the weeks the two DST calendars
-  disagree.
+  are normally EET with US DST (`2`); the runtime converts. Unlike S021, S004
+  does **not** verify it against the terminal, so a wrong rule fails silently and
+  moves the Asia window by an hour on the weeks the two DST calendars disagree.
+  Check it against S021's `init` event on the same server, which logs
+  `server_offset_expected_s` and `server_offset_observed_s`.
+- **The tester and the live EA share one log folder** when the login is the
+  same, because the folder is named after the account. A Strategy Tester pass
+  calls `ResetTradesCsvForTester` and **wipes** `<strategy>_trades.csv` — copy
+  the live file away before re-running a shadow pass, and pass `--since` to
+  `s004_parity.py` so live rows are not compared against the shadow window.
 - **One chart only.** A second copy with the same magic is refused
   (`InstanceLock`), because both would park limits on the same zones.
 - `InpRiskPct` × `InpMaxTradesPerDay` is the worst planned day; the EA refuses
