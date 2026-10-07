@@ -42,7 +42,8 @@ mt5/
                                  pure (no orders, no account) so it can be diffed bar for bar
           Runtime.mqh            S004 live layer: parks one limit per symbol on the zone the
                                  engine would take next, keeps virtual (out-of-session or
-                                 over-cap) trades order-free, replays warmup bars on restart
+                                 over-cap) trades order-free, replays warmup bars on restart,
+                                 and appends every closed trade to <strategy>_trades.csv
     Experts/AlgoTrading/
       S021_ORB.mq5               thin EA shell: inputs + event wiring
       S004_FVG.mq5               thin EA shell: risk/daily-cap inputs + event wiring
@@ -64,6 +65,7 @@ mt5/
     s021_parity.py               engine vs EA on the broker's own bars
     s004_clock_probe.py          measures which timezone the S004 data is stamped in
     s004_fixtures.py             S004 self-test fixtures: the engine's bars + its trades
+    s004_parity.py               engine vs EA on the broker's own bars (shadow tester pass)
     run_selftest.sh              runs a *_SelfTest script headlessly in a throwaway terminal
                                  (built and compiled from the repo, never from the live terminal)
     compile.sh                   compiles every .mq5 from the repo in a throwaway terminal --
@@ -173,3 +175,63 @@ python -m mt5.tools.s021_parity \
 - **Keep the terminal running on this Mac.** Prop rules forbid VPS/VPN. Disable
   sleep (`pmset`/Energy settings) and add the terminal to login items.
   `heartbeat.json` updates every 60 s, so it can be monitored.
+
+## S004 workflow (ALGODEV-62)
+
+One chart, any symbol: the expert reads all seven `S004_SYMBOLS` itself and
+counts the daily cap across them. Build and test from the repo — the sandbox
+scripts never write into the terminal that is trading.
+
+```bash
+# 1. regenerate the header from the Python source of truth, then the fixtures
+.venv/bin/python -m mt5.tools.gen_params
+.venv/bin/python -m mt5.tools.s004_fixtures
+
+# 2. build everything in a throwaway terminal (never deploy.sh while S021 trades)
+bash mt5/tools/compile.sh
+
+# 3. the engine port, bar for bar, against the Python trade list
+bash mt5/tools/run_selftest.sh          # expect 12132 passed, 0 failed, 1102 trades
+```
+
+### Shadow pass + parity (phase D)
+
+The self-test proves `Engine.mqh`; the shadow pass proves the live layer around
+it — the Asia-window filter, the portfolio-wide daily cap and its symbol-name
+tie-break — without sending a single order.
+
+1. **Tester.** Strategy Tester → `Experts/AlgoTrading/S004_FVG`, any of the seven
+   symbols as the chart symbol, M15, model "1 minute OHLC" (the EA only ever
+   reads closed M15 bars, so ticks buy nothing), preset
+   `Presets/AlgoTrading/S004_tester_shadow.set`. It sets
+   `InpTradeEnabled=false`: engines, logs and the cap all run, no order is sent.
+   Set `InpServerTzRule` to the **broker's** rule, not the strategy's — S004
+   decides on its own EET/EEST-with-European-DST clock and `Runtime.mqh`
+   converts. The pass rewrites `<strategy>_trades.csv` from scratch.
+2. **Bars.** Run `Scripts/AlgoTrading/ExportM1` once per pair (`InpSymbol`), over
+   at least the tested window.
+3. **Diff.**
+
+```bash
+.venv/bin/python -m mt5.tools.s004_parity \
+  --bars "<Common>/Files/AlgoTrading/exports" \
+  --ea-trades "<Common>/Files/AlgoTrading/logs/S004-mt5-acct<login>/S004-mt5-acct<login>_trades.csv" \
+  --rule EET_US_DST --out reports/s004_mt5_parity.csv
+```
+
+Exit code 0 means every trade matched on price, exit and R *and* on whether the
+live layer would have taken it. `ea_missed_fill` and `ea_halted` are reported
+but not failed — they are live-only outcomes the backtest cannot have. Anything
+`FAIL_*` is a real divergence.
+
+### Live checklist (S004, prop account)
+
+- **One chart only.** A second copy with the same magic is refused
+  (`InstanceLock`), because both would park limits on the same zones.
+- `InpRiskPct` × `InpMaxTradesPerDay` is the worst planned day; the EA refuses
+  to start if it exceeds `S004_DAILY_RISK_BUDGET_PCT` (S004's share of the
+  firm's −5% daily limit). The default pair is 2 × 1.00%.
+- **Check the `init` event**: `params` (the config sha), the symbol count, the
+  warmup size, `trade_enabled`, and the trades-CSV path.
+- Resting limits are deliberately left in place on deinit; `AdoptPositions`
+  picks them back up after a reattach.

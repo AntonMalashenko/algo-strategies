@@ -35,6 +35,21 @@
 //|    bars, which rebuilds the same zones, the same lock and the    |
 //|    same open position the running instance had. Open positions   |
 //|    are then re-adopted by magic+symbol.                          |
+//|                                                                  |
+//| Two clocks. Everything the STRATEGY decides -- the Asia window,  |
+//| the 22:45 cutoff, the day the cap is counted in -- runs on the   |
+//| session clock (S004_CLOCK_TZ_RULE, the EET/EEST the backtest     |
+//| bars are stamped in), so bar times are converted on the way into |
+//| the engine. The broker's own clock is only where bars and        |
+//| positions are read from. A broker whose server rule differs from |
+//| the session rule (EET_US_DST is the common one) would otherwise  |
+//| shift the whole session by an hour for the weeks the two DST     |
+//| calendars disagree -- that is the ALGODEV-61 bug, not a shortcut.|
+//|                                                                  |
+//| Parity input. Every closed engine trade is appended to           |
+//| <strategy>_trades.csv with the status that says whether an order |
+//| backed it; mt5/tools/s004_parity.py diffs that file against the  |
+//| Python engine re-run on the broker's own bars (phase D).         |
 //+------------------------------------------------------------------+
 #ifndef STRATEGIES_S004_FVG_RUNTIME_MQH
 #define STRATEGIES_S004_FVG_RUNTIME_MQH
@@ -54,6 +69,22 @@
 #define S004_MIN_WARMUP_BARS      400     // >= 4 H4 bars + the 96-bar zone window, with room
 #define S004_PIP_POINTS           10      // an FX pip is ten points on a 3/5-digit feed
 #define S004_PRICE_DIGITS         6       // log prices at tick resolution, not lot resolution
+#define S004_CSV_PRICE_DIGITS     8       // the parity CSV: same precision as the Python fixtures
+#define S004_CSV_R_DIGITS         6
+#define S004_CSV_LOT_DIGITS       4
+#define S004_TRADES_CSV_SUFFIX    "_trades.csv"
+#define S004_TRADES_CSV_HEADER    "symbol,time_in,time_out,dir,entry,sl,tp,exit,r,exit_reason," \
+                                  "hour,status,fill,lots,ticket,pip,cost"
+
+// What the live layer did with a trade the engine took. The first two are the
+// backtest's own "not taken" reasons and must match it exactly; the rest are
+// live-only outcomes mt5/tools/s004_parity.py reports but does not fail on.
+#define S004_STATUS_TAKEN         "taken"           // a real position mirrored the engine
+#define S004_STATUS_SHADOW        "shadow"          // would be taken, InpTradeEnabled=false
+#define S004_STATUS_MISSED_FILL   "missed_fill"     // would be taken, no position came back
+#define S004_STATUS_VIRTUAL_HOUR  "virtual_hour"    // outside the Asia entry window
+#define S004_STATUS_VIRTUAL_CAP   "virtual_cap"     // the daily cap was already spent
+#define S004_STATUS_VIRTUAL_HALT  "virtual_halt"    // the account guard had halted trading
 
 struct S004Settings
   {
@@ -65,6 +96,7 @@ struct S004Settings
    int               server_fixed_hours;
    int               warmup_bars;          // closed M15 bars replayed into each engine at init
    bool              trade_enabled;        // false: engines and logs run, no order is ever sent
+   bool              write_trades_csv;     // the mt5/tools/s004_parity.py input
    bool              log_to_common;
    AccountLimits     limits;
   };
@@ -76,12 +108,15 @@ struct S004Slot
    string            symbol;
    double            point;
    double            pip;
-   datetime          last_bar;             // last closed M15 bar fed to the engine
+   datetime          last_bar;             // last closed M15 bar fed to the engine, SERVER clock
    ulong             limit_ticket;         // resting entry limit, 0 = none
    int               limit_zone;           // the zone that limit belongs to, -1 = none
    double            limit_price;
    ulong             position_ticket;      // real position mirroring the engine's, 0 = virtual
-   datetime          position_day;         // server day the real entry was counted in
+   datetime          position_day;         // session-clock day the entry was counted in
+   string            position_status;      // S004_STATUS_* of the engine position now open
+   double            position_fill;        // the real fill price, 0 when no order backed it
+   double            position_lots;
   };
 
 //+------------------------------------------------------------------+
@@ -106,6 +141,15 @@ private:
    static datetime   DayOf(const datetime stamp)
      {
       return (datetime)(((long)stamp / CLOCK_SECONDS_PER_DAY) * CLOCK_SECONDS_PER_DAY);
+     }
+
+   // Broker clock -> the clock the strategy is defined on. Both hops are
+   // DST-aware, so the Asia window stays put even in the weeks where the US
+   // and the EU have already/not yet switched.
+   datetime          ServerToClock(const datetime server_time) const
+     {
+      datetime utc=ClockLocalToUtc(m_cfg.server_rule,m_cfg.server_fixed_hours,server_time);
+      return ClockUtcToLocal(S004_CLOCK_TZ_RULE,0,utc);
      }
 
    static bool       InSession(const datetime bar_time)
@@ -200,7 +244,7 @@ private:
       request.Str("symbol",m_slot[i].symbol);
       request.Str("reason",reason);
       request.Int("ticket",(long)m_slot[i].limit_ticket);
-      m_log.Order(Label(i,m_slot[i].last_bar),"cancel_limit",cycle,result.ok,
+      m_log.Order(Label(i,ServerToClock(m_slot[i].last_bar)),"cancel_limit",cycle,result.ok,
                   request.Body(),result.message,IntegerToString(result.retcode));
       m_slot[i].limit_ticket=0;
       m_slot[i].limit_zone=-1;
@@ -230,9 +274,11 @@ private:
      }
 
    // Park (or re-park) the entry limit for the bar that is about to open.
-   void              ParkLimit(const int i,const datetime next_bar,const string cycle)
+   // `next_bar_server` is on the broker clock; the session test is not.
+   void              ParkLimit(const int i,const datetime next_bar_server,const string cycle)
      {
       CS004Engine *engine=m_engine[i];
+      datetime next_bar=ServerToClock(next_bar_server);
       bool wanted=m_cfg.trade_enabled && !m_halted && !engine.HasPosition()
                   && InSession(next_bar) && m_taken_today<m_cfg.max_trades_per_day;
       int index=wanted ? NextZone(i) : -1;
@@ -297,7 +343,7 @@ private:
       request.Str("symbol",m_slot[i].symbol);
       request.Str("reason",reason);
       request.Int("ticket",(long)m_slot[i].position_ticket);
-      m_log.Order(Label(i,m_slot[i].last_bar),"close_position",cycle,result.ok,
+      m_log.Order(Label(i,ServerToClock(m_slot[i].last_bar)),"close_position",cycle,result.ok,
                   request.Body(),result.message,IntegerToString(result.retcode));
       if(result.ok)
          m_slot[i].position_ticket=0;
@@ -312,7 +358,10 @@ private:
       engine.GetPosition(pos);
       bool in_session=InSession(pos.time_in);
       bool has_slot=m_taken_today<m_cfg.max_trades_per_day;
-      bool taken=in_session && has_slot && m_cfg.trade_enabled && !m_halted;
+      // What the BACKTEST would do -- deliberately free of trade_enabled, so a
+      // shadow run (InpTradeEnabled=false) spends the daily cap exactly as a
+      // live one does and mt5/tools/s004_parity.py can compare the two.
+      bool taken=in_session && has_slot && !m_halted;
       OwnPosition live;
       bool filled=FindPosition(i,live);
 
@@ -330,10 +379,16 @@ private:
 
       m_slot[i].limit_ticket=0;          // it either filled or is about to be re-parked
       m_slot[i].limit_zone=-1;
+      m_slot[i].position_ticket=0;
+      m_slot[i].position_fill=0.0;
+      m_slot[i].position_lots=0.0;
       if(!taken)
         {
          // Virtual: the engine holds the symbol, the account does not. A limit
          // that filled anyway (the cap ran out while it rested) is flattened.
+         m_slot[i].position_status=!in_session ? S004_STATUS_VIRTUAL_HOUR
+                                   : (m_halted ? S004_STATUS_VIRTUAL_HALT : S004_STATUS_VIRTUAL_CAP);
+         fields.Str("status",m_slot[i].position_status);
          if(filled)
            {
             m_slot[i].position_ticket=live.ticket;
@@ -342,18 +397,33 @@ private:
          m_log.Position(Label(i,pos.time_in),"open_virtual",cycle,fields.Body());
          return;
         }
+      // The slot is spent the moment the backtest counts the trade, whether or
+      // not an order ends up backing it: not counting a missed fill would let
+      // the day take an entry the backtest marked as over the cap.
+      m_taken_today++;
+      m_slot[i].position_day=DayOf(pos.time_in);
+      if(!m_cfg.trade_enabled)
+        {
+         m_slot[i].position_status=S004_STATUS_SHADOW;
+         fields.Str("status",S004_STATUS_SHADOW);
+         m_log.Position(Label(i,pos.time_in),"open_shadow",cycle,fields.Body());
+         return;
+        }
       if(!filled)
         {
          // The engine says the near edge was touched but no fill came back:
          // the limit was never parked (a restart mid-bar), or the broker
          // rejected it. Never chase with a market order -- the backtest's
          // price is gone; let this one be virtual and log it loudly.
+         m_slot[i].position_status=S004_STATUS_MISSED_FILL;
+         fields.Str("status",S004_STATUS_MISSED_FILL);
          m_log.Event("missed_fill",cycle,fields.Body(),ALGO_LOG_WARNING);
          return;
         }
       m_slot[i].position_ticket=live.ticket;
-      m_slot[i].position_day=DayOf(pos.time_in);
-      m_taken_today++;
+      m_slot[i].position_status=S004_STATUS_TAKEN;
+      m_slot[i].position_fill=live.price_open;
+      m_slot[i].position_lots=live.volume;
       // A gap through the limit fills better than the parked price, and the
       // engine derives both the stop and the target from the ACTUAL fill.
       double sl=SizingNormalizePrice(m_slot[i].symbol,pos.sl);
@@ -371,6 +441,7 @@ private:
          m_log.Order(Label(i,pos.time_in),"retarget_fill",cycle,result.ok,
                      request.Body(),result.message,IntegerToString(result.retcode));
         }
+      fields.Str("status",S004_STATUS_TAKEN);
       fields.Num("fill",live.price_open,S004_PRICE_DIGITS);
       fields.Num("lots",live.volume);
       m_log.Position(Label(i,pos.time_in),"open",cycle,fields.Body());
@@ -387,8 +458,11 @@ private:
       fields.Str("reason",trade.exit_reason);
       fields.Num("exit",trade.exit,S004_PRICE_DIGITS);
       fields.Num("r",trade.r);
+      fields.Str("status",m_slot[i].position_status);
       fields.Bool("virtual",m_slot[i].position_ticket==0);
       m_log.Position(Label(i,trade.time_in),"close",cycle,fields.Body());
+      FlushTradeRow(i,trade);
+      m_slot[i].position_status="";
       if(m_slot[i].position_ticket==0)
          return;
       OwnPosition live;
@@ -396,6 +470,60 @@ private:
          CloseReal(i,cycle,trade.exit_reason);   // cutoff, or an SL/TP that did not trigger
       else
          m_slot[i].position_ticket=0;            // the broker closed it on the attached SL/TP
+     }
+
+   //--- parity input ------------------------------------------------------
+   string            TradesCsvPath(void) const
+     {
+      return m_log.Dir()+"/"+m_cfg.strategy_name+S004_TRADES_CSV_SUFFIX;
+     }
+
+   // A tester pass must start from an empty file: the CSV is append-only (see
+   // FlushTradeRow) and the common folder survives between passes, so a second
+   // shadow run would otherwise hand s004_parity.py every trade twice.
+   void              ResetTradesCsvForTester(void) const
+     {
+      if(!m_cfg.write_trades_csv || !MQLInfoInteger(MQL_TESTER))
+         return;
+      FileDelete(TradesCsvPath(),m_cfg.log_to_common ? FILE_COMMON : 0);
+     }
+
+   // One line per closed engine trade, append-only: a trade is final when it
+   // closes, and the warmup replay is silent, so a restart cannot duplicate a
+   // row the way S021's per-day file could.
+   void              FlushTradeRow(const int i,const S004Trade &trade)
+     {
+      if(!m_cfg.write_trades_csv)
+         return;
+      int common=m_cfg.log_to_common ? FILE_COMMON : 0;
+      string path=TradesCsvPath();
+      bool fresh=!FileIsExist(path,common);
+      int handle=FileOpen(path,FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_SHARE_READ
+                          |FILE_SHARE_WRITE|common);
+      if(handle==INVALID_HANDLE)
+         return;
+      if(fresh)
+         FileWriteString(handle,S004_TRADES_CSV_HEADER+"\n");
+      FileSeek(handle,0,SEEK_END);
+      string row=StringFormat("%s,%s,%s,%d,%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%I64u,%s,%s\n",
+                              m_slot[i].symbol,
+                              TimeToString(trade.time_in,TIME_DATE|TIME_MINUTES),
+                              TimeToString(trade.time_out,TIME_DATE|TIME_MINUTES),
+                              trade.dir,
+                              DoubleToString(trade.entry,S004_CSV_PRICE_DIGITS),
+                              DoubleToString(trade.sl,S004_CSV_PRICE_DIGITS),
+                              DoubleToString(trade.tp,S004_CSV_PRICE_DIGITS),
+                              DoubleToString(trade.exit,S004_CSV_PRICE_DIGITS),
+                              DoubleToString(trade.r,S004_CSV_R_DIGITS),
+                              trade.exit_reason,trade.hour,
+                              m_slot[i].position_status,
+                              DoubleToString(m_slot[i].position_fill,S004_CSV_PRICE_DIGITS),
+                              DoubleToString(m_slot[i].position_lots,S004_CSV_LOT_DIGITS),
+                              m_slot[i].position_ticket,
+                              DoubleToString(m_engine[i].Pip(),S004_CSV_PRICE_DIGITS),
+                              DoubleToString(m_engine[i].Cost(),S004_CSV_PRICE_DIGITS));
+      FileWriteString(handle,row);
+      FileClose(handle);
      }
 
    //--- bar feed ----------------------------------------------------------
@@ -448,9 +576,10 @@ private:
          m_slot[i].last_bar=bar_time;   // nothing traded on this symbol in that slot
          return;
         }
+      m_slot[i].last_bar=bar.time;      // server clock: that is what iTime returns
+      bar.time=ServerToClock(bar.time); // the engine runs on the session clock
       RollDay(bar.time);
       ENUM_S004_EVENT event=m_engine[i].Feed(bar);
-      m_slot[i].last_bar=bar.time;
       if(event==S004_EVENT_OPEN || event==S004_EVENT_OPEN_AND_CLOSE)
          OnEngineOpen(i,bar,cycle);
       if(event==S004_EVENT_CLOSE || event==S004_EVENT_OPEN_AND_CLOSE)
@@ -538,10 +667,14 @@ public:
          m_slot[i].limit_price=0.0;
          m_slot[i].position_ticket=0;
          m_slot[i].position_day=0;
+         m_slot[i].position_status="";
+         m_slot[i].position_fill=0.0;
+         m_slot[i].position_lots=0.0;
          m_engine[i]=new CS004Engine();
          m_engine[i].Configure(symbol,m_slot[i].pip,SpreadPrice(i));
         }
       m_count=count;
+      ResetTradesCsvForTester();
       Warmup(warmup,cycle);
       AdoptPositions(cycle);
       CJsonFields fields;
@@ -551,6 +684,7 @@ public:
       fields.Num("risk_pct",m_cfg.risk_pct);
       fields.Int("cap",m_cfg.max_trades_per_day);
       fields.Bool("trade_enabled",m_cfg.trade_enabled);
+      fields.Str("trades_csv",m_cfg.write_trades_csv ? TradesCsvPath() : "");
       m_log.Event("init",cycle,fields.Body());
       return true;
      }
@@ -573,14 +707,14 @@ public:
          for(int k=0; k<copied; k++)
            {
             S004Bar bar;
-            bar.time=rates[k].time;
+            bar.time=ServerToClock(rates[k].time);
             bar.open=rates[k].open;
             bar.high=rates[k].high;
             bar.low=rates[k].low;
             bar.close=rates[k].close;
             RollDay(bar.time);
             m_engine[i].Feed(bar);               // silent: no orders, no logs
-            m_slot[i].last_bar=bar.time;
+            m_slot[i].last_bar=rates[k].time;
            }
         }
       m_taken_today=0;    // the replay's entries are history, not today's budget
@@ -596,7 +730,10 @@ public:
          if(!FindPosition(i,live))
             continue;
          m_slot[i].position_ticket=live.ticket;
-         m_slot[i].position_day=DayOf(live.time_server);
+         m_slot[i].position_day=DayOf(ServerToClock(live.time_server));
+         m_slot[i].position_status=S004_STATUS_TAKEN;
+         m_slot[i].position_fill=live.price_open;
+         m_slot[i].position_lots=live.volume;
          if(m_slot[i].position_day==m_day)
             m_taken_today++;
          CJsonFields fields;

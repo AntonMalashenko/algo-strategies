@@ -32,6 +32,10 @@ S004_INTRADAY  -- ALGODEV-62: the same frozen champion plus three prop rules,
                   Rules 1-2 are engine flags; rule 3 is portfolio-level and is
                   applied by backtest/run_s004_intraday.py, which is the only
                   place that sees all 7 pairs at once.
+S004_INTRADAY_CAP1 -- modifier, DEFAULT OFF: the same -2% daily budget spent on
+                  the first signal of the day only (1 x 2.00%). Better per
+                  trade, worse per challenge -- the verdict and its numbers sit
+                  on the preset itself.
 
 The two position-sizing dials
 -----------------------------
@@ -150,3 +154,21 @@ S004_INTRADAY = S004_BASE.with_(
     cost_inclusive_sizing=True,
     max_trades_per_day=MAX_TRADES_PER_DAY,
 )
+
+# Modifier: spend the whole daily budget on the FIRST signal of the day instead
+# of splitting it over the first two. Same planned worst day (-2%), different
+# shape: 1 x 2.00% rather than 2 x 1.00%.
+#
+# TESTED 2026-10-06 (backtest/run_s004_daily_cap.py) and NOT PROMOTED. The edge
+# is real and monotone -- the first signal of the day is the best one: cap 1
+# beats cap 2 on R per trade in every year since 2019, out of sample +0.259 vs
+# +0.164 R/trade, it survives a 1.15x stop stress, and it roughly doubles the
+# prop emulator's median outcome. The price is diversification: one trade a day
+# has no second trade to average with, so it busts the challenge about twice as
+# often (13.7 vs 6.9 blown attempts per 3 years in the same emulator).
+#
+# Default-off because the comparison is a re-cap of one finished trade list, not
+# a walk-forward: nothing here was re-fitted out of sample, so the gate in
+# strategy-lifecycle is not met. Promote it only after a walk-forward, and only
+# if the higher bust rate is acceptable for the account it would run on.
+S004_INTRADAY_CAP1 = S004_INTRADAY.with_(max_trades_per_day=1, risk_pct=2.0)

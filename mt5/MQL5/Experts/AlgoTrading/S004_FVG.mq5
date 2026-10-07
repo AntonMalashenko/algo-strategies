@@ -48,6 +48,7 @@ input group "Runtime"
 input long         InpMagic        = 4004;  // Magic number
 input int          InpWarmupBars   = 1000;  // Closed M15 bars replayed into each engine at start
 input bool         InpTradeEnabled = true;  // false = shadow mode: engines and logs run, no orders
+input bool         InpWriteTradesCsv = true; // Append every closed engine trade to <strategy>_trades.csv
 input bool         InpLogToCommon  = true;  // Write logs to the shared Common/Files folder
 input int          InpTimerSeconds = 5;     // Poll period, s
 
@@ -81,6 +82,7 @@ int OnInit()
    settings.server_fixed_hours=InpServerFixedHours;
    settings.warmup_bars=InpWarmupBars;
    settings.trade_enabled=InpTradeEnabled;
+   settings.write_trades_csv=InpWriteTradesCsv;
    settings.log_to_common=InpLogToCommon;
    settings.limits.initial_balance=InpInitialBalance;
    settings.limits.daily_loss_pct=InpDailyGuardPct;

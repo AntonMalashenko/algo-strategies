@@ -367,7 +367,12 @@ public:
      }
 
    string            Symbol(void) const { return m_symbol; }
+   // Pip and Cost are what the Python engine takes as `pip` and
+   // `spread_pips * pip`: they move the buffered stop and the R denominator, so
+   // mt5/tools/s004_parity.py re-runs the backtest with these exact values
+   // instead of the modelled ones -- hence the columns in the trades CSV.
    double            Pip(void)    const { return m_pip; }
+   double            Cost(void)   const { return m_cost; }
    datetime          LastBar(void)const { return m_last_bar; }
    bool              HasPosition(void) const { return m_pos.active; }
    bool              OpenedThisBar(void) const { return m_pos.opened_this_bar; }

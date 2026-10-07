@@ -1,0 +1,34 @@
+; S004 FVG -- shadow (parity) pass in the Strategy Tester. ALGODEV-62 phase D.
+;
+; What this preset is for: run the EA over broker history with the order layer
+; switched OFF, so the engine, the Asia-window filter and the portfolio-wide
+; daily cap all run and get written to <strategy>_trades.csv, but nothing is
+; ever sent to the market. mt5/tools/s004_parity.py then diffs that file
+; against strategies/fvg_mtf.py re-run on the same bars.
+;
+; InpTradeEnabled=false is the whole point -- do not flip it here. The account
+; guard is off as well: a guard halt is a live-only decision the backtest knows
+; nothing about, and it would show up as `ea_halted` rows in the report.
+;
+; InpServerTzRule must be the BROKER's rule, not the strategy's. S004 decides on
+; its own EET/EEST clock with EUROPEAN DST dates; the runtime converts. Most
+; prop servers are EET with US DST (=2) -- check the EA's `init` event, it logs
+; the observed offset. Getting this wrong moves the Asia window by an hour for
+; the weeks the two DST calendars disagree.
+;
+; Enum codes: ServerTzRule/DayResetRule 0=UTC 1=FIXED 2=EET_US_DST 3=EET_EU_DST 4=CET_EU_DST
+InpRiskPct=1.0
+InpMaxTradesPerDay=2
+InpInitialBalance=10000.0
+InpDailyGuardPct=0.0
+InpMaxGuardPct=0.0
+InpDayResetRule=1
+InpDayResetFixedHours=3
+InpServerTzRule=2
+InpServerFixedHours=0
+InpMagic=4004
+InpWarmupBars=1000
+InpTradeEnabled=false
+InpWriteTradesCsv=true
+InpLogToCommon=true
+InpTimerSeconds=60
