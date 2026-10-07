@@ -378,6 +378,87 @@ the account guard, which count per magic.
 
 ---
 
+## 7.2 Trading the same day by hand on another account
+
+A second account (another broker, a prop platform, a web terminal) can follow S021
+without running the EA there. Quotes do **not** need to be synchronised, and matching
+them against a reference feed is in fact the one way to get this wrong.
+
+The reason is the shape of the rule: only the session open `O` is a broker-specific
+price. The bands are `O ± k_range*ADR14` and the stop is `stop_adr_mult*ADR14` — pure
+distances off ADR14, the mean daily high-low of the same underlying index. Two brokers
+can quote the index hundreds of points apart (dividend adjustments, financing) and still
+agree on its daily range to within a fraction of a percent. So the open is read on the
+platform you actually trade, and ADR14 is carried over from the EA.
+
+`python -m mt5.tools.s021_manual --open <your 09:30 New York open>` does the arithmetic.
+It reads ADR14 from the newest `levels` event in the EA's log, which the EA writes at
+09:30:10 New York every session, so the number is current by construction; it says so
+loudly when the newest event is not today's. `--adr <value>` covers the EA being down.
+
+```
+S021 manual levels -- 2026-10-07 New York
+ADR14 334.279   (EA log, session 2026-10-06)
+
+  your open  O       31264.50
+  buy stop   U       31331.36   stop loss 31080.65
+  sell stop  L       31197.64   stop loss 31448.35
+  stop distance        250.71
+```
+
+Position size is deliberately not printed: contract units and value per point differ per
+platform, and a wrong size is a worse failure than no size.
+
+### Fully standalone, on the broker's own feed
+
+`s021_manual.py` still needs MT5 running somewhere for ADR14, and the open typed in.
+`python -m mt5.tools.s021_capital` removes both: started any time before the open, it
+works out when the New York open is, waits for it, pulls the history and the open from
+Capital.com's REST API and prints the same block. Credentials live in `.env`
+(`CAPITAL_API_KEY`, `CAPITAL_IDENTIFIER`, `CAPITAL_PASSWORD`, `CAPITAL_DEMO`) — see
+`.env.example`. `--search nasdaq` lists the epics if `US100` is not the right one.
+
+`CAPITAL_DEMO=1` selects the demo endpoint, but an API key only authenticates against an
+environment where the account actually exists: a key generated on the live platform
+answers `HTTP 401 {"errorCode":"error.null.accountId"}` on the demo host. Set
+`CAPITAL_DEMO=0` in that case — the tool issues no trading calls either way.
+
+Measured against the IC Markets USTEC export over 12 sessions (2026-09..10), Capital.com's
+`US100` is effectively the same instrument: opens differ by −1.3 points on average (worst
+8.9), session ranges by 3.6 points on ~322. ADR14 for 2026-10-06 came out 337.1 here
+against the EA's 334.3, a 0.9% gap — well inside the noise that matters for a 0.20×ADR14
+band.
+
+The open **must** come from the feed the orders will sit on, which is why this tool
+talks to the broker rather than to a free index feed. Measured over 493 sessions
+(2024-10..2026-10, `^NDX` against the IC Markets USTEC export): the index open sits
+between −34 and +41 points of the broker's open at the 5–95% range, versus a band
+half-width of ~67 points, because the cash index is still stale at 09:30:00 while its
+constituents open one by one. ADR14 does carry across feeds — the index understates the
+CFD's daily range by a stable 2.2% (σ 1.0%) — but the open does not.
+
+### To the phone
+
+`--telegram` (on either tool) also pushes the plan to a Telegram bot, with every order
+price in its own tap-to-copy monospace span. One-time setup: create the bot with
+@BotFather, put its token in `.env` as `TELEGRAM_BOT_TOKEN`, say Start to the bot, then
+
+```bash
+python -m utils.telegram      # prints the TELEGRAM_CHAT_ID line, then sends a test message
+```
+
+Without those two variables the tools print a one-line notice and carry on, so Telegram
+stays optional. The sender is `utils/telegram.py`, shared and not S021-specific — one bot
+is enough for every strategy, since each message names its own.
+
+What the EA does for free and a human has to do here: **cancel the opposite stop order
+the moment one fills** (there is no OCO across two independent orders, and both filling
+means double risk in opposite directions), cancel both if neither filled by the 14:29 New
+York cutoff, and close by the clock at 15:59 New York — no retail platform closes on a
+schedule.
+
+---
+
 ## 8. Troubleshooting
 
 | Symptom | Cause / fix |

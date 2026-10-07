@@ -63,6 +63,8 @@ mt5/
     clock.py                     the same tz rules as Clock.mqh (tested against zoneinfo)
     s021_fixtures.py             self-test fixtures from histdata + the engine
     s021_parity.py               engine vs EA on the broker's own bars
+    s021_manual.py               order prices for trading S021 by hand on another account
+    s021_capital.py              the same, fully standalone on Capital.com's own feed
     s004_clock_probe.py          measures which timezone the S004 data is stamped in
     s004_fixtures.py             S004 self-test fixtures: the engine's bars + its trades
     s004_parity.py               engine vs EA on the broker's own bars (shadow tester pass)
