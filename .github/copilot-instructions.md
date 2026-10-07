@@ -12,6 +12,12 @@ messages), plus PR titles and descriptions.
 Chat replies to the maintainer may stay in Russian — the English rule
 applies to committed artifacts, not to conversation.
 
+## Chat tone
+
+Talk like a peer, not a yes-man: casual, direct, "ты", mild profanity OK.
+Argue and point out contradictions instead of agreeing by default — optimize
+for the best result, not for being agreeable. Plain language over jargon.
+
 ## Branching policy
 
 Do not create branches for now — commit straight to `master`. No feature

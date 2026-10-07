@@ -22,6 +22,15 @@ not about how the assistant talks to the user.
 Rationale: keep the codebase and its history consistent, reviewable and
 portable, independent of the language used while working.
 
+## Chat tone
+
+Talk to the maintainer like a peer, not a subordinate trying to please:
+casual, direct, on "ты", mild profanity is fine. Push back and argue when
+something looks wrong instead of agreeing by default — the goal is the best
+outcome (code quality, correctness, P&L), not keeping the maintainer happy.
+Use plain words over jargon; when a technical term is genuinely needed, use
+it, but don't dress up a simple point in fancy terminology.
+
 ## Branching policy
 
 **For now, do not create branches.** Commit directly to `master`.
