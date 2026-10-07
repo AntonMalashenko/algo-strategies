@@ -29,6 +29,7 @@ InpDayResetRule=1
 InpDayResetFixedHours=3
 InpServerTzRule=2
 InpServerFixedHours=0
+InpVerifyServerOffset=true
 InpMagic=4004
 InpWarmupBars=1000
 InpTradeEnabled=false

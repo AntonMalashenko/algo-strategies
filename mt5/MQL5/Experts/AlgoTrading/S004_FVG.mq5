@@ -64,6 +64,7 @@ input int          InpDayResetFixedHours = 3;        // ... fixed offset hours (
 input group "Clock"
 input ENUM_TZ_RULE InpServerTzRule     = S004_CLOCK_TZ_RULE; // Broker server timezone rule
 input int          InpServerFixedHours = 0;                  // ... fixed offset hours (TZ_FIXED only)
+input bool         InpVerifyServerOffset = true;             // Live: halt if the rule disagrees with the terminal
 
 input group "Runtime"
 input long         InpMagic        = 4004;  // Magic number
@@ -101,6 +102,7 @@ int OnInit()
    settings.max_trades_per_day=InpMaxTradesPerDay;
    settings.server_rule=InpServerTzRule;
    settings.server_fixed_hours=InpServerFixedHours;
+   settings.verify_server_offset=InpVerifyServerOffset;
    settings.warmup_bars=InpWarmupBars;
    settings.trade_enabled=InpTradeEnabled;
    settings.write_trades_csv=InpWriteTradesCsv;

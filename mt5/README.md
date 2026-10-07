@@ -267,11 +267,12 @@ the EA spent the wrong number of slots and still fails.
   input, no rebuild — once enough real fills have been through
   `s004_parity.py` with acceptable slippage and no `FAIL_*`.
 - **`InpServerTzRule` is the broker's rule**, not S004's own clock. Prop servers
-  are normally EET with US DST (`2`); the runtime converts. Unlike S021, S004
-  does **not** verify it against the terminal, so a wrong rule fails silently and
-  moves the Asia window by an hour on the weeks the two DST calendars disagree.
-  Check it against S021's `init` event on the same server, which logs
-  `server_offset_expected_s` and `server_offset_observed_s`.
+  are normally EET with US DST (`2`); the runtime converts. `InpVerifyServerOffset`
+  (default on) checks the rule against the terminal at init and halts on a
+  mismatch — without it the failure is silent: the bars still arrive, they are
+  just labelled with the wrong hour, and the Asia window moves. The check is
+  live-only: `TimeGMT()` is not real inside the tester. Read
+  `server_offset_expected_s` and `server_offset_observed_s` in the `init` event.
 - **The tester and the live EA share one log folder** when the login is the
   same, because the folder is named after the account. A Strategy Tester pass
   calls `ResetTradesCsvForTester` and **wipes** `<strategy>_trades.csv` — copy

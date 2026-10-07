@@ -94,6 +94,7 @@ struct S004Settings
    int               max_trades_per_day;   // portfolio-wide cap on REAL entries (EA input)
    ENUM_TZ_RULE      server_rule;          // the broker clock the session hours are on
    int               server_fixed_hours;
+   bool              verify_server_offset; // live: halt if the rule disagrees with the terminal
    int               warmup_bars;          // closed M15 bars replayed into each engine at init
    bool              trade_enabled;        // false: engines and logs run, no order is ever sent
    bool              write_trades_csv;     // the mt5/tools/s004_parity.py input
@@ -676,6 +677,19 @@ public:
         }
       m_count=count;
       ResetTradesCsvForTester();
+      // The session hours are decided on S004's own clock, which ServerToClock()
+      // derives from the BROKER's rule. A wrong rule is silent: every bar still
+      // arrives, just labelled with the wrong hour, and the Asia window moves.
+      // TimeGMT() is not real inside the tester, so only live can be checked.
+      bool tester=(bool)MQLInfoInteger(MQL_TESTER);
+      int observed=tester ? 0 : ClockObservedServerOffsetSeconds();
+      int expected=ClockOffsetSecondsAtUtc(m_cfg.server_rule,m_cfg.server_fixed_hours,TimeGMT());
+      if(!tester && m_cfg.verify_server_offset && observed!=expected)
+        {
+         m_halted=true;
+         m_halt_reason=StringFormat("server offset mismatch: rule %s gives %d s, terminal shows %d s",
+                                    ClockRuleName(m_cfg.server_rule),expected,observed);
+        }
       Warmup(warmup,cycle);
       AdoptPositions(cycle);
       CJsonFields fields;
@@ -685,8 +699,19 @@ public:
       fields.Num("risk_pct",m_cfg.risk_pct);
       fields.Int("cap",m_cfg.max_trades_per_day);
       fields.Bool("trade_enabled",m_cfg.trade_enabled);
+      fields.Str("server_tz_rule",ClockRuleName(m_cfg.server_rule));
+      fields.Int("server_offset_expected_s",expected);
+      fields.Int("server_offset_observed_s",observed);
+      fields.Bool("tester",tester);
+      fields.Bool("halted",m_halted);
       fields.Str("trades_csv",m_cfg.write_trades_csv ? TradesCsvPath() : "");
-      m_log.Event("init",cycle,fields.Body());
+      m_log.Event("init",cycle,fields.Body(),m_halted ? ALGO_LOG_ERROR : ALGO_LOG_INFO);
+      if(m_halted)
+        {
+         CJsonFields halt;
+         halt.Str("reason",m_halt_reason);
+         m_log.Event("halted",cycle,halt.Body(),ALGO_LOG_ERROR);
+        }
       return true;
      }
 
