@@ -19,7 +19,7 @@
 #define EXPORT_CHUNK_BARS   50000
 #define EXPORT_SECONDS_PER_DAY 86400
 
-input string InpSymbol = "";    // Symbol (empty = chart symbol)
+input string InpSymbol = "";    // Symbol, or a comma-separated list (empty = chart symbol)
 input int    InpDays   = 800;   // Calendar days back from now
 
 string SafeName(const string text)
@@ -32,13 +32,12 @@ string SafeName(const string text)
    return out;
   }
 
-void OnStart()
+bool ExportSymbol(const string symbol)
   {
-   string symbol=(StringLen(InpSymbol)>0) ? InpSymbol : _Symbol;
    if(!SymbolSelect(symbol,true))
      {
       PrintFormat("ExportM1: symbol %s not available",symbol);
-      return;
+      return false;
      }
    datetime to_server=TimeTradeServer();
    datetime from_server=(datetime)((long)to_server-(long)InpDays*EXPORT_SECONDS_PER_DAY);
@@ -51,7 +50,7 @@ void OnStart()
    if(handle==INVALID_HANDLE)
      {
       PrintFormat("ExportM1: cannot open output (error %d)",GetLastError());
-      return;
+      return false;
      }
    FileWriteString(handle,"time_server,open,high,low,close,tick_volume,spread\n");
    int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
@@ -125,5 +124,31 @@ void OnStart()
       FileClose(spec);
      }
    PrintFormat("ExportM1: %I64d bars of %s written to <Common>/Files/%s.csv",written,symbol,base);
+   return true;
+  }
+
+// A parity check needs every symbol the strategy trades, on the same export
+// run; doing them one script launch at a time is seven chances to miss one.
+void OnStart()
+  {
+   string list=(StringLen(InpSymbol)>0) ? InpSymbol : _Symbol;
+   string symbols[];
+   int count=StringSplit(list,',',symbols);
+   if(count<=0)
+     {
+      Print("ExportM1: no symbol to export");
+      return;
+     }
+   int done=0;
+   for(int i=0;i<count;i++)
+     {
+      StringTrimLeft(symbols[i]);
+      StringTrimRight(symbols[i]);
+      if(StringLen(symbols[i])==0)
+         continue;
+      if(ExportSymbol(symbols[i]))
+         done++;
+     }
+   PrintFormat("ExportM1: %d of %d symbols exported",done,count);
   }
 //+------------------------------------------------------------------+

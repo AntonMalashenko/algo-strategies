@@ -18,6 +18,11 @@
 --since       ignore engine trades entered before this session-clock stamp.
               Default: the EA's first logged entry. The EA replays InpWarmupBars
               silently at start, so anything older is history it never reported.
+--ea-start    the first bar of the EA's run (the Strategy Tester's "from" date).
+              With --warmup-bars it trims the bars so the Python engine starts
+              from the same bar the EA's warmup did. Without it the engine sees
+              however much history happens to be exported, builds zones the EA
+              never had, and reports trades the EA could not have taken.
 
 Every trade is matched on (symbol, entry time) and checked on two levels:
 
@@ -121,6 +126,22 @@ def load_broker_bars(path: Path, rule: str, fixed_hours: int = 0) -> pd.DataFram
     m15 = m1.resample(M15).agg({"open": "first", "high": "max", "low": "min",
                                "close": "last", "volume": "sum"})
     return m15.dropna(subset=["close"])
+
+
+def trim_to_ea_history(bars: dict[str, pd.DataFrame], ea_start: pd.Timestamp,
+                      warmup_bars: int) -> dict[str, pd.DataFrame]:
+    """Drop bars older than the EA's own warmup window.
+
+    Zones survive for days, so an engine fed a deeper history than the EA was
+    carries state the EA never had. Trimming is positional, not calendar-based:
+    the EA replayed exactly `warmup_bars` CLOSED bars before its first one, and
+    how many days that spans depends on the symbol's trading hours.
+    """
+    trimmed = {}
+    for symbol, frame in bars.items():
+        start = frame.index.searchsorted(ea_start)
+        trimmed[symbol] = frame.iloc[max(start - warmup_bars, 0):]
+    return trimmed
 
 
 def engine_trades(bars: dict[str, pd.DataFrame], config, scales: dict[str, tuple]) -> pd.DataFrame:
@@ -290,6 +311,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--since", default=None,
                         help=f"session-clock stamp, {SERVER_TIME_FORMAT}")
     parser.add_argument("--until", default=None)
+    parser.add_argument("--ea-start", default=None,
+                        help=f"the EA run's first bar, {SERVER_TIME_FORMAT}")
+    parser.add_argument("--warmup-bars", type=int, default=1000,
+                        help="InpWarmupBars of the run being compared")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
 
@@ -297,6 +322,27 @@ def main(argv: list[str] | None = None) -> int:
     for path in expand_bar_paths(args.bars):
         bars[symbol_of(path)] = load_broker_bars(path, args.rule, args.fixed_hours)
     ea = load_ea_trades(args.ea_trades)
+    # The exports folder is shared with the other strategies, so it routinely
+    # holds symbols S004 does not trade. Feeding one to the engine invents
+    # trades that compete for the daily cap and turns every later entry of that
+    # day into a false divergence, so narrow to the configured pairs.
+    foreign = sorted(set(bars) - set(S004_INTRADAY.pairs))
+    if foreign:
+        print(f"ignoring bars not in the config: {', '.join(foreign)}")
+        bars = {symbol: frame for symbol, frame in bars.items() if symbol not in foreign}
+    # A pair the EA traded but we have no bars for is fatal for the same reason,
+    # only backwards: the engine would be one competitor short of the EA.
+    unexported = sorted(set(ea["symbol"].unique()) - set(bars))
+    if unexported:
+        print(f"the EA traded {', '.join(unexported)} but no bars were exported for them"
+              " -- re-run ExportM1 with every pair")
+        return 2
+    idle = sorted(set(S004_INTRADAY.pairs) - set(bars))
+    if idle:
+        print(f"warning: no bars for {', '.join(idle)}; the daily cap is compared with"
+              " fewer competing pairs than the strategy trades")
+    if args.ea_start:
+        bars = trim_to_ea_history(bars, pd.Timestamp(args.ea_start), args.warmup_bars)
     engine = engine_trades(bars, S004_INTRADAY, ea_scales(ea))
     since = pd.Timestamp(args.since) if args.since else None
     until = pd.Timestamp(args.until) if args.until else None
