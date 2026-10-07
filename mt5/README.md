@@ -40,8 +40,12 @@ mt5/
           Params.mqh             GENERATED from strategies/s004_config.py::S004_INTRADAY
           Engine.mqh             S004 engine: port of strategies/fvg_mtf.py::run_backtest,
                                  pure (no orders, no account) so it can be diffed bar for bar
+          Runtime.mqh            S004 live layer: parks one limit per symbol on the zone the
+                                 engine would take next, keeps virtual (out-of-session or
+                                 over-cap) trades order-free, replays warmup bars on restart
     Experts/AlgoTrading/
       S021_ORB.mq5               thin EA shell: inputs + event wiring
+      S004_FVG.mq5               thin EA shell: risk/daily-cap inputs + event wiring
     Scripts/AlgoTrading/
       S021_SelfTest.mq5          runs the pure pieces against Python-made fixtures
       S004_SelfTest.mq5          replays Python-made fixtures through S004 Engine.mqh and

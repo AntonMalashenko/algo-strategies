@@ -226,6 +226,17 @@ public:
       result.ticket=m_trade.ResultOrder();
      }
 
+   // Move an open position's SL/TP. A resting limit can fill BETTER than its
+   // price when the market gaps through it, and a strategy that derives the
+   // stop and target from the actual fill (S004) then has to correct them.
+   void              Modify(const ulong position_ticket,const double stop_loss,
+                            const double take_profit,TradeResult &result)
+     {
+      TradeOpsResetResult(result);
+      Fill(result,m_trade.PositionModify(position_ticket,stop_loss,take_profit));
+      result.ticket=position_ticket;
+     }
+
    void              Cancel(const ulong order_ticket,TradeResult &result)
      {
       TradeOpsResetResult(result);
