@@ -6,13 +6,21 @@
 .DESCRIPTION
   1. regenerate the GENERATED headers (python -m mt5.tools.gen_params)
   2. run the mt5 pytest suite                       (skip: -SkipTests)
-  3. generate self-test fixtures / tester history if missing
+  3. generate the self-test fixtures of the selected strategies if missing
   4. mirror sources, presets and fixtures into the terminal (robocopy, .ex5 kept)
-  5. compile every .mq5 we own with MetaEditor64.exe /compile and fail on errors
+  5. compile the selected .mq5 with MetaEditor64.exe /compile and fail on errors
   6. -Watch: repeat 1-5 whenever a source file changes (Ctrl+C to stop)
+
+  Programs to deploy are named as positional arguments, matched as a
+  case-insensitive substring of the path under MQL5 ("S004", "s004_fvg" or
+  "Experts\AlgoTrading\S004_FVG.mq5"). With none, everything we own is built.
+  Step 5 overwrites the .ex5 a running EA was loaded from, so name the program
+  whenever another strategy is live on the same terminal; steps 1-4 keep the
+  existing .ex5 either way.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File mt5\tools\deploy.ps1
+  powershell -ExecutionPolicy Bypass -File mt5\tools\deploy.ps1 S004
   powershell -ExecutionPolicy Bypass -File mt5\tools\deploy.ps1 -Watch
   powershell -ExecutionPolicy Bypass -File mt5\tools\deploy.ps1 -DataDir "C:\Users\me\AppData\Roaming\MetaQuotes\Terminal\<hash>"
 
@@ -28,7 +36,8 @@ param(
     [switch]$SkipTests,
     [switch]$NoCompile,
     [string]$DataDir = "",
-    [string]$CommonDir = ""
+    [string]$CommonDir = "",
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$Only = @()
 )
 $ErrorActionPreference = "Stop"
 
@@ -40,6 +49,36 @@ $WatchIntervalSeconds = 3
 $RobocopyFailureCode = 8          # robocopy: exit codes >= 8 are failures
 
 function Log([string]$Message) { Write-Host "[deploy] $Message" -ForegroundColor Cyan }
+
+# Paths (relative to MQL5) of every .mq5 we own, narrowed to -Only.
+function Get-SelectedSources {
+    $all = foreach ($dir in $OwnSources) {
+        Get-ChildItem (Join-Path $Mt5 "MQL5\$dir") -Filter *.mq5 -ErrorAction SilentlyContinue |
+            Sort-Object Name | ForEach-Object { "$dir\$($_.Name)" }
+    }
+    if ($Only.Count -eq 0) { return @($all) }
+    @($all | Where-Object { $path = $_; $Only | Where-Object { $path -like "*$_*" } })
+}
+
+function Test-SelectionHas([string]$Fragment) {
+    @(Get-SelectedSources | Where-Object { $_ -like "*$Fragment*" }).Count -gt 0
+}
+
+# A typo must not silently deploy nothing.
+function Assert-Selection {
+    if ($Only.Count -eq 0) { return }
+    foreach ($sel in $Only) {
+        if (-not (Test-SelectionHas $sel)) {
+            Write-Host "no .mq5 matches '$sel'; available:" -ForegroundColor Red
+            foreach ($dir in $OwnSources) {
+                Get-ChildItem (Join-Path $Mt5 "MQL5\$dir") -Filter *.mq5 -ErrorAction SilentlyContinue |
+                    ForEach-Object { Write-Host "  $dir\$($_.Name)" }
+            }
+            exit 2
+        }
+    }
+    Log "selection: $((Get-SelectedSources) -join ' ')"
+}
 
 function Get-Python {
     if ($env:MT5_PYTHON) { return $env:MT5_PYTHON }
@@ -96,14 +135,23 @@ function Step-Tests {
 
 function Step-Fixtures {
     $files = Join-Path $Mt5 "MQL5\Files\AlgoTrading"
-    if (-not (Test-Path (Join-Path $files "fixtures\s021_m1.csv"))) {
-        Log "3/5 self-test fixtures missing -> generating"
-        Invoke-Python @("-m", "mt5.tools.s021_fixtures")
-    } else { Log "3/5 fixtures present" }
-    if (-not (Test-Path (Join-Path $files "e2e\s021_m1.csv"))) {
-        Log "    tester history missing -> generating (2025-01-02..2026-09-30)"
-        Invoke-Python @("-m", "mt5.tools.s021_fixtures", "--start", "2025-01-02", "--end", "2026-09-30",
-                        "--out", (Join-Path $files "e2e"))
+    Log "3/5 self-test fixtures"
+    if (Test-SelectionHas "S021") {
+        if (-not (Test-Path (Join-Path $files "fixtures\s021_m1.csv"))) {
+            Log "    S021 missing -> generating"
+            Invoke-Python @("-m", "mt5.tools.s021_fixtures")
+        } else { Log "    S021 present" }
+        if (-not (Test-Path (Join-Path $files "e2e\s021_m1.csv"))) {
+            Log "    tester history missing -> generating (2025-01-02..2026-09-30)"
+            Invoke-Python @("-m", "mt5.tools.s021_fixtures", "--start", "2025-01-02", "--end", "2026-09-30",
+                            "--out", (Join-Path $files "e2e"))
+        }
+    }
+    if (Test-SelectionHas "S004") {
+        if (-not (Test-Path (Join-Path $files "fixtures\s004_m15.csv"))) {
+            Log "    S004 missing -> generating"
+            Invoke-Python @("-m", "mt5.tools.s004_fixtures")
+        } else { Log "    S004 present" }
     }
 }
 
@@ -135,19 +183,19 @@ function Step-Compile([string]$Data, [string]$Install) {
     if (-not (Test-Path $editor)) { Log "5/5 MetaEditor64.exe not found in $Install -- compile with F7"; return }
     Log "5/5 compile with $editor"
     $failed = 0
-    foreach ($dir in $OwnSources) {
-        Get-ChildItem (Join-Path $Data "MQL5\$dir") -Filter *.mq5 | Sort-Object Name | ForEach-Object {
-            $log = Join-Path $env:TEMP "algotrading_compile_$($_.BaseName).log"
-            Remove-Item $log -ErrorAction SilentlyContinue
-            Start-Process -FilePath $editor -ArgumentList "/compile:`"$($_.FullName)`"", "/log:`"$log`"" -Wait -NoNewWindow
-            $result = if (Test-Path $log) { Get-Content $log -Encoding Unicode | Where-Object { $_ -like "Result:*" } | Select-Object -Last 1 } else { "" }
-            if ($result -like "*: 0 errors*" -or $result -like "Result: 0 errors*") {
-                Write-Host "  ok   $dir\$($_.Name)  ($result)"
-            } else {
-                $failed++
-                Write-Host "  FAIL $dir\$($_.Name)  ($result)" -ForegroundColor Red
-                if (Test-Path $log) { Get-Content $log -Encoding Unicode | Where-Object { $_ -match " error | warning " } | Select-Object -First 20 }
-            }
+    foreach ($rel in Get-SelectedSources) {
+        $source = Join-Path $Data "MQL5\$rel"
+        if (-not (Test-Path $source)) { continue }
+        $log = Join-Path $env:TEMP "algotrading_compile_$([IO.Path]::GetFileNameWithoutExtension($rel)).log"
+        Remove-Item $log -ErrorAction SilentlyContinue
+        Start-Process -FilePath $editor -ArgumentList "/compile:`"$source`"", "/log:`"$log`"" -Wait -NoNewWindow
+        $result = if (Test-Path $log) { Get-Content $log -Encoding Unicode | Where-Object { $_ -like "Result:*" } | Select-Object -Last 1 } else { "" }
+        if ($result -like "*: 0 errors*" -or $result -like "Result: 0 errors*") {
+            Write-Host "  ok   $rel  ($result)"
+        } else {
+            $failed++
+            Write-Host "  FAIL $rel  ($result)" -ForegroundColor Red
+            if (Test-Path $log) { Get-Content $log -Encoding Unicode | Where-Object { $_ -match " error | warning " } | Select-Object -First 20 }
         }
     }
     if ($failed -gt 0) { throw "compilation errors (see above)" }
@@ -171,12 +219,15 @@ function Get-Fingerprint {
         (Join-Path $Mt5 "MQL5\Include"), (Join-Path $Mt5 "MQL5\Experts"), (Join-Path $Mt5 "MQL5\Scripts"),
         (Join-Path $Mt5 "MQL5\Presets"), (Join-Path $Mt5 "tools"),
         (Join-Path $Repo "strategies\orb_intraday\config.py"), (Join-Path $Repo "bot\risk.py"),
-        (Join-Path $Repo "bot\account_guard.py"), (Join-Path $Repo "bot\orb_config.py")
+        (Join-Path $Repo "bot\account_guard.py"), (Join-Path $Repo "bot\orb_config.py"),
+        (Join-Path $Repo "strategies\s004_config.py"), (Join-Path $Repo "strategies\fvg_mtf.py")
     )
     (Get-ChildItem $paths -Recurse -File -Include *.mq5, *.mqh, *.set, *.py, *.ps1, *.sh -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin @("Params.mqh", "GeneratedCore.mqh") -and $_.FullName -notlike "*__pycache__*" } |
         ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }) -join "`n"
 }
+
+Assert-Selection
 
 if (-not $Watch) { Invoke-Deploy; exit 0 }
 

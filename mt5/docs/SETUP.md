@@ -12,7 +12,14 @@ rules: [`mt5/README.md`](../README.md). Ticket: ALGODEV-61.
 | When | macOS / Linux | Windows (PowerShell) |
 |---|---|---|
 | after `git pull` or any code change | `mt5/tools/deploy.sh` | `powershell -ExecutionPolicy Bypass -File mt5\tools\deploy.ps1` |
+| the same, with another strategy live on that terminal | `mt5/tools/deploy.sh S004` | `... deploy.ps1 S004` |
 | while developing (auto-deploy on save) | `mt5/tools/deploy.sh --watch` | `... deploy.ps1 -Watch` |
+
+Named programs (`S004`, `s004_fvg`, or a full path under `MQL5`) narrow steps 3
+and 5 to that subset. This matters because step 5 overwrites the `.ex5` a
+running expert was loaded from: deploying everything onto a terminal that is
+trading would swap the binary under the live EA. Steps 1-4 are safe regardless
+-- the sources are mirrored with the existing `.ex5` files kept.
 
 `deploy` does everything that does not need a mouse:
 

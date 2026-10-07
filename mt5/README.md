@@ -11,7 +11,9 @@ Ticket: ALGODEV-61. Design and spec: Claude Project doc
 
 **Installation, setup and daily use on macOS, Windows and Linux: [`docs/SETUP.md`](docs/SETUP.md).**
 Day to day: `mt5/tools/deploy.sh` (or `--watch` to redeploy on every save);
-on Windows `mt5\tools\deploy.ps1`.
+on Windows `mt5\tools\deploy.ps1`. Name the program when another strategy is
+live on the same terminal -- `mt5/tools/deploy.sh S004` builds only S004 and
+leaves the running EA's `.ex5` alone.
 
 ## Layout
 
@@ -73,7 +75,9 @@ mt5/
     compile.sh                   compiles every .mq5 from the repo in a throwaway terminal --
                                  the check to run after touching a shared AlgoCore header
     _mt5_env.sh                  shared wine/terminal discovery + the sandbox helpers
-    deploy.sh / deploy.ps1       one-command deploy: generate, test, copy, compile (--watch / -Watch)
+    deploy.sh / deploy.ps1       one-command deploy: generate, test, copy, compile (--watch / -Watch);
+                                 takes program names ("S004", "s004_fvg", a path under MQL5) to
+                                 deploy a subset -- all of them when given none
     install_mac.sh               copy (default) or link sources/presets/fixtures into a terminal
 tests/mt5/                       pytest for the tools (repo testpaths = tests/)
 ```
@@ -189,7 +193,7 @@ scripts never write into the terminal that is trading.
 .venv/bin/python -m mt5.tools.gen_params
 .venv/bin/python -m mt5.tools.s004_fixtures
 
-# 2. build everything in a throwaway terminal (never deploy.sh while S021 trades)
+# 2. build everything in a throwaway terminal (nothing is written to the live one)
 bash mt5/tools/compile.sh
 
 # 3. the engine port, bar for bar, against the Python trade list
