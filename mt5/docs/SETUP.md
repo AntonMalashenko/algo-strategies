@@ -32,7 +32,12 @@ Things you do **once**, not on every update:
 - installing the terminal;
 - creating the offline symbol;
 - tester settings (the terminal remembers them);
-- attaching the EA to a chart (it is reloaded automatically after recompilation).
+- attaching the EA to a chart.
+
+> After `deploy` overwrites the `.ex5` from outside, MT5 keeps running the already-loaded
+> copy — Navigator → Refresh updates the list, not the attached expert. To pick up a new
+> build on a live chart, drag the EA onto it again (or remove and re-attach). The new
+> instance logs a fresh `init`; if there is none, the old build is still running.
 
 | Change | What to repeat |
 |---|---|
@@ -337,6 +342,39 @@ first tick of the exit minute (= the bar open), the engine on that bar's close.
    Look for `levels`, `size`, two `place_stop`, then on a fill `fill` and `cancel_sibling` with `cancel_latency_ms`.
 6. **Keep the machine running:** see the OS sections. `heartbeat.json` is refreshed every 60 s and can be monitored.
 7. **Several accounts** need one terminal instance per account: a terminal can only be logged in to one account. That is not covered by these scripts yet.
+8. **One chart only.** A second copy of the EA on the same account+symbol+magic refuses to start (`AlgoCore/InstanceLock.mqh`). Without that lock two copies each place their own pair on the same levels, so a breakout fills the combined lot, their OCO cancels act on each other's orders, and they overwrite each other's JSONL records — all three were observed live on 2026-10-06.
+
+---
+
+## 7.1 Taking a day the EA refuses (manual assist)
+
+The EA will not re-enter a day whose orders already came and went — it was restarted
+late, the orders were cancelled by hand, the terminal was down over the open
+(`Runtime.mqh` case 6, logged as `day_resolved`). That refusal is deliberate and is not
+being relaxed. `Scripts/AlgoTrading/S021_PlaceToday.mq5` is the explicit human override.
+
+Run it from the Navigator on the **chart of the traded symbol**, with `InpRiskPct`,
+`InpMagic`, `InpServerTzRule` and `InpHistoryDays` matching the running EA. It prints to
+the Experts tab:
+
+```
+now: 2026.10.06 16:57:12 server / 2026.10.06 09:57:12 New York (strategy clock)
+levels: O 31264.50  ADR14 334.279  U 31331.36  L 31197.64  stop 250.709  (30 sessions)
+size: balance 10000.00  risk 1.00% = 100.00  lot 0.3988 -> 0.40  real risk 100.28 (1.003%)
+dry run: nothing placed. Rerun with InpPlace=true to place these two orders
+```
+
+`InpPlace` is `false` by default, so the first run only shows the numbers. The script
+refuses on its own when it is outside the 09:30–14:29 New York entry window, when the EA
+already holds orders or positions for the day, when ADR14 is not computable, and — the
+important one — when a level was already touched since the open, which is the same test
+the EA applies before entering (`Runtime.mqh:363`).
+
+Orders go out with the **EA's magic and comment**, so the running EA adopts them on its
+next cycle and manages them exactly like its own: OCO cancel of the sibling on a fill, the
+attached stop loss, the cutoff cancel, the time exit. Do not work around the refusal with
+a second magic number instead — a second magic hides the trade from the daily risk cap and
+the account guard, which count per magic.
 
 ---
 
@@ -357,5 +395,6 @@ first tick of the exit minute (= the bar open), the engine on that bar's close.
 | Self-test suddenly reports more checks than the docs say | expected after a new `ENUM_TZ_RULE` is added: the clock fixture gains ~1419 cross-checks per rule |
 | `halted` event at start | the server timezone rule disagrees with the terminal clock. Check the broker's server time and set `InpServerTzRule` |
 | `missed_entry` warning | a level was already touched before the EA could place the stops (late start or a gap). The day is skipped by design: no market-order substitute |
+| Expert log: `refusing to start: another chart already runs this expert` | the single-instance lock did its job — the EA is attached to a second chart on the same account+symbol+magic. Remove the duplicate, then re-attach. Two copies place two independent order pairs on the same levels, multiplying the risk, and overwrite each other's JSONL records |
 | `insufficient_adr_history` | fewer than 14 valid sessions in the M1 history. Scroll the chart back (Home key), or set Tools → Options → Charts → Max bars = Unlimited |
 | `oco_double_fill` error | both stops filled before the sibling was cancelled. Both legs are closed (`DoubleFillPolicy`), see ALGODEV-60 |

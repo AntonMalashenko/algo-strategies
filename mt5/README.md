@@ -29,6 +29,7 @@ mt5/
         Sizing.mqh               lots_for_risk + volume/price normalisation (bot/risk.py port)
         AccountGuard.mqh         account daily/max loss guard (bot/account_guard.py port)
         TradeOps.mqh             own positions/orders snapshot, place stop / cancel / close
+        InstanceLock.mqh         one running copy per (login, symbol, magic)
         GeneratedCore.mqh        GENERATED constants from bot/risk.py, bot/account_guard.py
       Strategies/
         S021_ORB/
@@ -45,6 +46,8 @@ mt5/
       S021_SelfTest.mq5          runs the pure pieces against Python-made fixtures
       S004_SelfTest.mq5          replays Python-made fixtures through S004 Engine.mqh and
                                  compares every trade (entry/SL/TP/exit/reason/R)
+      S021_PlaceToday.mq5        manual assist: today's levels/lot now, optional hand placement
+                                 of the pair with the EA's magic (it then manages them)
       ExportM1.mq5               dumps the broker's M1 bars + symbol spec (any strategy)
       ImportM1CustomSymbol.mq5   builds an offline custom symbol from an M1 CSV (tester runs
                                  on histdata or on a saved broker export -- any strategy)

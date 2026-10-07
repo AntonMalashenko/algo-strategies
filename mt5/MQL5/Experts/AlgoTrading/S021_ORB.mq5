@@ -8,7 +8,8 @@
 //| strategies/orb_intraday/config.py::ORB_BASE -- never edit them   |
 //| here). Inputs below are runtime / prop-firm concerns only.       |
 //|                                                                  |
-//| Attach to ONE chart of the Nasdaq 100 symbol (any timeframe).    |
+//| Attach to ONE chart of the Nasdaq 100 symbol (any timeframe);    |
+//| a second copy on the same account+symbol+magic refuses to start. |
 //| Docs: mt5/README.md, Project doc                                 |
 //| claude/prompt-s021-mt5-ea-implementation.md                      |
 //+------------------------------------------------------------------+
@@ -17,6 +18,7 @@
 #property description "S021 ORB Nasdaq 100: two resting stops at O +/- 0.2*ADR14, SL 0.75*ADR14, time exit."
 
 #include <Strategies/S021_ORB/Runtime.mqh>
+#include <AlgoCore/InstanceLock.mqh>
 
 input group "Risk"
 input double                  InpRiskPct            = S021_DEFAULT_RISK_PCT; // Risk per trade, % of balance
@@ -48,6 +50,7 @@ input bool                    InpWriteDaysCsv       = true;  // Per-day CSV (par
 input int                     InpTimerSeconds       = 1;     // Safety-net reconcile period, s (raise only for long tester runs)
 
 CS021Runtime g_runtime;
+string       g_lock_name="";
 
 int OnInit()
   {
@@ -78,6 +81,17 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    if(StringLen(InpForceExitUtc)>0 && settings.force_exit_utc_minute<0)
       return INIT_PARAMETERS_INCORRECT;
+
+   g_lock_name=InstanceLockName(S021_MAGIC_PREFIX,_Symbol,InpMagic);
+   if(!InstanceLockAcquire(g_lock_name))
+     {
+      PrintFormat("[%s] refusing to start: another chart already runs this expert on %s "
+                  "with magic %I64d. Two copies place two sets of orders on the same "
+                  "levels -- remove the duplicate, then re-attach.",
+                  settings.strategy_name,_Symbol,InpMagic);
+      g_lock_name="";
+      return INIT_FAILED;
+     }
    if(!g_runtime.Init(settings))
       return INIT_FAILED;
    EventSetTimer(InpTimerSeconds);
@@ -87,6 +101,11 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
+   if(StringLen(g_lock_name)>0)
+     {
+      InstanceLockRelease(g_lock_name);
+      g_lock_name="";
+     }
    g_runtime.Deinit(reason);
   }
 
