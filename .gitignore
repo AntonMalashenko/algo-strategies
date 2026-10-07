@@ -20,6 +20,9 @@ data/histdata/*
 data/fresh/*
 data/GER40/*
 data/.scheduler_locks/
+# ALGODEV-45 step 4: webapp/runner.py::cycle_lock's per-account_strategy
+# flock files (empty, runtime-only -- same reasoning as .scheduler_locks/).
+data/.cycle_locks/
 !data/**/.gitkeep
 reports/*
 !reports/.gitkeep
