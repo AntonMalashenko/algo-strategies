@@ -632,8 +632,7 @@ def _worker_orb(link: AccountStrategy, session, budget_s: float | None) -> int:
         magic=strat.name, broker=broker_mode, allow_mainnet=allow_mainnet, env=acc.env,
         daily_risk_cap_pct=link.daily_risk_cap_pct, initial_balance=link.initial_balance,
         account_limits=_account_limits(acc),
-        on_token_refreshed=_token_persister(session, acc),
-        api=api)
+        on_token_refreshed=_token_persister(session, acc))
 
     for a in result["actions"]:
         if a["kind"] == "open":
