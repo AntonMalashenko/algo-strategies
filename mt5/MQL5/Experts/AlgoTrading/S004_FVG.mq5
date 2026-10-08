@@ -35,6 +35,7 @@
 input group "Sizing (tunable; cap x risk must stay within the daily budget)"
 input double       InpRiskPct         = S004_DEFAULT_RISK_PCT;            // Risk per trade, % of balance
 input int          InpMaxTradesPerDay = S004_DEFAULT_MAX_TRADES_PER_DAY;  // Max REAL entries per day, all pairs together
+input double       InpEntryShiftPips  = S004_DEFAULT_ENTRY_SHIFT_PIPS;    // Entry limit offset from the zone edge toward the bounce, pips (0 = on the edge)
 
 // OFF BY DEFAULT, AND THAT IS THE DECISION, not an oversight (2026-10-07,
 // measured by backtest/run_s004_guard_modes.py).
@@ -81,6 +82,15 @@ int OnInit()
   {
    if(InpRiskPct<=0.0 || InpMaxTradesPerDay<1 || InpTimerSeconds<1)
       return INIT_PARAMETERS_INCORRECT;
+   // The shift is backtested only between 0 and S004_MAX_ENTRY_SHIFT_PIPS
+   // (strategies/s004_config.py::ENTRY_SHIFT_PIPS holds the evidence). Past
+   // it the stop-to-entry distance changes the strategy, untested.
+   if(InpEntryShiftPips<0.0 || InpEntryShiftPips>S004_MAX_ENTRY_SHIFT_PIPS)
+     {
+      PrintFormat("refusing to start: InpEntryShiftPips=%.2f is outside the tested range 0..%.2f pips.",
+                  InpEntryShiftPips,S004_MAX_ENTRY_SHIFT_PIPS);
+      return INIT_PARAMETERS_INCORRECT;
+     }
    // The one input combination that can quietly kill the account: the firm's
    // daily limit is counted in money, not in trades, so a cap x risk beyond
    // S004's share of it means a normal losing day is a breach.
@@ -100,6 +110,7 @@ int OnInit()
                                        AccountInfoInteger(ACCOUNT_LOGIN));
    settings.risk_pct=InpRiskPct;
    settings.max_trades_per_day=InpMaxTradesPerDay;
+   settings.entry_shift_pips=InpEntryShiftPips;
    settings.server_rule=InpServerTzRule;
    settings.server_fixed_hours=InpServerFixedHours;
    settings.verify_server_offset=InpVerifyServerOffset;

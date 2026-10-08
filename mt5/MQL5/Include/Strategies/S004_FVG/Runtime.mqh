@@ -10,14 +10,15 @@
 //|                                                                  |
 //| The three things that make this more than a thin wrapper:        |
 //|                                                                  |
-//| 1. RESTING LIMITS. The backtest fills at the near edge of the    |
-//|    zone INSIDE the bar, so a live entry has to be parked before  |
+//| 1. RESTING LIMITS. The backtest fills at its limit price (the    |
+//|    zone's near edge moved InpEntryShiftPips toward the bounce)   |
+//|    INSIDE the bar, so a live entry has to be parked before       |
 //|    that bar opens -- entering at the close of the bar the touch  |
 //|    was noticed on would be a different (worse) price. After each |
 //|    bar the runtime parks one limit per symbol on the zone the    |
 //|    engine would take next, and cancels it when that zone dies.   |
 //|    A limit that gaps through fills BETTER than its price, which  |
-//|    is what the engine models too (entry = min(open, near edge)), |
+//|    is what the engine models too (entry = min(open, limit price)),|
 //|    so the fill is then re-stopped/re-targeted off the real fill. |
 //|                                                                  |
 //| 2. VIRTUAL TRADES. The engine trades round the clock and the     |
@@ -92,6 +93,7 @@ struct S004Settings
    string            strategy_name;        // log group, e.g. "S004-mt5-acct123"
    double            risk_pct;             // % of balance risked per trade (EA input)
    int               max_trades_per_day;   // portfolio-wide cap on REAL entries (EA input)
+   double            entry_shift_pips;     // entry limit offset toward the bounce, pips (EA input)
    ENUM_TZ_RULE      server_rule;          // the broker clock the session hours are on
    int               server_fixed_hours;
    bool              verify_server_offset; // live: halt if the rule disagrees with the terminal
@@ -265,7 +267,7 @@ private:
          engine.GetZone(index,zone);
          if(zone.dead || zone.in_trade)
             continue;
-         double entry=engine.NearEdgeOf(index);
+         double entry=engine.EntryEdgeOf(index);
          double stop=engine.StopFor(index);
          if((entry-stop)*zone.dir<=0.0)
             continue;
@@ -290,7 +292,7 @@ private:
         }
       S004Zone zone;
       engine.GetZone(index,zone);
-      double entry=SizingNormalizePrice(m_slot[i].symbol,engine.NearEdgeOf(index));
+      double entry=SizingNormalizePrice(m_slot[i].symbol,engine.EntryEdgeOf(index));
       double stop=SizingNormalizePrice(m_slot[i].symbol,engine.StopFor(index));
       double target=SizingNormalizePrice(m_slot[i].symbol,
                                          entry+zone.dir*S004_RR*(entry-stop)*zone.dir);
@@ -412,7 +414,7 @@ private:
         }
       if(!filled)
         {
-         // The engine says the near edge was touched but no fill came back:
+         // The engine says the limit price was touched but no fill came back:
          // the limit was never parked (a restart mid-bar), or the broker
          // rejected it. Never chase with a market order -- the backtest's
          // price is gone; let this one be virtual and log it loudly.
@@ -673,7 +675,7 @@ public:
          m_slot[i].position_fill=0.0;
          m_slot[i].position_lots=0.0;
          m_engine[i]=new CS004Engine();
-         m_engine[i].Configure(symbol,m_slot[i].pip,SpreadPrice(i));
+         m_engine[i].Configure(symbol,m_slot[i].pip,SpreadPrice(i),m_cfg.entry_shift_pips);
         }
       m_count=count;
       ResetTradesCsvForTester();
@@ -698,6 +700,7 @@ public:
       fields.Int("warmup_bars",warmup);
       fields.Num("risk_pct",m_cfg.risk_pct);
       fields.Int("cap",m_cfg.max_trades_per_day);
+      fields.Num("entry_shift_pips",m_cfg.entry_shift_pips);
       fields.Bool("trade_enabled",m_cfg.trade_enabled);
       fields.Str("server_tz_rule",ClockRuleName(m_cfg.server_rule));
       fields.Int("server_offset_expected_s",expected);

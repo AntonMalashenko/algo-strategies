@@ -126,6 +126,7 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                  fta_min_r: float | None = None,
                  intraday_cutoff: time | None = None,
                  cost_inclusive_sizing: bool = False,
+                 entry_shift_pips: float = 0.0,
                  return_state: bool = False):
     """Event-driven backtest. Returns a DataFrame of trades.
 
@@ -178,6 +179,16 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
 
     Intrabar pessimism: within one bar SL is always assumed to be hit BEFORE
     any favourable level (partial/BE trigger/TP).
+    entry_shift_pips -- (mode="base" only) move the entry limit this many pips
+                         from the zone's near edge TOWARD the bounce (above the
+                         edge for a long, below it for a short). 0.0 (default)
+                         is the frozen baseline: a limit parked exactly on the
+                         edge. A positive value fills a bar that only gets
+                         WITHIN that distance of the edge, so the backtest no
+                         longer credits fills a real limit queue would miss; the
+                         price paid is a worse entry (the stop stays behind the
+                         far edge, so risk grows by the shift and the target,
+                         being rr x risk, moves out with it).
     """
     if mode == "base" and stop == "swing":
         raise ValueError("base mode has no reaction swing at entry time")
@@ -205,6 +216,7 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
         trend = None
 
     buf = BUFFER_PIPS * pip
+    shift = entry_shift_pips * pip
     cost = spread_pips * pip            # total round-trip cost in price units
     cutoff_minute = (None if intraday_cutoff is None
                      else intraday_cutoff.hour * MINUTES_PER_HOUR + intraday_cutoff.minute)
@@ -286,7 +298,8 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                 continue
 
             near = z["top"] if d == 1 else z["bot"]
-            touched = l[t] <= near if d == 1 else h[t] >= near
+            fill_edge = near + d * shift      # the limit price; == near when the shift is 0
+            touched = l[t] <= fill_edge if d == 1 else h[t] >= fill_edge
 
             if not z["armed"]:
                 if z["wait_exit"]:      # after an SL: require a fresh approach
@@ -304,7 +317,7 @@ def run_backtest(m15: pd.DataFrame, mode: str = "base", stop: str = "zone",
                     if trend is not None and not _trend_ok(trend[t], d, trend_align):
                         z["dead"] = True    # touched against the filter: consumed
                         continue
-                    entry = min(o[t], near) if d == 1 else max(o[t], near)
+                    entry = min(o[t], fill_edge) if d == 1 else max(o[t], fill_edge)
                     pos = _open(z, entry, t, times, stop, rr, buf, d, cost, cost_inclusive_sizing)
                     if pos is None:
                         z["dead"] = True

@@ -204,7 +204,7 @@ scripts never write into the terminal that is trading.
 bash mt5/tools/compile.sh
 
 # 3. the engine port, bar for bar, against the Python trade list
-bash mt5/tools/run_selftest.sh          # expect 12132 passed, 0 failed, 1102 trades
+bash mt5/tools/run_selftest.sh          # expect 12507 passed, 0 failed, 1136 trades
 ```
 
 ### Shadow pass + parity (phase D)
@@ -291,6 +291,15 @@ the EA spent the wrong number of slots and still fails.
   to start if it exceeds `S004_DAILY_RISK_BUDGET_PCT` (S004's share of the
   firm's −5% daily limit). Count S021's leg too: it spends the same −5% day on
   the same account, so 2 × 0.50% + its 1.00% is 2.00% of the firm's 5%.
+- `InpEntryShiftPips` (default 1.0, from `S004_INTRADAY.entry_shift_pips`) parks
+  the entry limit that many pips from the zone edge toward the bounce; 0 puts it
+  exactly on the edge, and the EA refuses anything outside 0..2 pips (the tested
+  range). Why 1.0, and what each value costs in the backtest, is in
+  `strategies/s004_config.py::ENTRY_SHIFT_PIPS`. Run `s004_parity.py` with
+  `--entry-shift-pips` if the compared run used a different value: the trades
+  CSV does not record it. If the market sits between the edge and the shifted
+  price when the limit is parked, the broker can refuse it (a buy limit above the
+  ask); that surfaces as a `missed_fill`, so watch their count in the first live days.
 - The daily cap rolls over on S004's **session clock**, not on
   `InpDayResetRule` — that input only feeds the (disabled) guards.
 - **That product is the whole risk control.** `InpDailyGuardPct` and

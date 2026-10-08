@@ -192,7 +192,8 @@ def render_s021(config=None) -> str:
 # prop preset S004_INTRADAY, so that -- not the frozen base -- is the reference
 # every exported config is checked against.
 S004_EA_FIELDS = ("rr", "entry_hours", "pairs", "intraday_cutoff",
-                  "cost_inclusive_sizing", "max_trades_per_day", "risk_pct")
+                  "cost_inclusive_sizing", "max_trades_per_day", "risk_pct",
+                  "entry_shift_pips")
 # Backtest-only fields: the EA reads the live symbol instead. `pip` is a data
 # artifact (ejtrader/histdata store MT points), and the live sizing cost is the
 # broker's real spread at entry, not S004's modelled 0.9-pip average.
@@ -240,7 +241,8 @@ def _contiguous_hours(hours: tuple[int, ...]) -> tuple[int, int]:
 
 def render_s004(config=None) -> str:
     from strategies import fvg_mtf
-    from strategies.s004_config import DAILY_RISK_BUDGET_PCT, MAGIC, SESSION_TZ, S004_INTRADAY
+    from strategies.s004_config import (DAILY_RISK_BUDGET_PCT, MAGIC, MAX_ENTRY_SHIFT_PIPS,
+                                         SESSION_TZ, S004_INTRADAY)
 
     config = S004_INTRADAY if config is None else config
     _check_s004_intraday(config)
@@ -265,6 +267,11 @@ def render_s004(config=None) -> str:
         _define("S004_DEFAULT_MAX_TRADES_PER_DAY", config.max_trades_per_day,
                 "prop rule 3 (EA input default): entries per session day across ALL symbols, "
                 "not per symbol"),
+        _define("S004_DEFAULT_ENTRY_SHIFT_PIPS", float(config.entry_shift_pips),
+                "S004_INTRADAY.entry_shift_pips (EA input default): the entry limit sits this "
+                "far from the zone's near edge, toward the bounce"),
+        _define("S004_MAX_ENTRY_SHIFT_PIPS", float(MAX_ENTRY_SHIFT_PIPS),
+                "s004_config.MAX_ENTRY_SHIFT_PIPS: the EA refuses an input beyond the tested range"),
         _define("S004_SYMBOL_COUNT", len(config.pairs), "S004_INTRADAY.pairs count"),
         _define("S004_SYMBOLS", ",".join(config.pairs),
                 "S004_INTRADAY.pairs; ties are ordered by symbol name, not by this order"),
@@ -285,9 +292,10 @@ def render_s004(config=None) -> str:
                   "mt5/tools/s004_clock_probe.py, never assumed to be a fixed offset.",
                   "The daily cap is portfolio-wide: the EA counts entries across all",
                   "S004_SYMBOLS together (see backtest/run_s004_intraday.py).",
-                  "The two S004_DEFAULT_* values are only the defaults of the EA's",
-                  "inputs -- the cap and the risk are meant to be tuned live -- but",
-                  "their product must stay within S004_DAILY_RISK_BUDGET_PCT."],
+                  "The S004_DEFAULT_* values are only the defaults of the EA's",
+                  "inputs -- the cap, the risk and the entry shift are meant to be",
+                  "tuned live -- but cap x risk must stay within S004_DAILY_RISK_BUDGET_PCT",
+                  "and the shift within S004_MAX_ENTRY_SHIFT_PIPS."],
                  body)
 
 

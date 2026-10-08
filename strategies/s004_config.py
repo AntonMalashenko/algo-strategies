@@ -32,6 +32,12 @@ S004_INTRADAY  -- ALGODEV-62: the same frozen champion plus three prop rules,
                   Rules 1-2 are engine flags; rule 3 is portfolio-level and is
                   applied by backtest/run_s004_intraday.py, which is the only
                   place that sees all 7 pairs at once.
+                  Amendment 2026-10-08 (maintainer's call, after the entry-shift
+                  sensitivity below): the entry limit sits ENTRY_SHIFT_PIPS
+                  toward the bounce, not exactly on the zone's edge.
+S004_INTRADAY_NOSHIFT -- S004_INTRADAY exactly as first validated (limit parked on the
+                  zone's near edge, entry_shift_pips=0). Kept so the numbers in
+                  the 2026-10-06/07 research notes stay reproducible.
 S004_INTRADAY_CAP1 -- modifier, DEFAULT OFF: the same -2% daily budget spent on
                   the first signal of the day only (1 x 2.00%). Better per
                   trade, worse per challenge -- the verdict and its numbers sit
@@ -84,6 +90,33 @@ SESSION_TZ = "Europe/Bucharest"
 INTRADAY_CUTOFF = time(22, 45)  # last M15 bar of the session day; it closes at 23:00
 MAX_TRADES_PER_DAY = 2          # portfolio-wide, all 7 pairs together
 
+# Entry limit offset, in pips, from the zone's near edge TOWARD the bounce.
+#
+# Why: the backtest fills on the first TOUCH of the edge. A real limit queue does
+# not fill every touch, and the touches it misses are the ones that reverse at
+# once -- the winners -- so touch-fills are optimistic in exactly the wrong
+# direction. For a buy limit there may be a second, mechanical gap: MT5 bars are
+# normally built from BID prices while a buy fills at the ASK, about the 0.9-pip
+# spread above them. That is a hypothesis about this data feed, not measured.
+#
+# TESTED 2026-10-08 on S004_INTRADAY, 7 pairs, RR 3 (scratch scripts, then
+# strategies/fvg_mtf.py::entry_shift_pips), 2022-03+ untouched window:
+#   limit moved toward the bounce  0 / 0.2 / 0.5 / 1.0 / 2.0 pip
+#     -> +0.164 / +0.168 / +0.176 / +0.151 / +0.148 R per trade, 5/5 years in plus
+#        throughout: trades that only get NEAR the edge are as good as the rest,
+#        so moving the limit costs almost nothing.
+#   fill only if price trades THROUGH the edge by 0 / 0.2 / 0.5 / 1.0 / 2.0 pip
+#     (the harsh queue model, fill price still the edge)
+#     -> +0.164 / +0.149 / +0.128 / +0.065 / -0.013 R: the edge halves at 1 pip
+#        and is gone at 2. That is what a limit parked EXACTLY on the edge risks.
+# 1.0 pip was chosen by that argument -- it is about the spread -- and NOT as the
+# peak of the table: the 0.5-pip bump is inside the noise, and picking it would
+# be fitting. It costs 0.013 R per trade against the unshifted limit.
+ENTRY_SHIFT_PIPS = 1.0
+# Largest shift the EA accepts as an input: the top of the tested range. Beyond
+# it the stop-to-entry distance grows enough to change the strategy, untested.
+MAX_ENTRY_SHIFT_PIPS = 2.0
+
 # Live-trading identity, consumed by the MT5 EA through mt5/tools/gen_params.py
 # (the S021 equivalents live in bot/orb_config.py; S004 has no bot module).
 MAGIC = "S004"                  # position-label prefix
@@ -110,10 +143,17 @@ class S004Config:
     cost_inclusive_sizing: bool = False         # engine flag, rule 2
     max_trades_per_day: int | None = None       # portfolio-level, rule 3
 
+    # --- entry limit offset (off in S004_BASE; amendment 2026-10-08, see ENTRY_SHIFT_PIPS) ---
+    entry_shift_pips: float = 0.0               # engine flag; EA input default
+
     # --- live sizing (ignored by the backtest engine, exported to the EA) ---
     risk_pct: float = RISK_PCT                  # % of equity per trade
 
     def __post_init__(self) -> None:
+        if not 0.0 <= self.entry_shift_pips <= MAX_ENTRY_SHIFT_PIPS:
+            raise ValueError(
+                f"entry_shift_pips={self.entry_shift_pips} is outside the tested range "
+                f"0..{MAX_ENTRY_SHIFT_PIPS} pips (see ENTRY_SHIFT_PIPS)")
         # Uncapped (S004_BASE) there is no planned worst day to check: that
         # preset is backtest-only and gen_params.py refuses to export it.
         if self.max_trades_per_day is None:
@@ -141,7 +181,8 @@ class S004Config:
         return dict(mode=self.mode, stop=self.stop, rr=self.rr, pip=self.pip,
                     spread_pips=self.spread_pips,
                     intraday_cutoff=self.intraday_cutoff,
-                    cost_inclusive_sizing=self.cost_inclusive_sizing)
+                    cost_inclusive_sizing=self.cost_inclusive_sizing,
+                    entry_shift_pips=self.entry_shift_pips)
 
     def with_(self, **overrides) -> "S004Config":
         return replace(self, **overrides)
@@ -149,11 +190,13 @@ class S004Config:
 
 S004_BASE = S004Config()        # frozen champion -- never edit in place
 
-S004_INTRADAY = S004_BASE.with_(
+S004_INTRADAY_NOSHIFT = S004_BASE.with_(
     intraday_cutoff=INTRADAY_CUTOFF,
     cost_inclusive_sizing=True,
     max_trades_per_day=MAX_TRADES_PER_DAY,
 )
+
+S004_INTRADAY = S004_INTRADAY_NOSHIFT.with_(entry_shift_pips=ENTRY_SHIFT_PIPS)
 
 # Modifier: spend the whole daily budget on the FIRST signal of the day instead
 # of splitting it over the first two. Same planned worst day (-2%), different
@@ -171,4 +214,5 @@ S004_INTRADAY = S004_BASE.with_(
 # a walk-forward: nothing here was re-fitted out of sample, so the gate in
 # strategy-lifecycle is not met. Promote it only after a walk-forward, and only
 # if the higher bust rate is acceptable for the account it would run on.
-S004_INTRADAY_CAP1 = S004_INTRADAY.with_(max_trades_per_day=1, risk_pct=2.0)
+# Built off S004_INTRADAY_NOSHIFT: every number above was measured with the limit on the edge.
+S004_INTRADAY_CAP1 = S004_INTRADAY_NOSHIFT.with_(max_trades_per_day=1, risk_pct=2.0)

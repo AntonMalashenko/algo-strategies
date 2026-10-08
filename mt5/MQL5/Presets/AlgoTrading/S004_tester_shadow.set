@@ -20,8 +20,10 @@
 ; the weeks the two DST calendars disagree.
 ;
 ; Enum codes: ServerTzRule/DayResetRule 0=UTC 1=FIXED 2=EET_US_DST 3=EET_EU_DST 4=CET_EU_DST
+; Same entry shift as the live preset, so the parity pass runs the traded rules.
 InpRiskPct=1.0
 InpMaxTradesPerDay=2
+InpEntryShiftPips=1.0
 InpInitialBalance=10000.0
 InpDailyGuardPct=0.0
 InpMaxGuardPct=0.0

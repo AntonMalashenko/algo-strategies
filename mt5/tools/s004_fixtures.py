@@ -80,9 +80,9 @@ def write_fixtures(out_dir: Path, symbols: tuple[str, ...], start: str, end: str
     trades[TRADE_COLUMNS].to_csv(out_dir / "s004_trades.csv", index=False,
                                  lineterminator="\n", float_format="%.10f")
     pd.DataFrame({
-        "key": ["pip", "cost_price", "rr", "symbols", "start", "end"],
-        "value": [PIP_RAW, SPREAD_PIPS * PIP_RAW, S004_INTRADAY.rr,
-                  " ".join(symbols), start, end],
+        "key": ["pip", "cost_price", "shift_pips", "rr", "symbols", "start", "end"],
+        "value": [PIP_RAW, SPREAD_PIPS * PIP_RAW, S004_INTRADAY.entry_shift_pips,
+                  S004_INTRADAY.rr, " ".join(symbols), start, end],
     }).to_csv(out_dir / "s004_meta.csv", index=False, header=False, lineterminator="\n")
     return dict(bars=len(all_bars), trades=len(trades),
                 exit_reasons=trades["exit_reason"].value_counts().to_dict())

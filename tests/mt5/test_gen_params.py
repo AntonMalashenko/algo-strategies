@@ -11,8 +11,13 @@ import pytest
 from mt5.tools import clock, gen_params
 from strategies import fvg_mtf
 from strategies.orb_intraday.config import ORB_BASE
-from strategies.s004_config import (DAILY_RISK_BUDGET_PCT, SESSION_TZ, S004_BASE,
-                                    S004_INTRADAY)
+from strategies.s004_config import (
+    DAILY_RISK_BUDGET_PCT,
+    MAX_ENTRY_SHIFT_PIPS,
+    S004_BASE,
+    S004_INTRADAY,
+    SESSION_TZ,
+)
 
 
 def _defines(text: str) -> dict[str, str]:
@@ -70,6 +75,8 @@ def test_s004_header_carries_the_intraday_preset():
     assert int(values["S004_INTRADAY_CUTOFF_MINUTE"]) == 22 * 60 + 45
     assert values["S004_COST_INCLUSIVE_SIZING"] == "true"
     assert int(values["S004_DEFAULT_MAX_TRADES_PER_DAY"]) == S004_INTRADAY.max_trades_per_day
+    assert float(values["S004_DEFAULT_ENTRY_SHIFT_PIPS"]) == S004_INTRADAY.entry_shift_pips
+    assert float(values["S004_MAX_ENTRY_SHIFT_PIPS"]) == MAX_ENTRY_SHIFT_PIPS
     assert int(values["S004_SYMBOL_COUNT"]) == len(S004_INTRADAY.pairs)
     assert values["S004_SYMBOLS"] == '"' + ",".join(S004_INTRADAY.pairs) + '"'
     assert float(values["S004_BUFFER_PIPS"]) == fvg_mtf.BUFFER_PIPS

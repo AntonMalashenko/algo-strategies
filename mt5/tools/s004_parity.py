@@ -359,6 +359,10 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"the EA run's first bar, {SERVER_TIME_FORMAT}")
     parser.add_argument("--warmup-bars", type=int, default=1000,
                         help="InpWarmupBars of the run being compared")
+    parser.add_argument("--entry-shift-pips", type=float, default=None,
+                        help="InpEntryShiftPips of the run being compared; default is the "
+                             "preset's value (S004_INTRADAY.entry_shift_pips). The trades CSV "
+                             "does not record it, so a run with a different input must say so")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
 
@@ -387,7 +391,10 @@ def main(argv: list[str] | None = None) -> int:
               " fewer competing pairs than the strategy trades")
     if args.ea_start:
         bars = trim_to_ea_history(bars, pd.Timestamp(args.ea_start), args.warmup_bars)
-    engine = engine_trades(bars, S004_INTRADAY, ea_scales(ea))
+    config = S004_INTRADAY
+    if args.entry_shift_pips is not None:
+        config = config.with_(entry_shift_pips=args.entry_shift_pips)
+    engine = engine_trades(bars, config, ea_scales(ea))
     since = pd.Timestamp(args.since) if args.since else None
     until = pd.Timestamp(args.until) if args.until else None
     report = compare(engine, ea, since, until)

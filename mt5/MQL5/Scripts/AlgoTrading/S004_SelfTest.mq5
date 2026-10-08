@@ -7,7 +7,7 @@
 //|                                                                  |
 //| Fixtures come from `python -m mt5.tools.s004_fixtures` into      |
 //| <Common>/Files/AlgoTrading/fixtures/ (see mt5/README.md):        |
-//|   s004_meta.csv    pip and round-trip cost in price units        |
+//|   s004_meta.csv    pip, round-trip cost (price units), shift_pips |
 //|   s004_m15.csv     the bars, already on the broker's EET clock   |
 //|   s004_trades.csv  what strategies/fvg_mtf.py produced on them   |
 //|                                                                  |
@@ -89,13 +89,14 @@ void SkipFields(const int handle,const int count)
   }
 
 //--- fixtures ---------------------------------------------------------------
-bool ReadMeta(double &pip,double &cost)
+bool ReadMeta(double &pip,double &cost,double &shift_pips)
   {
    int handle=OpenFixture("s004_meta.csv");
    if(handle==INVALID_HANDLE)
       return false;
    pip=0.0;
    cost=-1.0;
+   shift_pips=-1.0;
    while(!FileIsEnding(handle))
      {
       string key=FileReadString(handle);
@@ -106,9 +107,11 @@ bool ReadMeta(double &pip,double &cost)
          pip=StringToDouble(value);
       if(key=="cost_price")
          cost=StringToDouble(value);
+      if(key=="shift_pips")
+         shift_pips=StringToDouble(value);
      }
    FileClose(handle);
-   return pip>0.0 && cost>=0.0;
+   return pip>0.0 && cost>=0.0 && shift_pips>=0.0;
   }
 
 bool ReadExpectedTrades(void)
@@ -173,7 +176,7 @@ void CompareTrade(const string symbol,const S004Trade &trade)
 
 // Replay s004_m15.csv. The file is grouped by symbol, so a symbol change means
 // "start a fresh engine", exactly like a separate run_backtest call in Python.
-bool ReplayBars(const double pip,const double cost)
+bool ReplayBars(const double pip,const double cost,const double shift_pips)
   {
    int handle=OpenFixture("s004_m15.csv");
    if(handle==INVALID_HANDLE)
@@ -198,7 +201,7 @@ bool ReplayBars(const double pip,const double cost)
          if(engine!=NULL)
             delete engine;
          engine=new CS004Engine();
-         engine.Configure(symbol,pip,cost);
+         engine.Configure(symbol,pip,cost,shift_pips);
          current=symbol;
         }
       ENUM_S004_EVENT event=engine.Feed(bar);
@@ -224,6 +227,8 @@ void TestGeneratedParams()
    Check(S004_INTRADAY_CUTOFF_MINUTE==22*60+45,"params.cutoff_minute");
    Check(S004_DEFAULT_MAX_TRADES_PER_DAY==2,"params.daily_cap");
    Check(S004_COST_INCLUSIVE_SIZING,"params.cost_inclusive_sizing");
+   Check(S004_DEFAULT_ENTRY_SHIFT_PIPS>=0.0 && S004_DEFAULT_ENTRY_SHIFT_PIPS<=S004_MAX_ENTRY_SHIFT_PIPS,
+         "params.entry_shift_in_tested_range");
    Check(S004_SYMBOL_COUNT==7,"params.symbol_count");
    Check(S004_CLOCK_TZ_RULE==TZ_EET_EU_DST,"params.clock_rule_is_european");
   }
@@ -258,8 +263,8 @@ void OnStart()
    TestGeneratedParams();
    TestEngineBasics();
 
-   double pip=0.0,cost=0.0;
-   if(!ReadMeta(pip,cost))
+   double pip=0.0,cost=0.0,shift_pips=0.0;
+   if(!ReadMeta(pip,cost,shift_pips))
       Check(false,"fixtures.meta_missing");
    else
      {
@@ -267,7 +272,7 @@ void OnStart()
          Check(false,"fixtures.trades_missing");
       else
         {
-         if(!ReplayBars(pip,cost))
+         if(!ReplayBars(pip,cost,shift_pips))
             Check(false,"fixtures.bars_missing");
          else
             Check(g_produced==g_exp_count,"engine.trade_count");

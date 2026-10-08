@@ -30,8 +30,19 @@
 ; pairs itself and refuses a second instance with the same magic.
 ;
 ; Enum codes: ServerTzRule/DayResetRule 0=UTC 1=FIXED 2=EET_US_DST 3=EET_EU_DST 4=CET_EU_DST
+; InpEntryShiftPips=1.0 (ALGODEV-62 amendment, 2026-10-08): the entry limit is parked
+; 1 pip from the zone's edge TOWARD the bounce instead of exactly on it. The backtest
+; fills on the first touch of the edge; a real queue misses some touches, and the
+; ones it misses are the instant reversals -- the winners. Moved 1 pip the edge
+; barely changes (+0.151 R/trade vs +0.164 unshifted, 2022-03+); left on the edge
+; and filled only on a 1-pip pierce it halves (+0.065). Evidence and the tested
+; range (0..2 pips, the EA refuses more) are in strategies/s004_config.py. Set 0.0
+; for the original behaviour. Known cost: when the market already sits between the
+; edge and the shifted price at the moment the limit is parked, the broker can
+; refuse it (a buy limit above the ask) -- that shows up as a missed_fill row.
 InpRiskPct=0.5
 InpMaxTradesPerDay=2
+InpEntryShiftPips=1.0
 InpInitialBalance=10000.0
 InpDailyGuardPct=0.0
 InpMaxGuardPct=0.0

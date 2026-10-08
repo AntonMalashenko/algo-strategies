@@ -113,6 +113,7 @@ private:
    double            m_pip;          // price units per pip
    double            m_buffer;       // BUFFER_PIPS in price units
    double            m_cost;         // round-trip cost in price units (R denominator)
+   double            m_shift;        // entry limit offset from the near edge, toward the bounce, price units
 
    S004Bar           m_h4[];         // completed H4 bars, oldest first
    S004Zone          m_zones[];      // every zone ever created, oldest first
@@ -240,12 +241,16 @@ private:
 public:
                      CS004Engine(void) { m_next_zone=0; m_last_bar=0; m_event=S004_EVENT_NONE; m_pos.active=false; }
 
-   void              Configure(const string symbol,const double pip,const double cost_price)
+   // `shift_pips` is fvg_mtf's entry_shift_pips: the limit sits that far from the
+   // zone's near edge toward the bounce (0 = parked exactly on the edge).
+   void              Configure(const string symbol,const double pip,const double cost_price,
+                               const double shift_pips)
      {
       m_symbol=symbol;
       m_pip=pip;
       m_buffer=S004_BUFFER_PIPS*pip;
       m_cost=cost_price;
+      m_shift=shift_pips*pip;
      }
 
    static int        HourOf(const datetime stamp)
@@ -341,13 +346,13 @@ public:
             m_zones[index].dead=true;  // closed beyond the far edge: invalidated
             continue;
            }
-         double near_edge=NearEdgeOf(index);
-         bool touched=(dir==S004_DIR_LONG) ? bar.low<=near_edge : bar.high>=near_edge;
+         double fill_edge=EntryEdgeOf(index);
+         bool touched=(dir==S004_DIR_LONG) ? bar.low<=fill_edge : bar.high>=fill_edge;
          if(!touched)
             continue;
-         // base mode: the limit fills at the near edge on the first touch, or at
+         // base mode: the limit fills at its price on the first touch, or at
          // the open when the bar gapped past it
-         double entry=(dir==S004_DIR_LONG) ? MathMin(bar.open,near_edge) : MathMax(bar.open,near_edge);
+         double entry=(dir==S004_DIR_LONG) ? MathMin(bar.open,fill_edge) : MathMax(bar.open,fill_edge);
          if(!OpenAt(index,entry,bar.time))
             m_zones[index].dead=true;  // no valid risk: the zone is consumed
          break;                        // one entry attempt per bar, like Python's break
@@ -358,6 +363,13 @@ public:
    double            NearEdgeOf(const int zone_index) const
      {
       return (m_zones[zone_index].dir==S004_DIR_LONG) ? m_zones[zone_index].top : m_zones[zone_index].bot;
+     }
+
+   // The limit's price: the near edge moved `m_shift` toward the bounce (up for a
+   // long, down for a short). This -- not NearEdgeOf -- is what the live layer parks.
+   double            EntryEdgeOf(const int zone_index) const
+     {
+      return NearEdgeOf(zone_index)+m_zones[zone_index].dir*m_shift;
      }
 
    double            StopFor(const int zone_index) const
@@ -373,6 +385,7 @@ public:
    // instead of the modelled ones -- hence the columns in the trades CSV.
    double            Pip(void)    const { return m_pip; }
    double            Cost(void)   const { return m_cost; }
+   double            Shift(void)  const { return m_shift; }
    datetime          LastBar(void)const { return m_last_bar; }
    bool              HasPosition(void) const { return m_pos.active; }
    bool              OpenedThisBar(void) const { return m_pos.opened_this_bar; }
