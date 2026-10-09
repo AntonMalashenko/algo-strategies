@@ -153,8 +153,13 @@ services:
       # all, and would have kept firing 17:00-19:59 Kyiv, past its own
       # session end, for no effect (the worker's own in_window check would
       # just no-op there, but still a wasted/confusing extra dispatch).
+      # ALGODEV-61: CAPITAL_*/TELEGRAM_* added for the s021_signal task
+      # (tools/s021_capital.py) -- values come from the host .env via
+      # compose's normal ${VAR} substitution (same mechanism as
+      # APP_SECRET_KEY above), nothing new to configure beyond what already
+      # works for the manual CLI run.
       ofelia.job-run.dispatch.environment: >-
-        ["APP_SECRET_KEY=${APP_SECRET_KEY}", "APP_DB_URL=sqlite:////app/data/app.db", "TZ=Europe/Kyiv", "REDIS_URL=redis://redis:6379"]
+        ["APP_SECRET_KEY=${APP_SECRET_KEY}", "APP_DB_URL=sqlite:////app/data/app.db", "TZ=Europe/Kyiv", "REDIS_URL=redis://redis:6379", "CAPITAL_API_KEY=${CAPITAL_API_KEY}", "CAPITAL_IDENTIFIER=${CAPITAL_IDENTIFIER}", "CAPITAL_PASSWORD=${CAPITAL_PASSWORD}", "CAPITAL_DEMO=${CAPITAL_DEMO}", "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}", "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}"]
 
 
 networks:

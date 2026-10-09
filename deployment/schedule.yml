@@ -179,6 +179,30 @@ tasks:
     command: python -m scripts.position_audit --account-strategy-id 7
     schedule: "26 13 * * 1-5"         # 13:26 UTC
     tz: UTC
+  # ALGODEV-61: S021 manual-plan Telegram signal (tools/s021_capital.py),
+  # moved here from the flaky GitHub Actions `schedule:` trigger
+  # (.github/workflows/s021_signal.yml, which never fired on its own across
+  # 2 consecutive trading days and once fired ~6h late when it finally did --
+  # unresolved GitHub platform quirk, not something fixable in this repo).
+  # This task now rides the SAME Ofelia/Podman tick that already drives
+  # every other strategy/task in this file, so it gets the same
+  # `restart: unless-stopped` self-healing as the rest (docker-compose.yml's
+  # ofelia service) instead of depending on GitHub's scheduler.
+  #
+  # `--no-wait`: scheduler_tick's own ITEM_TIMEOUT_SECONDS=120 hard-kills any
+  # subprocess after 2 minutes, but s021_capital.py's normal `wait_for_open`
+  # path can block up to ~85 minutes (winter DST) -- the two are
+  # incompatible, so this task does NOT wait inline. Instead the cron time
+  # itself (14:35 UTC) is picked to always be AFTER the New York open has
+  # already happened under BOTH DST regimes (13:30 UTC EDT / 14:30 UTC EST --
+  # same seasonal window S021's own `tz: UTC` strategy entry above
+  # documents), so `--no-wait` can read the already-formed 09:30 NY bar
+  # immediately. The GitHub Actions workflow keeps its `--wait` entrypoint
+  # as a manual/backup path (`workflow_dispatch`); this is now the primary.
+  - name: s021_signal
+    command: python -m tools.s021_capital --no-wait --telegram
+    schedule: "35 14 * * 1-5"         # 14:35 UTC, after the latest possible (EST) open
+    tz: UTC
   # ALGODEV-45 step 1: S007 stall watchdog (scripts/s007_watchdog.py). Reads
   # AccountStrategy.last_cycle_at only -- never touches the broker, never
   # kills/restarts anything (there is nothing persistent to manage yet;
