@@ -23,6 +23,7 @@
 #property version   "1.00"
 
 #include <AlgoCore/Clock.mqh>
+#include <AlgoCore/Sizing.mqh>
 #include <Strategies/S004_FVG/Engine.mqh>
 
 #define SELFTEST_FIXTURE_DIR   "AlgoTrading/fixtures/"
@@ -242,6 +243,26 @@ void TestEngineBasics()
    Check(S004_COST_INCLUSIVE_SIZING,"engine.full_stop_is_minus_one_r");
   }
 
+// Regression for the 2026-10-09 live sizing bug (ALGODEV-62): every real S004
+// entry overnight sized at the broker's minimum lot, on every pair, because
+// LotsFor() paired a POINTS-COUNT distance with a RAW-PRICE-UNIT money value
+// -- a factor-of-point mismatch (100000x on EURUSD, 1000x on JPY pairs).
+// Numbers are S004_SizingProbe.mq5's actual 2026-10-09 FundingPips readout.
+void TestSizingPointStepConversion()
+  {
+   // EURUSD: point=tick_size=0.00001, tick_value=1.0 -> money_per_price_unit=100000.
+   Check(Near(SizingMoneyPerPointPerLotForPointStep(100000.0,0.00001),1.0),
+         "sizing.point_step_fx_5digit");
+   // GBPJPY: point=tick_size=0.001, tick_value=0.63256 -> money_per_price_unit=632.56.
+   Check(Near(SizingMoneyPerPointPerLotForPointStep(632.55508,0.001),0.63255508),
+         "sizing.point_step_jpy_3digit");
+   // End to end: a 15-pip (150-point) EURUSD stop, $50 risk, must NOT floor
+   // to the broker's 0.01 minimum -- that is exactly what the bug did.
+   double lots=SizingLotsForRisk(50.0,150.0,
+                                 SizingMoneyPerPointPerLotForPointStep(100000.0,0.00001),0.01);
+   Check(lots>0.3 && lots<0.4,"sizing.point_step_end_to_end_not_floored");
+  }
+
 void WriteSummary()
   {
    if(!FolderCreate(SELFTEST_RESULT_DIR,FILE_COMMON))
@@ -262,6 +283,7 @@ void OnStart()
   {
    TestGeneratedParams();
    TestEngineBasics();
+   TestSizingPointStepConversion();
 
    double pip=0.0,cost=0.0,shift_pips=0.0;
    if(!ReadMeta(pip,cost,shift_pips))

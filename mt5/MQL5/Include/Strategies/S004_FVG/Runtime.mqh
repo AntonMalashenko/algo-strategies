@@ -198,8 +198,17 @@ private:
       if(distance<=0.0 || m_slot[i].point<=0.0)
          return 0.0;
       double risk_amount=AccountInfoDouble(ACCOUNT_BALANCE)*m_cfg.risk_pct/S004_PCT;
+      // Distance here is a COUNT of SYMBOL_POINT steps (ALGO_MIN_STOP_POINTS
+      // is calibrated against that unit), so the per-step money must be too --
+      // ...ForPointStep() converts SizingMoneyPerPointPerLot()'s raw-price-unit
+      // value (S021's convention) into money per 1.0 `point` move. Bug fixed
+      // 2026-10-09 (ALGODEV-62): the raw-price-unit value was used directly
+      // against a points-count distance, inflating the implied cost by
+      // 1/point (100000x on EURUSD, 1000x on JPY pairs) and flooring every
+      // live entry to the broker's minimum lot regardless of risk_pct.
       double lots=SizingLotsForRisk(risk_amount,distance/m_slot[i].point,
-                                    SizingMoneyPerPointPerLot(m_slot[i].symbol),
+                                    SizingMoneyPerPointPerLotForPointStep(
+                                       SizingMoneyPerPointPerLot(m_slot[i].symbol),m_slot[i].point),
                                     SymbolInfoDouble(m_slot[i].symbol,SYMBOL_VOLUME_MIN));
       return SizingNormalizeVolumeForSymbol(m_slot[i].symbol,lots);
      }

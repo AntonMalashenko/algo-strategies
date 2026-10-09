@@ -62,6 +62,20 @@ double SizingMoneyPerPointPerLot(const string symbol)
    return tick_value/tick_size;
   }
 
+// SizingMoneyPerPointPerLot() above is money per 1.0 RAW PRICE move -- the
+// convention S021 uses, sizing off a raw price distance (ORB stop, in index
+// points). A caller that instead sizes off a distance already expressed as a
+// COUNT of SYMBOL_POINT steps (distance/point -- S004's FX pairs, where a
+// "point" is a fraction of a pip) needs money per 1.0 *point* move instead:
+// scale by `point` so stop_distance_points * this gives the same dollars.
+// Passing the two numbers already read (not re-reading the symbol) keeps
+// this pure arithmetic, so it is unit-testable without a broker connection.
+double SizingMoneyPerPointPerLotForPointStep(const double money_per_price_unit_per_lot,
+                                             const double point)
+  {
+   return money_per_price_unit_per_lot*point;
+  }
+
 // Price rounded to the symbol's tick grid and digits.
 double SizingNormalizePrice(const string symbol,const double price)
   {
